@@ -1,0 +1,268 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ============================================================
+   CSS Custom Properties — Apple-inspired design tokens
+   ============================================================ */
+
+@layer base {
+  [data-theme="dark"] {
+    --bg-primary:   #1c1c1e;
+    --bg-secondary: #2c2c2e;
+    --bg-tertiary:  #3a3a3c;
+    --bg-stripe:    #232325;
+    --text-primary:   #ffffff;
+    --text-secondary: #ebebf5;
+    --text-muted:     #8e8e93;
+    --border:       #38383a;
+    --accent:       #0a84ff;
+    --accent-hover: #0071e3;
+    --success:      #30d158;
+    --danger:       #ff453a;
+    --warning:      #ffd60a;
+    --danger-bg:     rgba(255, 69, 58, 0.15);
+    --danger-border: rgba(255, 69, 58, 0.40);
+    --warning-bg:     rgba(255, 214, 10, 0.12);
+    --warning-border: rgba(255, 214, 10, 0.35);
+  }
+
+  [data-theme="light"] {
+    --bg-primary:   #f2f2f7;
+    --bg-secondary: #ffffff;
+    --bg-tertiary:  #e5e5ea;
+    --bg-stripe:    #f4f4f8;
+    --text-primary:   #000000;
+    --text-secondary: #3c3c43;
+    --text-muted:     #8e8e93;
+    --border:       #c6c6c8;
+    --accent:       #007aff;
+    --accent-hover: #0071e3;
+    --success:      #34c759;
+    --danger:       #ff3b30;
+    --warning:      #ff9500;
+    --danger-bg:     rgba(255, 59, 48, 0.08);
+    --danger-border: rgba(255, 59, 48, 0.25);
+    --warning-bg:     rgba(255, 149, 0, 0.08);
+    --warning-border: rgba(255, 149, 0, 0.25);
+  }
+
+  html {
+    transition: background-color 0.2s ease, color 0.2s ease;
+  }
+
+  body {
+    background-color: var(--bg-primary);
+    color: var(--text-primary);
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    transition: background-color 0.2s ease, color 0.2s ease;
+  }
+
+  select option {
+    background-color: var(--bg-secondary);
+    color: var(--text-primary);
+  }
+}
+
+/* ============================================================
+   Scrollbars
+   ============================================================ */
+
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--bg-tertiary) var(--bg-secondary);
+}
+*::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+*::-webkit-scrollbar-track {
+  background: var(--bg-secondary);
+  border-radius: 3px;
+}
+*::-webkit-scrollbar-thumb {
+  background: var(--bg-tertiary);
+  border-radius: 3px;
+}
+*::-webkit-scrollbar-thumb:hover {
+  background: var(--text-muted);
+}
+
+/* ============================================================
+   Semantic component classes
+   ============================================================ */
+
+/* Card / panel */
+.card {
+  background-color: var(--bg-secondary);
+  border: 1px solid var(--border);
+  transition: background-color 0.2s ease, border-color 0.2s ease;
+}
+
+/* Form inputs and selects */
+.input-field {
+  background-color: var(--bg-tertiary);
+  border: 1px solid var(--border);
+  color: var(--text-primary);
+  outline: none;
+  transition: background-color 0.2s ease, border-color 0.15s ease, color 0.2s ease;
+}
+.input-field:focus {
+  border-color: var(--accent);
+}
+.input-field::placeholder {
+  color: var(--text-muted);
+  opacity: 1;
+}
+
+/* Accent (primary action) button */
+.btn-accent {
+  background-color: var(--accent);
+  color: #ffffff;
+  transition: background-color 0.15s ease;
+}
+.btn-accent:hover:not(:disabled) {
+  background-color: var(--accent-hover);
+}
+.btn-accent:disabled {
+  background-color: var(--bg-tertiary);
+  color: var(--text-muted);
+  cursor: not-allowed;
+}
+
+/* Ghost (secondary) button */
+.btn-ghost {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--text-muted);
+  transition: border-color 0.15s ease, color 0.15s ease;
+}
+.btn-ghost:hover:not(:disabled) {
+  border-color: var(--text-muted);
+  color: var(--text-secondary);
+}
+.btn-ghost:disabled {
+  opacity: 0.3;
+  cursor: not-allowed;
+}
+
+/* Danger ghost button (Clean Duplicates) */
+.btn-danger-ghost {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--text-muted);
+  transition: border-color 0.15s ease, color 0.15s ease;
+}
+.btn-danger-ghost:hover:not(:disabled) {
+  color: var(--danger);
+  border-color: var(--danger-border);
+}
+.btn-danger-ghost:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+/* Nav tabs */
+.nav-tab {
+  background: transparent;
+  color: var(--text-muted);
+  transition: color 0.15s ease;
+}
+.nav-tab:hover {
+  color: var(--text-secondary);
+}
+.nav-tab-active {
+  background-color: var(--accent);
+  color: #ffffff;
+}
+
+/* Autocomplete suggestion items */
+.suggestion-item {
+  color: var(--text-secondary);
+  transition: background-color 0.1s ease;
+}
+.suggestion-item:hover {
+  background-color: var(--bg-tertiary);
+}
+
+/* Status badges (injuries) */
+.status-out {
+  background-color: var(--danger-bg);
+  border-color: var(--danger-border);
+  color: var(--danger);
+}
+.status-questionable {
+  background-color: var(--warning-bg);
+  border-color: var(--warning-border);
+  color: var(--warning);
+}
+.status-neutral {
+  background-color: var(--bg-tertiary);
+  border-color: var(--border);
+  color: var(--text-muted);
+}
+
+/* Icon-only buttons (×, ✏) */
+.icon-btn {
+  background: transparent;
+  color: var(--text-muted);
+  transition: color 0.15s ease;
+}
+.icon-btn:hover {
+  color: var(--text-primary);
+}
+
+/* Theme toggle pill */
+.theme-toggle {
+  background-color: var(--bg-tertiary);
+  border: 1px solid var(--border);
+  color: var(--text-secondary);
+  transition: background-color 0.15s ease, border-color 0.15s ease, color 0.2s ease;
+}
+.theme-toggle:hover {
+  border-color: var(--text-muted);
+}
+
+/* Sortable table headers */
+.sort-header {
+  color: var(--text-muted);
+  cursor: pointer;
+  user-select: none;
+  white-space: nowrap;
+  transition: color 0.15s ease;
+}
+.sort-header:hover {
+  color: var(--text-secondary);
+}
+
+/* Table row dividers using theme border */
+.divide-theme > * + * {
+  border-top-width: 1px;
+  border-top-style: solid;
+  border-color: var(--border);
+}
+
+/* ============================================================
+   Animations
+   ============================================================ */
+
+@layer utilities {
+  .animate-slide-down {
+    animation: slideDown 0.3s ease-out forwards;
+  }
+
+  @keyframes slideDown {
+    from { opacity: 0; transform: translateY(-10px); }
+    to   { opacity: 1; transform: translateY(0); }
+  }
+
+  .animate-fade-in {
+    animation: fadeIn 0.4s ease-out forwards;
+  }
+
+  @keyframes fadeIn {
+    from { opacity: 0; transform: scale(0.97); }
+    to   { opacity: 1; transform: scale(1); }
+  }
+}
