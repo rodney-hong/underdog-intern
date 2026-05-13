@@ -2,7 +2,11 @@ import { useState, useEffect, useRef, useCallback } from 'react'
 import History from './History'
 
 const API = 'http://localhost:8000'
-const STAT_TYPES = ['Points', 'Assists', 'Rebounds', 'PRA', '3PM', 'PR', 'PA', 'RA']
+const STAT_TYPES = [
+  'Points', 'Assists', 'Rebounds', 'PRA', '3PM', 'PR', 'PA', 'RA',
+  'Blocks', 'Steals', 'Blocks+Steals', 'Turnovers',
+  'Offensive Rebounds', 'Defensive Rebounds', 'Double Double', '3PA',
+]
 
 // ---------------------------------------------------------------------------
 // Theme icons
@@ -197,14 +201,37 @@ function OpponentField({ value, teams, playerTeam, onChange, onClear }) {
 // Stat line number input
 // ---------------------------------------------------------------------------
 
-function StatLineField({ value, onChange, onClear }) {
+const SOURCE_LABELS = {
+  fanduel:    'FanDuel',
+  draftkings: 'DraftKings',
+  betmgm:     'BetMGM',
+  betonlineag:'BetOnline',
+  bovada:     'Bovada',
+}
+
+function StatLineField({ value, onChange, onClear, source, lineLoading, lineNote }) {
   const handleChange = (e) => {
     const raw = e.target.value
     if (/^(\d*\.?\d*)$/.test(raw)) onChange(raw)
   }
   return (
     <div>
-      <Label>Stat Line</Label>
+      <div className="flex items-center justify-between mb-1.5">
+        <label className="text-xs font-semibold uppercase tracking-widest" style={{ color: 'var(--text-muted)' }}>
+          Stat Line
+        </label>
+        {lineLoading && (
+          <span className="text-xs" style={{ color: 'var(--text-muted)' }}>fetching line…</span>
+        )}
+        {!lineLoading && source && (
+          <span className="text-xs font-medium" style={{ color: 'var(--text-muted)' }}>
+            via {SOURCE_LABELS[source] ?? source}
+          </span>
+        )}
+        {!lineLoading && !source && lineNote && (
+          <span className="text-xs italic" style={{ color: 'var(--text-muted)' }}>{lineNote}</span>
+        )}
+      </div>
       <div className="relative">
         <input
           type="text"
@@ -244,6 +271,24 @@ function StatTypeField({ value, onChange, onClear }) {
         )}
         <ClearButton visible={!!value} onClick={onClear} />
       </div>
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Game date input
+// ---------------------------------------------------------------------------
+
+function GameDateField({ value, onChange }) {
+  return (
+    <div>
+      <Label>Game Date</Label>
+      <input
+        type="date"
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        className="input-field w-full rounded-xl px-4 py-3"
+      />
     </div>
   )
 }
@@ -332,6 +377,82 @@ function ResultCard({ result }) {
 }
 
 // ---------------------------------------------------------------------------
+// Slip card
+// ---------------------------------------------------------------------------
+
+function SlipCard({ slip, onClear }) {
+  if (!slip) return null
+
+  if (slip.picks.length === 0) {
+    return (
+      <div className="card animate-fade-in mt-4 w-full max-w-lg rounded-2xl p-6 text-center">
+        <p className="text-sm" style={{ color: 'var(--text-muted)' }}>
+          No strong picks found for tonight.
+        </p>
+      </div>
+    )
+  }
+
+  return (
+    <div className="card animate-fade-in mt-4 w-full max-w-lg rounded-2xl p-6 space-y-4">
+      <div className="flex items-center justify-between">
+        <h2 className="font-bold text-base" style={{ color: 'var(--text-primary)' }}>
+          Tonight's Suggested Slip 🎯
+        </h2>
+        <button
+          onClick={onClear}
+          className="btn-ghost text-xs px-3 py-1.5 rounded-lg font-medium"
+        >
+          Clear
+        </button>
+      </div>
+
+      <div className="space-y-3">
+        {slip.picks.map((pick, i) => {
+          const isOver = pick.outcome === 'OVER'
+          return (
+            <div
+              key={i}
+              className="rounded-xl p-3.5 space-y-1.5"
+              style={{ backgroundColor: 'var(--bg-tertiary)' }}
+            >
+              <div className="flex items-center justify-between gap-2">
+                <span className="font-semibold text-sm" style={{ color: 'var(--text-primary)' }}>
+                  {pick.player}
+                </span>
+                <span
+                  className="font-black text-sm shrink-0"
+                  style={{ color: isOver ? 'var(--success)' : 'var(--danger)' }}
+                >
+                  {pick.outcome}
+                </span>
+              </div>
+              <div className="flex items-center justify-between gap-2">
+                <span className="text-xs" style={{ color: 'var(--text-secondary)' }}>
+                  {pick.stat_type} · {pick.line}
+                </span>
+                <span className="text-xs font-medium shrink-0" style={{ color: 'var(--text-muted)' }}>
+                  {Math.round(pick.confidence * 100)}% confidence
+                </span>
+              </div>
+              <p className="text-xs" style={{ color: 'var(--text-muted)' }}>
+                {pick.game}
+              </p>
+            </div>
+          )
+        })}
+      </div>
+
+      <div className="border-t pt-4 text-center" style={{ borderColor: 'var(--border)' }}>
+        <span className="text-sm font-semibold" style={{ color: 'var(--text-primary)' }}>
+          Parlay Confidence: {Math.round(slip.parlay_confidence * 100)}%
+        </span>
+      </div>
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------------------
 // Main App
 // ---------------------------------------------------------------------------
 
@@ -367,6 +488,13 @@ export default function App() {
   const [result, setResult] = useState(null)
   const [predicting, setPredicting] = useState(false)
   const [error, setError] = useState('')
+  const [lineSource, setLineSource] = useState(null)
+  const [lineLoading, setLineLoading] = useState(false)
+  const [lineNote, setLineNote] = useState('')
+  const [gameDate, setGameDate] = useState('')
+  const [slipResult, setSlipResult] = useState(null)
+  const [slipLoading, setSlipLoading] = useState(false)
+  const [slipSize, setSlipSize] = useState(2)
 
   const showAdditionalFields = !!selectedPlayer
 
@@ -384,6 +512,8 @@ export default function App() {
     setIsHome(false)
     setIsBackToBack(false)
     setPlayerContext(null)
+    setGameDate('')
+    setLineNote('')
     fetch(`${API}/players/${encodeURIComponent(selectedPlayer)}/team`)
       .then((r) => r.json())
       .then((data) => {
@@ -391,6 +521,7 @@ export default function App() {
         if (data.next_opponent?.full) setOpponent(data.next_opponent.full)
         setIsHome(data.is_home ?? false)
         setIsBackToBack(data.is_back_to_back ?? false)
+        if (data.next_game_date) setGameDate(data.next_game_date)
       })
       .catch(() => { setPlayerTeam('') })
     fetch(`${API}/players/${encodeURIComponent(selectedPlayer)}/context`)
@@ -398,6 +529,48 @@ export default function App() {
       .then(setPlayerContext)
       .catch(() => {})
   }, [selectedPlayer])
+
+  // Auto-fill stat line from OddsAPI when player + stat type are both set
+  useEffect(() => {
+    if (!selectedPlayer || !statType) {
+      setLineSource(null)
+      setLineNote('')
+      return
+    }
+    let active = true
+    setLineLoading(true)
+    setLineSource(null)
+    setLineNote('')
+    fetch(`${API}/lines/${encodeURIComponent(selectedPlayer)}/${encodeURIComponent(statType)}`)
+      .then((r) => r.json())
+      .then((data) => {
+        if (!active) return
+        if (data.line != null) {
+          setStatLine(String(data.line))
+          setLineSource(data.source ?? null)
+          setLineNote('')
+        } else {
+          setLineNote('Line not available from sportsbooks — enter manually')
+        }
+      })
+      .catch(() => {})
+      .finally(() => { if (active) setLineLoading(false) })
+    return () => { active = false }
+  }, [selectedPlayer, statType])
+
+  const handleBuildSlip = async () => {
+    setSlipLoading(true)
+    setSlipResult(null)
+    try {
+      const res = await fetch(`${API}/slip?size=${slipSize}`)
+      if (!res.ok) throw new Error('slip fetch failed')
+      setSlipResult(await res.json())
+    } catch {
+      setSlipResult({ picks: [], parlay_confidence: 0.0 })
+    } finally {
+      setSlipLoading(false)
+    }
+  }
 
   const handlePlayerSelect = (name) => {
     setSelectedPlayer(name)
@@ -419,6 +592,10 @@ export default function App() {
     setOpponentInjuries([])
     setResult(null)
     setError('')
+    setLineSource(null)
+    setLineLoading(false)
+    setLineNote('')
+    setGameDate('')
   }
 
   const canPredict =
@@ -440,6 +617,7 @@ export default function App() {
           stat_type: statType,
           is_home: isHome,
           is_back_to_back: isBackToBack,
+          game_date: gameDate || null,
         }),
       })
       if (!res.ok) {
@@ -460,8 +638,8 @@ export default function App() {
     <div className="min-h-screen flex flex-col items-center px-4 py-16" style={{ backgroundColor: 'var(--bg-primary)' }}>
       {/* Header */}
       <div className="text-center mb-8">
-        <div className="text-5xl mb-3">🏀</div>
-        <h1 className="text-3xl font-black tracking-tight" style={{ color: 'var(--text-primary)' }}>NBA Prop Predictor</h1>
+        {/* <div className="text-5xl mb-3">🏀</div> */}
+        <h1 className="text-3xl font-black tracking-tight" style={{ color: 'var(--text-primary)' }}>Sports Bettr</h1>
         <p className="mt-1 text-sm" style={{ color: 'var(--text-muted)' }}>AI-powered over/under predictions using real game data</p>
       </div>
 
@@ -484,7 +662,7 @@ export default function App() {
           aria-label={theme === 'dark' ? 'Switch to light mode' : 'Switch to dark mode'}
           title={theme === 'dark' ? 'Switch to light mode' : 'Switch to dark mode'}
         >
-          {theme === 'dark' ? <MoonIcon /> : <SunIcon />}
+          {theme === 'dark' ? <SunIcon /> : <MoonIcon />}
         </button>
       </div>
 
@@ -518,10 +696,14 @@ export default function App() {
                 onChange={setOpponent}
                 onClear={() => { setOpponent(''); setResult(null) }}
               />
+              <GameDateField value={gameDate} onChange={setGameDate} />
               <StatLineField
                 value={statLine}
-                onChange={setStatLine}
-                onClear={() => { setStatLine(''); setResult(null) }}
+                onChange={(val) => { setStatLine(val); setLineSource(null) }}
+                onClear={() => { setStatLine(''); setLineSource(null); setResult(null) }}
+                source={lineSource}
+                lineLoading={lineLoading}
+                lineNote={lineNote}
               />
               <StatTypeField
                 value={statType}
@@ -557,6 +739,36 @@ export default function App() {
             </div>
           )}
         </div>
+
+        <div className="w-full max-w-lg mt-4 space-y-2">
+          <div className="flex items-center gap-2">
+            <span className="text-xs font-semibold uppercase tracking-widest" style={{ color: 'var(--text-muted)' }}>
+              Legs
+            </span>
+            {[2, 3, 4, 5].map((n) => (
+              <button
+                key={n}
+                onClick={() => setSlipSize(n)}
+                className="px-3 py-1 rounded-full text-xs font-bold transition-all duration-150"
+                style={{
+                  backgroundColor: slipSize === n ? 'var(--accent)' : 'var(--bg-tertiary)',
+                  color: slipSize === n ? '#fff' : 'var(--text-muted)',
+                }}
+              >
+                {n}
+              </button>
+            ))}
+          </div>
+          <button
+            onClick={handleBuildSlip}
+            disabled={slipLoading}
+            className="btn-ghost w-full py-3 rounded-xl text-sm font-medium"
+          >
+            {slipLoading ? 'Building your slip…' : '🎯 Build Me a Slip'}
+          </button>
+        </div>
+
+        <SlipCard slip={slipResult} onClear={() => setSlipResult(null)} />
 
         {result && (
           <div className="w-full max-w-lg">

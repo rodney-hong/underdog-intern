@@ -3,7 +3,11 @@ import { useState, useEffect, useCallback } from 'react'
 const API = 'http://localhost:8000'
 const PAGE_SIZES = [10, 25, 50]
 
-const ALL_STAT_TYPES = ['All', 'Points', 'Assists', 'Rebounds', 'PRA', '3PM', 'PR', 'PA', 'RA']
+const ALL_STAT_TYPES = [
+  'All', 'Points', 'Assists', 'Rebounds', 'PRA', '3PM', 'PR', 'PA', 'RA',
+  'Blocks', 'Steals', 'Blocks+Steals', 'Turnovers',
+  'Offensive Rebounds', 'Defensive Rebounds', 'Double Double', '3PA',
+]
 const OUTCOME_FILTERS = ['All', 'Correct', 'Incorrect', 'Pending']
 
 // ---------------------------------------------------------------------------
@@ -44,12 +48,17 @@ function FilterSelect({ value, onChange, options }) {
 
 function PredictionRow({ prediction: p, isEditing, editValue, onEdit, onEditChange, onEditConfirm, onEditCancel, stripe }) {
   const isOver = p.predicted_outcome === 'OVER'
-  const isResolved = p.actual_result !== null
+  const isDNP = p.actual_result === 'DNP'
+  const isResolved = p.actual_result !== null && !isDNP
   const isCorrect = isResolved && p.predicted_outcome === p.actual_result
 
-  const resultIcon = isResolved ? (isCorrect ? '✅' : '❌') : '⏳'
+  const resultIcon = isDNP
+    ? <span style={{ color: 'var(--text-muted)' }}>—</span>
+    : isResolved ? (isCorrect ? '✅' : '❌') : '⏳'
 
-  const actualDisplay = isResolved
+  const actualDisplay = isDNP
+    ? <span style={{ color: 'var(--text-muted)' }}>DNP</span>
+    : isResolved
     ? <span className="font-semibold" style={{ color: p.actual_result === 'OVER' ? 'var(--success)' : 'var(--danger)' }}>{p.actual_result}</span>
     : <span style={{ color: 'var(--text-muted)' }}>Pending</span>
 
@@ -63,22 +72,30 @@ function PredictionRow({ prediction: p, isEditing, editValue, onEdit, onEditChan
     }
   })()
 
+  const gameDateStr = p.game_date
+    ? (() => {
+        const [y, m, d] = p.game_date.split('-').map(Number)
+        return new Date(y, m - 1, d).toLocaleDateString('en-US', { month: 'short', day: 'numeric' })
+      })()
+    : '—'
+
   return (
     <tr style={{ backgroundColor: stripe ? 'var(--bg-stripe)' : 'transparent' }}>
-      <td className="px-4 py-3 text-xs whitespace-nowrap" style={{ color: 'var(--text-muted)' }}>{dateStr}</td>
-      <td className="px-4 py-3 whitespace-nowrap" style={{ color: 'var(--text-secondary)' }}>{p.player_name}</td>
-      <td className="px-4 py-3" style={{ color: 'var(--text-muted)' }}>{p.stat_type}</td>
-      <td className="px-4 py-3" style={{ color: 'var(--text-secondary)' }}>{p.stat_line}</td>
-      <td className="px-4 py-3 whitespace-nowrap" style={{ color: 'var(--text-muted)' }}>{p.opponent_team}</td>
-      <td className="px-4 py-3">
+      <td className="px-2 py-2 text-xs truncate" style={{ color: 'var(--text-muted)' }}>{dateStr}</td>
+      <td className="px-2 py-2 text-xs truncate" style={{ color: 'var(--text-muted)' }}>{gameDateStr}</td>
+      <td className="px-2 py-2 truncate" style={{ color: 'var(--text-secondary)' }}>{p.player_name}</td>
+      <td className="px-2 py-2 truncate" style={{ color: 'var(--text-muted)' }}>{p.stat_type}</td>
+      <td className="px-2 py-2 truncate" style={{ color: 'var(--text-secondary)' }}>{p.stat_line}</td>
+      <td className="px-2 py-2 truncate" style={{ color: 'var(--text-muted)' }}>{p.opponent_team}</td>
+      <td className="px-2 py-2 truncate">
         <span className="font-semibold" style={{ color: isOver ? 'var(--success)' : 'var(--danger)' }}>
           {p.predicted_outcome}
         </span>
       </td>
-      <td className="px-4 py-3" style={{ color: 'var(--text-secondary)' }}>{(p.confidence * 100).toFixed(1)}%</td>
-      <td className="px-4 py-3">{actualDisplay}</td>
-      <td className="px-4 py-3 text-center">{resultIcon}</td>
-      <td className="px-4 py-3">
+      <td className="px-2 py-2 truncate" style={{ color: 'var(--text-secondary)' }}>{(p.confidence * 100).toFixed(1)}%</td>
+      <td className="px-2 py-2 truncate">{actualDisplay}</td>
+      <td className="px-2 py-2 text-center">{resultIcon}</td>
+      <td className="px-2 py-2">
         {isEditing ? (
           <div className="flex items-center gap-1.5">
             <select
@@ -164,8 +181,8 @@ export default function History() {
     finally { setCleaning(false) }
   }
 
-  // Derived summary stats (always over full dataset)
-  const resolved = predictions.filter((p) => p.actual_result !== null)
+  // Derived summary stats (always over full dataset, excluding DNP)
+  const resolved = predictions.filter((p) => p.actual_result !== null && p.actual_result !== 'DNP')
   const correct = resolved.filter((p) => p.predicted_outcome === p.actual_result)
   const overallAcc = resolved.length > 0
     ? `${(correct.length / resolved.length * 100).toFixed(1)}%`
@@ -188,9 +205,9 @@ export default function History() {
   // Filter pipeline
   const filtered = predictions.filter((p) => {
     if (statFilter !== 'All' && p.stat_type !== statFilter) return false
-    if (outcomeFilter === 'Pending') return p.actual_result === null
-    if (outcomeFilter === 'Correct') return p.actual_result !== null && p.predicted_outcome === p.actual_result
-    if (outcomeFilter === 'Incorrect') return p.actual_result !== null && p.predicted_outcome !== p.actual_result
+    if (outcomeFilter === 'Pending') return p.actual_result === null || p.actual_result === 'DNP'
+    if (outcomeFilter === 'Correct') return p.actual_result !== null && p.actual_result !== 'DNP' && p.predicted_outcome === p.actual_result
+    if (outcomeFilter === 'Incorrect') return p.actual_result !== null && p.actual_result !== 'DNP' && p.predicted_outcome !== p.actual_result
     if (searchQuery && !p.player_name.toLowerCase().includes(searchQuery.toLowerCase())) return false
     return true
   })
@@ -284,10 +301,23 @@ export default function History() {
       ) : (
         <>
           <div
-            className="overflow-x-auto overflow-y-auto max-h-96 rounded-2xl border"
+            className="overflow-y-auto max-h-96 rounded-2xl border"
             style={{ borderColor: 'var(--border)' }}
           >
-            <table className="w-full text-sm">
+            <table className="w-full text-sm" style={{ tableLayout: 'fixed' }}>
+              <colgroup>
+                <col style={{ width: '13%' }} />
+                <col style={{ width: '8%' }} />
+                <col style={{ width: '13%' }} />
+                <col style={{ width: '9%' }} />
+                <col style={{ width: '5%' }} />
+                <col style={{ width: '14%' }} />
+                <col style={{ width: '7%' }} />
+                <col style={{ width: '6%' }} />
+                <col style={{ width: '7%' }} />
+                <col style={{ width: '5%' }} />
+                <col style={{ width: '3%' }} />
+              </colgroup>
               <thead>
                 <tr
                   className="text-left text-xs uppercase tracking-widest border-b"
@@ -295,6 +325,7 @@ export default function History() {
                 >
                   {[
                     { label: 'Date',      key: 'timestamp' },
+                    { label: 'Game Date', key: 'game_date' },
                     { label: 'Player',    key: 'player_name' },
                     { label: 'Stat',      key: 'stat_type' },
                     { label: 'Line',      key: 'stat_line' },
@@ -308,7 +339,7 @@ export default function History() {
                       <th
                         key={key}
                         onClick={() => handleSort(key)}
-                        className="sort-header px-4 py-3 font-semibold"
+                        className="sort-header px-2 py-2 font-semibold truncate"
                       >
                         {label}
                         {active && (
@@ -319,8 +350,8 @@ export default function History() {
                       </th>
                     )
                   })}
-                  <th className="px-4 py-3 font-semibold text-center select-none" style={{ color: 'var(--text-muted)' }}>Result</th>
-                  <th className="px-4 py-3"></th>
+                  <th className="px-2 py-2 font-semibold text-center select-none" style={{ color: 'var(--text-muted)' }}>Result</th>
+                  <th className="px-2 py-2"></th>
                 </tr>
               </thead>
               <tbody className="divide-theme">

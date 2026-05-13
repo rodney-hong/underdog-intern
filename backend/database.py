@@ -13,6 +13,7 @@ _STATS_COLS = [
     "numMinutes", "points", "assists", "reboundsTotal", "reboundsOffensive",
     "reboundsDefensive", "threePointersMade", "plusMinusPoints", "win",
     "estimatedPace", "usagePercentage", "defensiveRating",
+    "blocks", "steals", "turnovers", "doubleDouble", "threePointersAttempted",
 ]
 _SCHEDULE_COLS = [
     "gameId", "gameDateTimeEst", "homeTeamId", "awayTeamId",
@@ -43,6 +44,16 @@ def init_db():
         )
     """)
     conn.execute("CREATE TABLE IF NOT EXISTS kaggle_version (version INTEGER)")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS odds_cache (
+            id INTEGER PRIMARY KEY,
+            cached_at TEXT,
+            data TEXT
+        )
+    """)
+    existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(predictions)").fetchall()}
+    if "game_date" not in existing_cols:
+        conn.execute("ALTER TABLE predictions ADD COLUMN game_date TEXT")
     conn.commit()
     conn.close()
 
@@ -55,26 +66,33 @@ def log_prediction(
     predicted_outcome: str,
     confidence: float,
     explanation: str,
+    game_date: str | None = None,
 ) -> int:
     conn = get_connection()
     existing = conn.execute(
         """
-        SELECT id FROM predictions
+        SELECT id, confidence FROM predictions
         WHERE player_name = ? AND stat_type = ? AND stat_line = ? AND opponent_team = ?
-          AND (julianday('now') - julianday(timestamp)) * 24 < 24
+          AND COALESCE(game_date, '') = COALESCE(?, '')
         ORDER BY timestamp DESC LIMIT 1
         """,
-        (player_name, stat_type, stat_line, opponent_team),
+        (player_name, stat_type, stat_line, opponent_team, game_date),
     ).fetchone()
     if existing:
+        if abs(existing["confidence"] - confidence) > 1e-6:
+            conn.execute(
+                "UPDATE predictions SET confidence = ?, explanation = ?, timestamp = ? WHERE id = ?",
+                (confidence, explanation, datetime.utcnow().isoformat(), existing["id"]),
+            )
+            conn.commit()
         conn.close()
         return existing["id"]
     cursor = conn.execute(
         """
         INSERT INTO predictions
             (timestamp, player_name, stat_type, stat_line, opponent_team,
-             predicted_outcome, confidence, explanation, actual_result)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)
+             predicted_outcome, confidence, explanation, actual_result, game_date)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
         """,
         (
             datetime.utcnow().isoformat(),
@@ -85,6 +103,7 @@ def log_prediction(
             predicted_outcome,
             confidence,
             explanation,
+            game_date,
         ),
     )
     row_id = cursor.lastrowid
@@ -94,14 +113,22 @@ def log_prediction(
 
 
 _RESOLVE_STAT_COLS = {
-    "Points":   ["points"],
-    "Rebounds": ["reboundsTotal"],
-    "Assists":  ["assists"],
-    "3PM":      ["threePointersMade"],
-    "PRA":      ["points", "reboundsTotal", "assists"],
-    "PR":       ["points", "reboundsTotal"],
-    "PA":       ["points", "assists"],
-    "RA":       ["reboundsTotal", "assists"],
+    "Points":               ["points"],
+    "Rebounds":             ["reboundsTotal"],
+    "Assists":              ["assists"],
+    "3PM":                  ["threePointersMade"],
+    "PRA":                  ["points", "reboundsTotal", "assists"],
+    "PR":                   ["points", "reboundsTotal"],
+    "PA":                   ["points", "assists"],
+    "RA":                   ["reboundsTotal", "assists"],
+    "Blocks":               ["blocks"],
+    "Steals":               ["steals"],
+    "Blocks+Steals":        ["blocks", "steals"],
+    "Turnovers":            ["turnovers"],
+    "Offensive Rebounds":   ["reboundsOffensive"],
+    "Defensive Rebounds":   ["reboundsDefensive"],
+    "Double Double":        ["doubleDouble"],
+    "3PA":                  ["threePointersAttempted"],
 }
 
 
@@ -137,7 +164,12 @@ def resolve_pending_predictions() -> int:
             except ValueError:
                 continue
 
-            cols_sql = ", ".join(stat_cols + ["gameDateTimeEst"])
+            available_cols = {
+                r[1] for r in conn.execute("PRAGMA table_info(player_stats)").fetchall()
+            }
+            needed = stat_cols + ["gameDateTimeEst", "numMinutes"]
+            select_cols = [c for c in needed if c in available_cols]
+            cols_sql = ", ".join(select_cols)
             game = conn.execute(
                 f"SELECT {cols_sql} FROM player_stats "
                 "WHERE firstName = ? AND lastName = ? AND opponentteamName = ? "
@@ -158,8 +190,12 @@ def resolve_pending_predictions() -> int:
             if abs((game_dt - pred_ts).total_seconds()) > 86400:
                 continue
 
-            actual_value = sum(float(game[c] or 0) for c in stat_cols)
-            actual_result = "OVER" if actual_value > row["stat_line"] else "UNDER"
+            minutes_val = game["numMinutes"] if "numMinutes" in select_cols else None
+            if minutes_val is None or float(minutes_val or 0) == 0:
+                actual_result = "DNP"
+            else:
+                actual_value = sum(float(game[c] or 0) for c in stat_cols if c in select_cols)
+                actual_result = "OVER" if actual_value > row["stat_line"] else "UNDER"
 
             conn.execute(
                 "UPDATE predictions SET actual_result = ? WHERE id = ?",

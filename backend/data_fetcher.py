@@ -5,11 +5,19 @@ All function signatures are identical to the previous version so predictor.py
 and main.py require no changes beyond the startup call.
 """
 
+import os
+import json
 import sqlite3
+import time
 import difflib
 import datetime as dt
+from zoneinfo import ZoneInfo
+
 import httpx
 import pandas as pd
+from dotenv import load_dotenv
+
+load_dotenv()
 
 from database import DB_PATH
 
@@ -239,15 +247,24 @@ def get_game_logs(
     if player_id is None:
         return pd.DataFrame()
 
+    _ALWAYS_COLS = [
+        "gameDateTimeEst",
+        "playerteamName", "playerteamCity",
+        "opponentteamName", "opponentteamCity",
+        "points", "assists", "reboundsTotal", "reboundsOffensive", "reboundsDefensive",
+        "threePointersMade", "numMinutes", "win", "plusMinusPoints",
+        "estimatedPace", "usagePercentage", "defensiveRating",
+    ]
+    _OPTIONAL_COLS = ["blocks", "steals", "turnovers", "doubleDouble", "threePointersAttempted"]
+
     conn = get_db()
+    available = {r[1] for r in conn.execute("PRAGMA table_info(player_stats)").fetchall()}
+    select_cols = [c for c in _ALWAYS_COLS if c in available] + \
+                  [c for c in _OPTIONAL_COLS if c in available]
+    cols_sql = ", ".join(select_cols)
     rows = conn.execute(
-        """
-        SELECT gameDateTimeEst,
-               playerteamName, playerteamCity,
-               opponentteamName, opponentteamCity,
-               points, assists, reboundsTotal, threePointersMade,
-               numMinutes, win, plusMinusPoints,
-               estimatedPace, usagePercentage, defensiveRating
+        f"""
+        SELECT {cols_sql}
         FROM player_stats
         WHERE personId = ? AND gameType = ?
         ORDER BY gameDateTimeEst DESC
@@ -262,19 +279,27 @@ def get_game_logs(
 
     df = pd.DataFrame([dict(r) for r in rows])
 
-    df = df.rename(columns={
-        "gameDateTimeEst":   "GAME_DATE",
-        "points":            "PTS",
-        "assists":           "AST",
-        "reboundsTotal":     "REB",
-        "threePointersMade": "FG3M",
-        "numMinutes":        "MIN",
-        "plusMinusPoints":   "PLUS_MINUS",
-        "win":               "WL",
-        "estimatedPace":     "PACE",
-        "usagePercentage":   "USG",
-        "defensiveRating":   "DEF_RTG",
-    })
+    _RENAME = {
+        "gameDateTimeEst":        "GAME_DATE",
+        "points":                 "PTS",
+        "assists":                "AST",
+        "reboundsTotal":          "REB",
+        "reboundsOffensive":      "OREB",
+        "reboundsDefensive":      "DREB",
+        "threePointersMade":      "FG3M",
+        "threePointersAttempted": "FG3A",
+        "numMinutes":             "MIN",
+        "plusMinusPoints":        "PLUS_MINUS",
+        "win":                    "WL",
+        "estimatedPace":          "PACE",
+        "usagePercentage":        "USG",
+        "defensiveRating":        "DEF_RTG",
+        "blocks":                 "BLK",
+        "steals":                 "STL",
+        "turnovers":              "TOV",
+        "doubleDouble":           "DD",
+    }
+    df = df.rename(columns={k: v for k, v in _RENAME.items() if k in df.columns})
 
     df["GAME_DATE"] = pd.to_datetime(df["GAME_DATE"], errors="coerce")
 
@@ -382,6 +407,7 @@ def get_player_context(player_name: str) -> dict | None:
             "next_opponent_abbrev": None,
             "is_home":              False,
             "is_back_to_back":      False,
+            "next_game_date":       None,
         }
 
     is_home = int(game_row["homeTeamId"]) == team_id
@@ -404,6 +430,8 @@ def get_player_context(player_name: str) -> dict | None:
     ).fetchone()
     b2b = b2b_row["cnt"] > 0
 
+    next_game_date = str(game_row["gameDateTimeEst"])[:10] if game_row["gameDateTimeEst"] else None
+
     conn.close()
 
     return {
@@ -413,6 +441,7 @@ def get_player_context(player_name: str) -> dict | None:
         "next_opponent_abbrev": opp_abbrev,
         "is_home":              is_home,
         "is_back_to_back":      b2b,
+        "next_game_date":       next_game_date,
     }
 
 
@@ -525,3 +554,205 @@ def get_player_news(player_name: str) -> str:
     except Exception:
         pass
     return ""
+
+
+# ---------------------------------------------------------------------------
+# OddsAPI — today's player prop lines
+# ---------------------------------------------------------------------------
+
+_ODDS_API_KEY = os.getenv("ODDS_API_KEY", "")
+_ODDS_EVENTS_URL = "https://api.the-odds-api.com/v4/sports/basketball_nba/events"
+_ODDS_PROPS_URL  = "https://api.the-odds-api.com/v4/sports/basketball_nba/events/{event_id}/odds"
+_PREFERRED_BOOKS = ["fanduel", "draftkings"]
+_PROP_MARKETS    = "player_points,player_rebounds,player_assists,player_threes"
+_STAT_TYPE_MAP   = {
+    "Points":   "player_points",
+    "Rebounds": "player_rebounds",
+    "Assists":  "player_assists",
+    "3PM":      "player_threes",
+}
+_CACHE_TTL = 6 * 3600  # 6 hours
+
+_lines_cache: dict = {}
+_lines_cache_ts: float = 0.0
+
+
+def get_todays_lines() -> dict:
+    """
+    Return today's NBA player prop lines keyed by player name:
+      {
+        "Cade Cunningham": {
+          "player_points": {"value": 27.5, "source": "fanduel"},
+          ...
+          "game_id": "...", "home_team": "...", "away_team": "..."
+        }
+      }
+    Cache hierarchy (6-hour TTL):
+      1. In-memory dict  — avoids SQLite reads within the same process lifetime.
+      2. SQLite odds_cache table — survives server restarts.
+      3. OddsAPI fetch — writes result back to both layers.
+    Returns stale memory cache on network/API error; {} if no key configured.
+    """
+    global _lines_cache, _lines_cache_ts
+
+    if not _ODDS_API_KEY:
+        return {}
+
+    now      = time.time()
+    eastern  = ZoneInfo("America/New_York")
+    today_et = dt.datetime.now(eastern).date()
+
+    # 1. In-memory hit — TTL and same calendar day (ET)
+    if _lines_cache and (now - _lines_cache_ts) < _CACHE_TTL:
+        cached_date_et = dt.datetime.fromtimestamp(_lines_cache_ts, tz=eastern).date()
+        if cached_date_et == today_et:
+            return _lines_cache
+        # Different calendar day — fall through to refresh
+
+    # 2. SQLite hit — TTL and same calendar day (ET)
+    conn = get_db()
+    row = conn.execute(
+        "SELECT data, cached_at FROM odds_cache "
+        "WHERE (julianday('now') - julianday(cached_at)) * 86400 < ? LIMIT 1",
+        (_CACHE_TTL,),
+    ).fetchone()
+    conn.close()
+    if row:
+        try:
+            cached_dt     = dt.datetime.fromisoformat(row["cached_at"])
+            cached_dt_utc = cached_dt.replace(tzinfo=dt.timezone.utc)
+            if cached_dt_utc.astimezone(eastern).date() == today_et:
+                _lines_cache    = json.loads(row["data"])
+                _lines_cache_ts = cached_dt_utc.timestamp()
+                return _lines_cache
+            # Different calendar day — fall through to API fetch
+        except Exception:
+            pass  # corrupted row — fall through to API fetch
+
+    # 3. Fetch today's events
+    try:
+        resp = httpx.get(_ODDS_EVENTS_URL, params={"apiKey": _ODDS_API_KEY}, timeout=10)
+        resp.raise_for_status()
+        events = resp.json()
+    except Exception:
+        return _lines_cache  # return stale cache rather than crashing
+
+    # Filter to games starting today in US/Eastern time
+    today_events = []
+    for event in events:
+        try:
+            commence = dt.datetime.fromisoformat(
+                event["commence_time"].replace("Z", "+00:00")
+            )
+            if commence.astimezone(eastern).date() == today_et:
+                today_events.append(event)
+        except Exception:
+            continue
+
+    # Fetch props for each game and merge into one player map
+    new_cache: dict = {}
+    for event in today_events:
+        game_id   = event["id"]
+        home_team = event.get("home_team", "")
+        away_team = event.get("away_team", "")
+        try:
+            resp = httpx.get(
+                _ODDS_PROPS_URL.format(event_id=game_id),
+                params={
+                    "apiKey":      _ODDS_API_KEY,
+                    "regions":     "us",
+                    "markets":     _PROP_MARKETS,
+                    "oddsFormat":  "american",
+                },
+                timeout=10,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception:
+            continue
+
+        # Build player_lines for this event.
+        # Iterate preferred books in order; first book to set a market wins.
+        player_lines: dict = {}
+        for book_key in _PREFERRED_BOOKS:
+            book = next(
+                (b for b in data.get("bookmakers", []) if b["key"] == book_key),
+                None,
+            )
+            if not book:
+                continue
+            for market in book.get("markets", []):
+                market_key = market["key"]
+                seen: set = set()
+                for outcome in market.get("outcomes", []):
+                    player = outcome.get("description", "")
+                    point  = outcome.get("point")
+                    if not player or point is None or player in seen:
+                        continue
+                    seen.add(player)
+                    if player not in player_lines:
+                        player_lines[player] = {
+                            "game_id":   game_id,
+                            "home_team": home_team,
+                            "away_team": away_team,
+                        }
+                    # First book to provide a market key wins (fanduel > draftkings)
+                    if market_key not in player_lines[player]:
+                        player_lines[player][market_key] = {
+                            "value":  point,
+                            "source": book_key,
+                        }
+
+        new_cache.update(player_lines)
+
+    # Persist to SQLite so the cache survives restarts
+    cached_at = dt.datetime.now(dt.timezone.utc).isoformat()
+    try:
+        conn = get_db()
+        conn.execute("DELETE FROM odds_cache")
+        conn.execute(
+            "INSERT INTO odds_cache (cached_at, data) VALUES (?, ?)",
+            (cached_at, json.dumps(new_cache)),
+        )
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass  # non-fatal: memory cache still works if the write fails
+
+    _lines_cache    = new_cache
+    _lines_cache_ts = now
+    return _lines_cache
+
+
+def get_player_line(player_name: str, stat_type: str) -> tuple[float | None, str | None]:
+    """
+    Return (line_value, bookmaker_key) for the given player and stat type,
+    or (None, None) if unavailable.
+    Combined stat types (PRA, PR, PA, RA) always return (None, None).
+    Uses fuzzy name matching (cutoff 0.85) to handle minor OddsAPI name differences.
+    """
+    market_key = _STAT_TYPE_MAP.get(stat_type)
+    if not market_key:
+        return None, None
+
+    cache = get_todays_lines()
+    if not cache:
+        return None, None
+
+    def _extract(name: str) -> tuple[float | None, str | None]:
+        entry = cache.get(name, {}).get(market_key)
+        if entry:
+            return entry["value"], entry["source"]
+        return None, None
+
+    # Exact match first
+    value, source = _extract(player_name)
+    if value is not None:
+        return value, source
+
+    # Fuzzy fallback
+    close = difflib.get_close_matches(player_name, list(cache.keys()), n=1, cutoff=0.85)
+    if close:
+        return _extract(close[0])
+
+    return None, None

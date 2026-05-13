@@ -110,14 +110,22 @@ def _get_home_away_split(player_name: str, stat_type: str, is_home: bool) -> flo
 # ---------------------------------------------------------------------------
 
 STAT_COLUMNS = {
-    "Points": ["PTS"],
-    "Assists": ["AST"],
-    "Rebounds": ["REB"],
-    "PRA": ["PTS", "REB", "AST"],
-    "3PM": ["FG3M"],
-    "PR": ["PTS", "REB"],
-    "PA": ["PTS", "AST"],
-    "RA": ["REB", "AST"],
+    "Points":             ["PTS"],
+    "Assists":            ["AST"],
+    "Rebounds":           ["REB"],
+    "PRA":                ["PTS", "REB", "AST"],
+    "3PM":                ["FG3M"],
+    "PR":                 ["PTS", "REB"],
+    "PA":                 ["PTS", "AST"],
+    "RA":                 ["REB", "AST"],
+    "Blocks":             ["BLK"],
+    "Steals":             ["STL"],
+    "Blocks+Steals":      ["BLK", "STL"],
+    "Turnovers":          ["TOV"],
+    "Offensive Rebounds": ["OREB"],
+    "Defensive Rebounds": ["DREB"],
+    "Double Double":      ["DD"],
+    "3PA":                ["FG3A"],
 }
 
 

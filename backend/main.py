@@ -45,7 +45,11 @@ def startup_event():
 # Models
 # ---------------------------------------------------------------------------
 
-VALID_STAT_TYPES = {"Points", "Assists", "Rebounds", "PRA", "3PM", "PR", "PA", "RA"}
+VALID_STAT_TYPES = {
+    "Points", "Assists", "Rebounds", "PRA", "3PM", "PR", "PA", "RA",
+    "Blocks", "Steals", "Blocks+Steals", "Turnovers",
+    "Offensive Rebounds", "Defensive Rebounds", "Double Double", "3PA",
+}
 
 
 class ActualResultRequest(BaseModel):
@@ -66,6 +70,7 @@ class PredictRequest(BaseModel):
     stat_type: str
     is_home: bool = False
     is_back_to_back: bool = False
+    game_date: str | None = None
 
     @field_validator("stat_type")
     @classmethod
@@ -126,6 +131,7 @@ def get_player_team(player_name: str):
         ),
         "is_home": ctx["is_home"],
         "is_back_to_back": ctx["is_back_to_back"],
+        "next_game_date": ctx.get("next_game_date"),
     }
 
 
@@ -187,6 +193,7 @@ def predict_prop(req: PredictRequest):
         predicted_outcome=result["outcome"],
         confidence=result["confidence"],
         explanation=result["explanation"],
+        game_date=req.game_date,
     )
 
     return {
@@ -203,7 +210,7 @@ def get_prediction_history():
     conn = database.get_connection()
     rows = conn.execute(
         """SELECT id, timestamp, player_name, stat_type, stat_line, opponent_team,
-                  predicted_outcome, confidence, explanation, actual_result
+                  predicted_outcome, confidence, explanation, actual_result, game_date
            FROM predictions
            ORDER BY timestamp DESC"""
     ).fetchall()
@@ -246,7 +253,7 @@ def update_prediction_result(pred_id: int, req: ActualResultRequest):
     conn.commit()
     row = conn.execute(
         """SELECT id, timestamp, player_name, stat_type, stat_line, opponent_team,
-                  predicted_outcome, confidence, explanation, actual_result
+                  predicted_outcome, confidence, explanation, actual_result, game_date
            FROM predictions WHERE id = ?""",
         (pred_id,),
     ).fetchone()
@@ -254,6 +261,136 @@ def update_prediction_result(pred_id: int, req: ActualResultRequest):
     if not row:
         raise HTTPException(status_code=404, detail=f"Prediction {pred_id} not found")
     return dict(row)
+
+
+@app.get("/slip")
+def build_slip(size: int = Query(default=2, ge=1, le=5)):
+    """
+    Build a suggested parlay slip from tonight's games.
+    Runs predictions for every player in the OddsAPI lines cache in parallel,
+    applies diversity rules, and returns up to 3 picks with combined confidence.
+    """
+    SLIP_STATS = ["Points", "Rebounds", "Assists", "3PM"]
+    STAT_TO_MARKET = {
+        "Points":   "player_points",
+        "Rebounds": "player_rebounds",
+        "Assists":  "player_assists",
+        "3PM":      "player_threes",
+    }
+    MIN_CONFIDENCE = 0.65
+
+    lines = data_fetcher.get_todays_lines()
+    if not lines:
+        return {"picks": [], "parlay_confidence": 0.0}
+
+    def _predict_player(player_name: str) -> list[dict]:
+        player_data = lines.get(player_name, {})
+        home_team = player_data.get("home_team", "")
+        away_team = player_data.get("away_team", "")
+        game_id   = player_data.get("game_id", "")
+
+        ctx = data_fetcher.get_player_context(player_name)
+        if ctx is None or not ctx.get("next_opponent_full"):
+            return []
+
+        opponent_team   = ctx["next_opponent_full"]
+        is_home         = ctx["is_home"]
+        is_back_to_back = ctx["is_back_to_back"]
+
+        results = []
+        for stat_type in SLIP_STATS:
+            market_data = player_data.get(STAT_TO_MARKET[stat_type])
+            if not market_data:
+                continue
+            line_value = market_data["value"]
+            source     = market_data["source"]
+            try:
+                pred = predictor.predict(
+                    player_name=player_name,
+                    opponent_team=opponent_team,
+                    stat_line=line_value,
+                    stat_type=stat_type,
+                    is_home=is_home,
+                    is_back_to_back=is_back_to_back,
+                )
+            except Exception:
+                continue
+            if pred["confidence"] < MIN_CONFIDENCE:
+                continue
+            results.append({
+                "player":     player_name,
+                "stat_type":  stat_type,
+                "line":       line_value,
+                "outcome":    pred["outcome"],
+                "confidence": pred["confidence"],
+                "source":     source,
+                "game":       f"{home_team} vs {away_team}",
+                "_game_id":   game_id,
+            })
+        return results
+
+    all_candidates: list[dict] = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as ex:
+        futures = {ex.submit(_predict_player, name): name for name in lines}
+        for fut in concurrent.futures.as_completed(futures):
+            try:
+                all_candidates.extend(fut.result())
+            except Exception:
+                pass
+
+    all_candidates.sort(key=lambda x: x["confidence"], reverse=True)
+
+    picks: list[dict] = []
+    already_picked: set = set()
+    used_games:     set = set()
+    used_stat_types: set = set()
+    used_players:   set = set()
+
+    def _fill(min_conf: float, block_same_game: bool, block_same_stat: bool) -> None:
+        for i, c in enumerate(all_candidates):
+            if len(picks) >= size:
+                break
+            if i in already_picked:
+                continue
+            if c["confidence"] < min_conf:
+                continue
+            if block_same_game and c["_game_id"] in used_games:
+                continue
+            if block_same_stat and c["stat_type"] in used_stat_types:
+                continue
+            if not block_same_game and c["player"] in used_players:
+                continue
+            picks.append(c)
+            already_picked.add(i)
+            used_games.add(c["_game_id"])
+            used_stat_types.add(c["stat_type"])
+            used_players.add(c["player"])
+
+    _fill(0.65, block_same_game=True,  block_same_stat=True)   # pass 1
+    if len(picks) < size:
+        _fill(0.60, block_same_game=True,  block_same_stat=False)  # pass 2
+    if len(picks) < size:
+        _fill(0.55, block_same_game=False, block_same_stat=False)  # pass 3
+
+    for pick in picks:
+        pick.pop("_game_id", None)
+
+    parlay_confidence = 1.0
+    for pick in picks:
+        parlay_confidence *= pick["confidence"]
+    parlay_confidence = round(parlay_confidence, 4) if picks else 0.0
+
+    return {"picks": picks, "parlay_confidence": parlay_confidence}
+
+
+@app.get("/lines/{player_name}/{stat_type}")
+def get_player_line(player_name: str, stat_type: str):
+    """
+    Return the sportsbook line for a player's stat type for today's game.
+    { "line": 27.5, "source": "fanduel" } or { "line": null, "source": null }
+    """
+    line, source = data_fetcher.get_player_line(player_name, stat_type)
+    return {"line": line, "source": source}
 
 
 @app.get("/health")
