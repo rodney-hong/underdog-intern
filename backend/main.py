@@ -71,6 +71,7 @@ class PredictRequest(BaseModel):
     is_home: bool = False
     is_back_to_back: bool = False
     game_date: str | None = None
+    league: str = "NBA"
 
     @field_validator("stat_type")
     @classmethod
@@ -194,6 +195,7 @@ def predict_prop(req: PredictRequest):
         confidence=result["confidence"],
         explanation=result["explanation"],
         game_date=req.game_date,
+        league=req.league,
     )
 
     return {
@@ -210,7 +212,7 @@ def get_prediction_history():
     conn = database.get_connection()
     rows = conn.execute(
         """SELECT id, timestamp, player_name, stat_type, stat_line, opponent_team,
-                  predicted_outcome, confidence, explanation, actual_result, game_date
+                  predicted_outcome, confidence, explanation, actual_result, game_date, league
            FROM predictions
            ORDER BY timestamp DESC"""
     ).fetchall()
@@ -222,8 +224,8 @@ def get_prediction_history():
 def delete_duplicate_predictions():
     """
     Remove duplicate predictions, keeping the earliest row (lowest id) for each
-    unique combination of player_name, stat_type, stat_line, opponent_team, and
-    predicted_outcome.
+    unique combination of player_name, stat_type, stat_line, opponent_team,
+    predicted_outcome, and game_date.
     """
     conn = database.get_connection()
     cursor = conn.execute(
@@ -232,7 +234,8 @@ def delete_duplicate_predictions():
         WHERE id NOT IN (
             SELECT MIN(id)
             FROM predictions
-            GROUP BY player_name, stat_type, stat_line, opponent_team, predicted_outcome
+            GROUP BY player_name, stat_type, stat_line, opponent_team, predicted_outcome,
+                     COALESCE(game_date, '')
         )
         """
     )
@@ -253,7 +256,7 @@ def update_prediction_result(pred_id: int, req: ActualResultRequest):
     conn.commit()
     row = conn.execute(
         """SELECT id, timestamp, player_name, stat_type, stat_line, opponent_team,
-                  predicted_outcome, confidence, explanation, actual_result, game_date
+                  predicted_outcome, confidence, explanation, actual_result, game_date, league
            FROM predictions WHERE id = ?""",
         (pred_id,),
     ).fetchone()

@@ -618,6 +618,7 @@ export default function App() {
           is_home: isHome,
           is_back_to_back: isBackToBack,
           game_date: gameDate || null,
+          league: 'NBA',
         }),
       })
       if (!res.ok) {

@@ -9,6 +9,7 @@ const ALL_STAT_TYPES = [
   'Offensive Rebounds', 'Defensive Rebounds', 'Double Double', '3PA',
 ]
 const OUTCOME_FILTERS = ['All', 'Correct', 'Incorrect', 'Pending']
+const LEAGUE_FILTERS = ['All', 'NBA', 'NFL', 'WNBA']
 
 // ---------------------------------------------------------------------------
 // Summary cards
@@ -127,6 +128,7 @@ export default function History() {
   const [cleaning, setCleaning] = useState(false)
   const [statFilter, setStatFilter] = useState('All')
   const [outcomeFilter, setOutcomeFilter] = useState('All')
+  const [leagueFilter, setLeagueFilter] = useState('All')
   const [searchQuery, setSearchQuery] = useState('')
   const [page, setPage] = useState(1)
   const [pageSize, setPageSize] = useState(10)
@@ -150,7 +152,7 @@ export default function History() {
   useEffect(() => { fetchHistory() }, [fetchHistory])
 
   // Reset to page 1 whenever filters, search, page size, or sort change
-  useEffect(() => { setPage(1) }, [statFilter, outcomeFilter, searchQuery, pageSize, sortConfig])
+  useEffect(() => { setPage(1) }, [statFilter, outcomeFilter, leagueFilter, searchQuery, pageSize, sortConfig])
 
   const handleOverride = async (id) => {
     try {
@@ -204,6 +206,7 @@ export default function History() {
 
   // Filter pipeline
   const filtered = predictions.filter((p) => {
+    if (leagueFilter !== 'All' && (p.league ?? 'NBA') !== leagueFilter) return false
     if (statFilter !== 'All' && p.stat_type !== statFilter) return false
     if (outcomeFilter === 'Pending') return p.actual_result === null || p.actual_result === 'DNP'
     if (outcomeFilter === 'Correct') return p.actual_result !== null && p.actual_result !== 'DNP' && p.predicted_outcome === p.actual_result
@@ -233,7 +236,7 @@ export default function History() {
   const clampedPage = Math.min(page, totalPages)
   const paginated = sorted.slice((clampedPage - 1) * pageSize, clampedPage * pageSize)
 
-  const hasActiveFilter = statFilter !== 'All' || outcomeFilter !== 'All' || searchQuery !== ''
+  const hasActiveFilter = statFilter !== 'All' || outcomeFilter !== 'All' || leagueFilter !== 'All' || searchQuery !== ''
 
   return (
     <div className="w-full max-w-6xl mx-auto px-4">
@@ -261,6 +264,7 @@ export default function History() {
       {/* Filters row */}
       <div className="flex flex-wrap items-center gap-2 mb-4">
         <span className="text-xs uppercase tracking-widest" style={{ color: 'var(--text-muted)' }}>Filter:</span>
+        <FilterSelect value={leagueFilter} onChange={setLeagueFilter} options={LEAGUE_FILTERS} />
         <FilterSelect value={statFilter} onChange={setStatFilter} options={ALL_STAT_TYPES} />
         <FilterSelect value={outcomeFilter} onChange={setOutcomeFilter} options={OUTCOME_FILTERS} />
         <input
@@ -272,7 +276,7 @@ export default function History() {
         />
         {hasActiveFilter && (
           <button
-            onClick={() => { setStatFilter('All'); setOutcomeFilter('All'); setSearchQuery('') }}
+            onClick={() => { setLeagueFilter('All'); setStatFilter('All'); setOutcomeFilter('All'); setSearchQuery('') }}
             className="icon-btn text-xs"
           >
             Clear

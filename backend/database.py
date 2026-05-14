@@ -54,6 +54,9 @@ def init_db():
     existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(predictions)").fetchall()}
     if "game_date" not in existing_cols:
         conn.execute("ALTER TABLE predictions ADD COLUMN game_date TEXT")
+    if "league" not in existing_cols:
+        conn.execute("ALTER TABLE predictions ADD COLUMN league TEXT DEFAULT 'NBA'")
+        conn.execute("UPDATE predictions SET league = 'NBA' WHERE league IS NULL")
     conn.commit()
     conn.close()
 
@@ -67,6 +70,7 @@ def log_prediction(
     confidence: float,
     explanation: str,
     game_date: str | None = None,
+    league: str = "NBA",
 ) -> int:
     conn = get_connection()
     existing = conn.execute(
@@ -91,8 +95,8 @@ def log_prediction(
         """
         INSERT INTO predictions
             (timestamp, player_name, stat_type, stat_line, opponent_team,
-             predicted_outcome, confidence, explanation, actual_result, game_date)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
+             predicted_outcome, confidence, explanation, actual_result, game_date, league)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
         """,
         (
             datetime.utcnow().isoformat(),
@@ -104,6 +108,7 @@ def log_prediction(
             confidence,
             explanation,
             game_date,
+            league,
         ),
     )
     row_id = cursor.lastrowid
