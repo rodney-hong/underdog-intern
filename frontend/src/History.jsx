@@ -8,7 +8,7 @@ const ALL_STAT_TYPES = [
   'Blocks', 'Steals', 'Blocks+Steals', 'Turnovers',
   'Offensive Rebounds', 'Defensive Rebounds', 'Double Double', '3PA',
 ]
-const OUTCOME_FILTERS = ['All', 'Correct', 'Incorrect', 'Pending']
+const OUTCOME_FILTERS = ['All', 'Correct', 'Incorrect', 'Pending', 'DNP']
 const LEAGUE_FILTERS = ['All', 'NBA', 'NFL', 'WNBA']
 
 // ---------------------------------------------------------------------------
@@ -58,7 +58,7 @@ function PredictionRow({ prediction: p, isEditing, editValue, onEdit, onEditChan
     : isResolved ? (isCorrect ? '✅' : '❌') : '⏳'
 
   const actualDisplay = isDNP
-    ? <span style={{ color: 'var(--text-muted)' }}>DNP</span>
+    ? <span className="font-semibold" style={{ color: '#8b5cf6' }}>DNP</span>
     : isResolved
     ? <span className="font-semibold" style={{ color: p.actual_result === 'OVER' ? 'var(--success)' : 'var(--danger)' }}>{p.actual_result}</span>
     : <span style={{ color: 'var(--text-muted)' }}>Pending</span>
@@ -208,7 +208,8 @@ export default function History() {
   const filtered = predictions.filter((p) => {
     if (leagueFilter !== 'All' && (p.league ?? 'NBA') !== leagueFilter) return false
     if (statFilter !== 'All' && p.stat_type !== statFilter) return false
-    if (outcomeFilter === 'Pending') return p.actual_result === null || p.actual_result === 'DNP'
+    if (outcomeFilter === 'Pending') return p.actual_result === null
+    if (outcomeFilter === 'DNP') return p.actual_result === 'DNP'
     if (outcomeFilter === 'Correct') return p.actual_result !== null && p.actual_result !== 'DNP' && p.predicted_outcome === p.actual_result
     if (outcomeFilter === 'Incorrect') return p.actual_result !== null && p.actual_result !== 'DNP' && p.predicted_outcome !== p.actual_result
     if (searchQuery && !p.player_name.toLowerCase().includes(searchQuery.toLowerCase())) return false

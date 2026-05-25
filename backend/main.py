@@ -5,6 +5,7 @@ Run with: uvicorn main:app --reload --port 8000
 """
 
 import concurrent.futures
+import threading
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, field_validator
@@ -39,6 +40,15 @@ def startup_event():
         print("Model ready.")
     else:
         print("Model up to date, skipping training.")
+
+    wnba_etl_ran = database.run_wnba_etl()
+
+    if wnba_etl_ran or not os.path.exists(ml_trainer.WNBA_MODEL_PATH):
+        print("Training WNBA XGBoost models…")
+        ml_trainer.train_wnba_models()
+        print("WNBA models ready.")
+    else:
+        print("WNBA models up to date, skipping training.")
 
 
 # ---------------------------------------------------------------------------
@@ -170,7 +180,8 @@ def predict_prop(req: PredictRequest):
     Returns: { outcome, confidence, explanation }
     Logs every prediction to predictions.db.
     """
-    result = predictor.predict(
+    _predict_fn = predictor.predict_wnba if req.league == "WNBA" else predictor.predict
+    result = _predict_fn(
         player_name=req.player_name,
         opponent_team=req.opponent_team,
         stat_line=req.stat_line,
@@ -223,19 +234,25 @@ def get_prediction_history():
 @app.delete("/predictions/duplicates")
 def delete_duplicate_predictions():
     """
-    Remove duplicate predictions, keeping the earliest row (lowest id) for each
-    unique combination of player_name, stat_type, stat_line, opponent_team,
-    predicted_outcome, and game_date.
+    Remove duplicate predictions, keeping the row with the highest confidence for each
+    unique combination of player_name, stat_type, stat_line, opponent_team, and game_date.
+    Ties are broken by lowest id.
     """
     conn = database.get_connection()
     cursor = conn.execute(
         """
         DELETE FROM predictions
         WHERE id NOT IN (
-            SELECT MIN(id)
-            FROM predictions
-            GROUP BY player_name, stat_type, stat_line, opponent_team, predicted_outcome,
-                     COALESCE(game_date, '')
+            SELECT id FROM (
+                SELECT id,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY player_name, stat_type, stat_line, opponent_team,
+                                        COALESCE(game_date, '')
+                           ORDER BY id DESC
+                       ) AS rn
+                FROM predictions
+            )
+            WHERE rn = 1
         )
         """
     )
@@ -383,6 +400,59 @@ def build_slip(size: int = Query(default=2, ge=1, le=5)):
         parlay_confidence *= pick["confidence"]
     parlay_confidence = round(parlay_confidence, 4) if picks else 0.0
 
+    _SECONDARY_STAT_TO_MARKET = {
+        "Steals":             "player_steals",
+        "Blocks":             "player_blocks",
+        "Turnovers":          "player_turnovers",
+        "Offensive Rebounds": "player_offensive_rebounds",
+        "Defensive Rebounds": "player_defensive_rebounds",
+        "3PA":                "player_three_point_attempts",
+        "Blocks+Steals":      "player_blocks_steals",
+        "Double Double":      "player_double_double",
+    }
+
+    def _log_secondary_stats() -> None:
+        count = 0
+        for player_name, player_data in lines.items():
+            ctx = data_fetcher.get_player_context(player_name)
+            if ctx is None or not ctx.get("next_opponent_full"):
+                continue
+            opponent_team   = ctx["next_opponent_full"]
+            is_home         = ctx["is_home"]
+            is_back_to_back = ctx["is_back_to_back"]
+            game_date       = ctx["next_game_date"]
+            for stat_type, market_key in _SECONDARY_STAT_TO_MARKET.items():
+                market_data = player_data.get(market_key)
+                if not market_data:
+                    continue
+                line_value = market_data["value"]
+                try:
+                    pred = predictor.predict(
+                        player_name=player_name,
+                        opponent_team=opponent_team,
+                        stat_line=line_value,
+                        stat_type=stat_type,
+                        is_home=is_home,
+                        is_back_to_back=is_back_to_back,
+                    )
+                    database.log_prediction(
+                        player_name=player_name,
+                        stat_type=stat_type,
+                        stat_line=line_value,
+                        opponent_team=opponent_team,
+                        predicted_outcome=pred["outcome"],
+                        confidence=pred["confidence"],
+                        explanation=pred.get("explanation", ""),
+                        game_date=game_date,
+                        league="NBA",
+                    )
+                    count += 1
+                except Exception:
+                    pass
+        print(f"[background] logged {count} secondary stat predictions")
+
+    threading.Thread(target=_log_secondary_stats, daemon=True).start()
+
     return {"picks": picks, "parlay_confidence": parlay_confidence}
 
 
@@ -393,6 +463,67 @@ def get_player_line(player_name: str, stat_type: str):
     { "line": 27.5, "source": "fanduel" } or { "line": null, "source": null }
     """
     line, source = data_fetcher.get_player_line(player_name, stat_type)
+    return {"line": line, "source": source}
+
+
+# ---------------------------------------------------------------------------
+# WNBA endpoints
+# ---------------------------------------------------------------------------
+
+@app.get("/wnba/players/search")
+def search_wnba_players(q: str = Query(default="", min_length=1)):
+    if not q.strip():
+        return []
+    return data_fetcher.search_wnba_players(q)
+
+
+@app.get("/wnba/teams")
+def get_wnba_teams():
+    return data_fetcher.get_wnba_team_names()
+
+
+@app.get("/wnba/players/{player_name}/team")
+def get_wnba_player_team(player_name: str):
+    ctx = data_fetcher.get_wnba_player_context(player_name)
+    if ctx is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"WNBA player '{player_name}' not found or has no current team",
+        )
+    return {
+        "player_name": player_name,
+        "player_team": {
+            "full":   ctx["player_team_full"],
+            "abbrev": ctx["player_team_abbrev"],
+        },
+        "next_opponent": (
+            {
+                "full":   ctx["next_opponent_full"],
+                "abbrev": ctx["next_opponent_abbrev"],
+            }
+            if ctx["next_opponent_full"]
+            else None
+        ),
+        "is_home":        ctx["is_home"],
+        "is_back_to_back": ctx["is_back_to_back"],
+        "next_game_date":  ctx.get("next_game_date"),
+    }
+
+
+@app.get("/wnba/players/{player_name}/context")
+def get_wnba_player_context_endpoint(player_name: str):
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
+        injury_fut = ex.submit(data_fetcher.get_wnba_injury_status, player_name)
+        try:
+            injury_status = injury_fut.result(timeout=5)
+        except Exception:
+            injury_status = None
+    return {"injury_status": injury_status, "news": ""}
+
+
+@app.get("/wnba/lines/{player_name}/{stat_type}")
+def get_wnba_player_line(player_name: str, stat_type: str):
+    line, source = data_fetcher.get_wnba_player_line(player_name, stat_type)
     return {"line": line, "source": source}
 
 

@@ -233,10 +233,9 @@ def get_all_active_players() -> list[dict]:
 def get_game_logs(
     player_name: str,
     last_n: int = 20,
-    game_type: str = "Regular Season",
 ) -> pd.DataFrame:
     """
-    Return a DataFrame of the player's last `last_n` games of `game_type`.
+    Return a DataFrame of the player's last `last_n` games across all game types.
 
     Columns are renamed to match predictor.py's expectations:
       GAME_DATE, MATCHUP, PTS, REB, AST, FG3M, MIN, PLUS_MINUS, WL
@@ -266,11 +265,11 @@ def get_game_logs(
         f"""
         SELECT {cols_sql}
         FROM player_stats
-        WHERE personId = ? AND gameType = ?
+        WHERE personId = ?
         ORDER BY gameDateTimeEst DESC
         LIMIT ?
         """,
-        (player_id, game_type, last_n),
+        (player_id, last_n),
     ).fetchall()
     conn.close()
 
@@ -380,8 +379,12 @@ def get_player_context(player_name: str) -> dict | None:
     team_full   = f"{team_row['playerteamCity']} {team_row['playerteamName']}"
     team_abbrev = full_to_abbrev(team_full)
 
-    # Next scheduled game after right now (UTC)
-    now = dt.datetime.now(dt.timezone.utc).isoformat()
+    # Next scheduled game after right now (UTC).
+    # Use strftime to produce 'YYYY-MM-DD HH:MM:SS' — the same format SQLite stores
+    # datetimes in — so the string comparison is reliable.  .isoformat() produces
+    # 'YYYY-MM-DDTHH:MM:SS+00:00' where the 'T' and '+00:00' suffix break ordering
+    # against space-separated stored values (space < 'T' in ASCII).
+    now = dt.datetime.now(dt.timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
     game_row = conn.execute(
         """
         SELECT gameDateTimeEst, homeTeamId,
@@ -564,12 +567,15 @@ _ODDS_API_KEY = os.getenv("ODDS_API_KEY", "")
 _ODDS_EVENTS_URL = "https://api.the-odds-api.com/v4/sports/basketball_nba/events"
 _ODDS_PROPS_URL  = "https://api.the-odds-api.com/v4/sports/basketball_nba/events/{event_id}/odds"
 _PREFERRED_BOOKS = ["fanduel", "draftkings"]
-_PROP_MARKETS    = "player_points,player_rebounds,player_assists,player_threes"
+_PROP_MARKETS    = "player_points,player_rebounds,player_assists,player_threes,player_steals,player_blocks,player_blocks_steals"
 _STAT_TYPE_MAP   = {
-    "Points":   "player_points",
-    "Rebounds": "player_rebounds",
-    "Assists":  "player_assists",
-    "3PM":      "player_threes",
+    "Points":       "player_points",
+    "Rebounds":     "player_rebounds",
+    "Assists":      "player_assists",
+    "3PM":          "player_threes",
+    "Steals":       "player_steals",
+    "Blocks":       "player_blocks",
+    "Blocks+Steals": "player_blocks_steals",  # DraftKings only; FanDuel doesn't carry this market
 }
 _CACHE_TTL = 6 * 3600  # 6 hours
 
@@ -730,6 +736,11 @@ def get_player_line(player_name: str, stat_type: str) -> tuple[float | None, str
     or (None, None) if unavailable.
     Combined stat types (PRA, PR, PA, RA) always return (None, None).
     Uses fuzzy name matching (cutoff 0.85) to handle minor OddsAPI name differences.
+
+    For Blocks+Steals (player_blocks_steals): FanDuel does not carry this market.
+    The cache is populated with _PREFERRED_BOOKS = ["fanduel", "draftkings"], so FanDuel
+    is checked first and DraftKings fills in as the fallback — the returned source will
+    be "draftkings" for this market.
     """
     market_key = _STAT_TYPE_MAP.get(stat_type)
     if not market_key:
@@ -743,6 +754,11 @@ def get_player_line(player_name: str, stat_type: str) -> tuple[float | None, str
         entry = cache.get(name, {}).get(market_key)
         if entry:
             return entry["value"], entry["source"]
+        # For Blocks+Steals, FanDuel won't carry the market; DraftKings data lands here.
+        if stat_type == "Blocks+Steals":
+            dk_entry = cache.get(name, {}).get("player_blocks_steals")
+            if dk_entry:
+                return dk_entry["value"], dk_entry["source"]
         return None, None
 
     # Exact match first
@@ -755,4 +771,424 @@ def get_player_line(player_name: str, stat_type: str) -> tuple[float | None, str
     if close:
         return _extract(close[0])
 
+    return None, None
+
+
+# ---------------------------------------------------------------------------
+# WNBA — ESPN public API + BallDontLie + OddsAPI
+# ---------------------------------------------------------------------------
+
+_WNBA_SCOREBOARD_URL = "https://site.api.espn.com/apis/site/v2/sports/basketball/wnba/scoreboard"
+_WNBA_INJURIES_URL   = "https://site.api.espn.com/apis/site/v2/sports/basketball/wnba/injuries"
+_WNBA_ODDS_EVENTS    = "https://api.the-odds-api.com/v4/sports/basketball_wnba/events"
+_WNBA_ODDS_PROPS     = "https://api.the-odds-api.com/v4/sports/basketball_wnba/events/{event_id}/odds"
+_BALLDONTLIE_KEY     = os.getenv("BALLDONTLIE_WNBA_KEY", "")
+
+_wnba_lines_cache: dict = {}
+_wnba_lines_cache_ts: float = 0.0
+
+
+def _parse_wnba_minutes(s) -> float:
+    try:
+        parts = str(s).split(":")
+        return float(parts[0]) + (float(parts[1]) / 60 if len(parts) > 1 else 0)
+    except Exception:
+        return 0.0
+
+
+def get_wnba_team_names() -> list[str]:
+    """Return sorted list of distinct WNBA team names from wnba_player_stats."""
+    conn = get_db()
+    try:
+        rows = conn.execute(
+            "SELECT DISTINCT player_team FROM wnba_player_stats ORDER BY player_team"
+        ).fetchall()
+    except Exception:
+        rows = []
+    finally:
+        conn.close()
+    return [r["player_team"] for r in rows if r["player_team"]]
+
+
+def search_wnba_players(query: str, limit: int = 10) -> list[str]:
+    """Return up to limit WNBA player names matching query (DB + BallDontLie)."""
+    q = query.strip()
+    if not q:
+        return []
+    conn = get_db()
+    try:
+        rows = conn.execute(
+            "SELECT DISTINCT player_name FROM wnba_player_stats "
+            "WHERE player_name LIKE ? ORDER BY player_name LIMIT ?",
+            (f"%{q}%", limit),
+        ).fetchall()
+    except Exception:
+        rows = []
+    finally:
+        conn.close()
+    db_names = [r["player_name"] for r in rows]
+
+    bdl_names: list[str] = []
+    if _BALLDONTLIE_KEY:
+        try:
+            resp = httpx.get(
+                "https://api.balldontlie.io/wnba/v1/players",
+                params={"search": q},
+                headers={"Authorization": _BALLDONTLIE_KEY},
+                timeout=5,
+            )
+            resp.raise_for_status()
+            for p in resp.json().get("data", []):
+                name = f"{p.get('first_name', '')} {p.get('last_name', '')}".strip()
+                if name:
+                    bdl_names.append(name)
+        except Exception:
+            pass
+
+    seen: set = set()
+    result: list[str] = []
+    for name in db_names + bdl_names:
+        if name not in seen:
+            seen.add(name)
+            result.append(name)
+        if len(result) >= limit:
+            break
+    return result
+
+
+def get_wnba_game_logs(player_name: str, last_n: int = 40) -> pd.DataFrame:
+    """
+    Return DataFrame of last N WNBA games for the player.
+    Columns: GAME_DATE, PTS, REB, AST, FG3M, STL, BLK, TOV, OREB, DREB,
+             MIN, PLUS_MINUS, MATCHUP, player_team, opponent_team.
+    """
+    conn = get_db()
+    try:
+        rows = conn.execute(
+            """
+            SELECT game_date, player_team, opponent_team, home, minutes,
+                   points, rebounds, assists, three_pm, steals, blocks,
+                   turnovers, oreb, dreb, plus_minus
+            FROM wnba_player_stats
+            WHERE player_name = ?
+            ORDER BY game_date DESC
+            LIMIT ?
+            """,
+            (player_name, last_n),
+        ).fetchall()
+    except Exception:
+        rows = []
+    finally:
+        conn.close()
+
+    if not rows:
+        conn = get_db()
+        try:
+            all_rows = conn.execute(
+                "SELECT DISTINCT player_name FROM wnba_player_stats"
+            ).fetchall()
+        except Exception:
+            all_rows = []
+        finally:
+            conn.close()
+        all_names = [r["player_name"] for r in all_rows]
+        close = difflib.get_close_matches(player_name, all_names, n=1, cutoff=0.80)
+        if close:
+            return get_wnba_game_logs(close[0], last_n)
+        return pd.DataFrame()
+
+    df = pd.DataFrame([dict(r) for r in rows])
+    df = df.rename(columns={
+        "game_date":  "GAME_DATE",
+        "points":     "PTS",
+        "rebounds":   "REB",
+        "assists":    "AST",
+        "three_pm":   "FG3M",
+        "steals":     "STL",
+        "blocks":     "BLK",
+        "turnovers":  "TOV",
+        "oreb":       "OREB",
+        "dreb":       "DREB",
+        "plus_minus": "PLUS_MINUS",
+    })
+    df["MIN"] = df["minutes"].apply(_parse_wnba_minutes)
+    df["GAME_DATE"] = pd.to_datetime(df["GAME_DATE"], errors="coerce")
+    df["MATCHUP"] = df["player_team"] + " vs. " + df["opponent_team"]
+    return df
+
+
+def get_wnba_player_context(player_name: str) -> dict | None:
+    """
+    Return team context dict for a WNBA player (same shape as get_player_context).
+    Team from most recent wnba_player_stats row; next game from ESPN WNBA scoreboard.
+    """
+    conn = get_db()
+    try:
+        row = conn.execute(
+            "SELECT player_team FROM wnba_player_stats WHERE player_name = ? "
+            "ORDER BY game_date DESC LIMIT 1",
+            (player_name,),
+        ).fetchone()
+    except Exception:
+        row = None
+    finally:
+        conn.close()
+
+    if not row:
+        conn = get_db()
+        try:
+            all_rows = conn.execute("SELECT DISTINCT player_name FROM wnba_player_stats").fetchall()
+        except Exception:
+            all_rows = []
+        finally:
+            conn.close()
+        all_names = [r["player_name"] for r in all_rows]
+        close = difflib.get_close_matches(player_name, all_names, n=1, cutoff=0.80)
+        if close:
+            return get_wnba_player_context(close[0])
+        return None
+
+    team_full = row["player_team"]
+
+    eastern  = ZoneInfo("America/New_York")
+    today_et = dt.datetime.now(eastern).date()
+
+    def _fetch_wnba_scoreboard(date_str: str) -> list:
+        try:
+            r = httpx.get(_WNBA_SCOREBOARD_URL, params={"dates": date_str}, timeout=8)
+            r.raise_for_status()
+            return r.json().get("events", [])
+        except Exception:
+            return []
+
+    today_events     = _fetch_wnba_scoreboard(today_et.strftime("%Y%m%d"))
+    yesterday_events = _fetch_wnba_scoreboard(
+        (today_et - dt.timedelta(days=1)).strftime("%Y%m%d")
+    )
+
+    next_opponent_full = None
+    is_home = False
+    next_game_date = None
+
+    for event in today_events:
+        try:
+            comps = event.get("competitions", [{}])[0]
+            competitors = comps.get("competitors", [])
+            team_names = [c["team"]["displayName"] for c in competitors]
+            close = difflib.get_close_matches(team_full, team_names, n=1, cutoff=0.70)
+            if not close:
+                continue
+            matched = close[0]
+            home_comp = next((c for c in competitors if c["homeAway"] == "home"), None)
+            away_comp = next((c for c in competitors if c["homeAway"] == "away"), None)
+            if not home_comp or not away_comp:
+                continue
+            if matched == home_comp["team"]["displayName"]:
+                is_home = True
+                next_opponent_full = away_comp["team"]["displayName"]
+            else:
+                is_home = False
+                next_opponent_full = home_comp["team"]["displayName"]
+            next_game_date = today_et.isoformat()
+            break
+        except Exception:
+            continue
+
+    b2b = False
+    for event in yesterday_events:
+        try:
+            comps = event.get("competitions", [{}])[0]
+            team_names = [c["team"]["displayName"] for c in comps.get("competitors", [])]
+            if difflib.get_close_matches(team_full, team_names, n=1, cutoff=0.70):
+                b2b = True
+                break
+        except Exception:
+            continue
+
+    return {
+        "player_team_full":     team_full,
+        "player_team_abbrev":   team_full,
+        "next_opponent_full":   next_opponent_full,
+        "next_opponent_abbrev": next_opponent_full,
+        "is_home":              is_home,
+        "is_back_to_back":      b2b,
+        "next_game_date":       next_game_date,
+    }
+
+
+def _fetch_wnba_injuries() -> list:
+    r = httpx.get(_WNBA_INJURIES_URL, timeout=8)
+    r.raise_for_status()
+    return r.json().get("injuries", [])
+
+
+def get_wnba_injury_status(player_name: str) -> dict | None:
+    try:
+        teams = _fetch_wnba_injuries()
+        all_players = [
+            (p, t)
+            for t in teams
+            for p in t.get("injuries", [])
+            if "athlete" in p
+        ]
+        names = [p["athlete"]["displayName"] for p, _ in all_players]
+        close = difflib.get_close_matches(player_name, names, n=1, cutoff=0.8)
+        if not close:
+            return None
+        matched = next(p for p, _ in all_players if p["athlete"]["displayName"] == close[0])
+        return {"status": matched.get("status", ""), "reason": matched.get("shortComment", "")}
+    except Exception:
+        return None
+
+
+def get_wnba_opponent_injuries(opponent_team: str) -> list[dict]:
+    try:
+        teams = _fetch_wnba_injuries()
+        team_names = [t.get("displayName", "") for t in teams]
+        close = difflib.get_close_matches(opponent_team, team_names, n=1, cutoff=0.7)
+        if not close:
+            return []
+        matched_team = next(t for t in teams if t.get("displayName") == close[0])
+        result = []
+        for p in matched_team.get("injuries", []):
+            status = p.get("status", "")
+            if status in ("Out", "Questionable"):
+                result.append({
+                    "player": p.get("athlete", {}).get("displayName", ""),
+                    "status": status,
+                    "reason": p.get("shortComment", ""),
+                })
+        return result
+    except Exception:
+        return []
+
+
+def get_wnba_todays_lines() -> dict:
+    """
+    Same as get_todays_lines() but uses OddsAPI basketball_wnba sport key
+    and persists to the wnba_odds_cache SQLite table.
+    """
+    global _wnba_lines_cache, _wnba_lines_cache_ts
+
+    if not _ODDS_API_KEY:
+        return {}
+
+    now      = time.time()
+    eastern  = ZoneInfo("America/New_York")
+    today_et = dt.datetime.now(eastern).date()
+
+    # 1. In-memory hit
+    if _wnba_lines_cache and (now - _wnba_lines_cache_ts) < _CACHE_TTL:
+        cached_date_et = dt.datetime.fromtimestamp(_wnba_lines_cache_ts, tz=eastern).date()
+        if cached_date_et == today_et:
+            return _wnba_lines_cache
+
+    # 2. SQLite hit
+    conn = get_db()
+    row = conn.execute(
+        "SELECT data, cached_at FROM wnba_odds_cache "
+        "WHERE (julianday('now') - julianday(cached_at)) * 86400 < ? LIMIT 1",
+        (_CACHE_TTL,),
+    ).fetchone()
+    conn.close()
+    if row:
+        try:
+            cached_dt = dt.datetime.fromisoformat(row["cached_at"]).replace(tzinfo=dt.timezone.utc)
+            if cached_dt.astimezone(eastern).date() == today_et:
+                _wnba_lines_cache    = json.loads(row["data"])
+                _wnba_lines_cache_ts = cached_dt.timestamp()
+                return _wnba_lines_cache
+        except Exception:
+            pass
+
+    # 3. Fetch from OddsAPI
+    try:
+        resp = httpx.get(_WNBA_ODDS_EVENTS, params={"apiKey": _ODDS_API_KEY}, timeout=10)
+        resp.raise_for_status()
+        events = resp.json()
+    except Exception:
+        return _wnba_lines_cache
+
+    today_events = []
+    for event in events:
+        try:
+            commence = dt.datetime.fromisoformat(event["commence_time"].replace("Z", "+00:00"))
+            if commence.astimezone(eastern).date() == today_et:
+                today_events.append(event)
+        except Exception:
+            continue
+
+    new_cache: dict = {}
+    for event in today_events:
+        game_id   = event["id"]
+        home_team = event.get("home_team", "")
+        away_team = event.get("away_team", "")
+        try:
+            resp = httpx.get(
+                _WNBA_ODDS_PROPS.format(event_id=game_id),
+                params={"apiKey": _ODDS_API_KEY, "regions": "us",
+                        "markets": _PROP_MARKETS, "oddsFormat": "american"},
+                timeout=10,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception:
+            continue
+
+        player_lines: dict = {}
+        for book_key in _PREFERRED_BOOKS:
+            book = next((b for b in data.get("bookmakers", []) if b["key"] == book_key), None)
+            if not book:
+                continue
+            for market in book.get("markets", []):
+                market_key = market["key"]
+                seen: set = set()
+                for outcome in market.get("outcomes", []):
+                    player = outcome.get("description", "")
+                    point  = outcome.get("point")
+                    if not player or point is None or player in seen:
+                        continue
+                    seen.add(player)
+                    if player not in player_lines:
+                        player_lines[player] = {"game_id": game_id,
+                                                "home_team": home_team, "away_team": away_team}
+                    if market_key not in player_lines[player]:
+                        player_lines[player][market_key] = {"value": point, "source": book_key}
+        new_cache.update(player_lines)
+
+    cached_at = dt.datetime.now(dt.timezone.utc).isoformat()
+    try:
+        conn = get_db()
+        conn.execute("DELETE FROM wnba_odds_cache")
+        conn.execute("INSERT INTO wnba_odds_cache (cached_at, data) VALUES (?, ?)",
+                     (cached_at, json.dumps(new_cache)))
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
+
+    _wnba_lines_cache    = new_cache
+    _wnba_lines_cache_ts = now
+    return _wnba_lines_cache
+
+
+def get_wnba_player_line(player_name: str, stat_type: str) -> tuple[float | None, str | None]:
+    """Same as get_player_line but reads from the WNBA lines cache."""
+    market_key = _STAT_TYPE_MAP.get(stat_type)
+    if not market_key:
+        return None, None
+    cache = get_wnba_todays_lines()
+    if not cache:
+        return None, None
+
+    def _extract(name: str) -> tuple[float | None, str | None]:
+        entry = cache.get(name, {}).get(market_key)
+        return (entry["value"], entry["source"]) if entry else (None, None)
+
+    value, source = _extract(player_name)
+    if value is not None:
+        return value, source
+    close = difflib.get_close_matches(player_name, list(cache.keys()), n=1, cutoff=0.85)
+    if close:
+        return _extract(close[0])
     return None, None

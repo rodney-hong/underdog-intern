@@ -67,7 +67,7 @@ function Label({ children }) {
 // Player Search with autocomplete dropdown
 // ---------------------------------------------------------------------------
 
-function PlayerSearch({ value, onChange, onSelect, onClear }) {
+function PlayerSearch({ value, onChange, onSelect, onClear, searchUrl, placeholder }) {
   const [suggestions, setSuggestions] = useState([])
   const [loading, setLoading] = useState(false)
   const [open, setOpen] = useState(false)
@@ -78,7 +78,8 @@ function PlayerSearch({ value, onChange, onSelect, onClear }) {
     if (!q.trim()) { setSuggestions([]); setOpen(false); return }
     setLoading(true)
     try {
-      const res = await fetch(`${API}/players/search?q=${encodeURIComponent(q)}`)
+      const url = searchUrl || `${API}/players/search`
+      const res = await fetch(`${url}?q=${encodeURIComponent(q)}`)
       const data = await res.json()
       setSuggestions(data)
       setOpen(data.length > 0)
@@ -87,7 +88,7 @@ function PlayerSearch({ value, onChange, onSelect, onClear }) {
     } finally {
       setLoading(false)
     }
-  }, [])
+  }, [searchUrl])
 
   const handleChange = (e) => {
     const q = e.target.value
@@ -125,7 +126,7 @@ function PlayerSearch({ value, onChange, onSelect, onClear }) {
           value={value}
           onChange={handleChange}
           onFocus={() => suggestions.length > 0 && setOpen(true)}
-          placeholder="Search NBA players…"
+          placeholder={placeholder ?? 'Search players…'}
           className="input-field w-full rounded-xl px-4 py-3 pr-10"
         />
         {loading && (
@@ -473,6 +474,9 @@ export default function App() {
 
   const toggleTheme = () => setTheme((t) => (t === 'dark' ? 'light' : 'dark'))
 
+  const [sport, setSport] = useState('NBA')
+  const sportPrefix = sport === 'WNBA' ? '/wnba' : ''
+
   const [currentPage, setCurrentPage] = useState('predict')
   const [playerQuery, setPlayerQuery] = useState('')
   const [selectedPlayer, setSelectedPlayer] = useState('')
@@ -499,11 +503,12 @@ export default function App() {
   const showAdditionalFields = !!selectedPlayer
 
   useEffect(() => {
-    fetch(`${API}/teams`)
+    const prefix = sport === 'WNBA' ? '/wnba' : ''
+    fetch(`${API}${prefix}/teams`)
       .then((r) => r.json())
       .then(setAllTeams)
       .catch(() => {})
-  }, [])
+  }, [sport])
 
   useEffect(() => {
     if (!selectedPlayer) return
@@ -514,7 +519,8 @@ export default function App() {
     setPlayerContext(null)
     setGameDate('')
     setLineNote('')
-    fetch(`${API}/players/${encodeURIComponent(selectedPlayer)}/team`)
+    const prefix = sport === 'WNBA' ? '/wnba' : ''
+    fetch(`${API}${prefix}/players/${encodeURIComponent(selectedPlayer)}/team`)
       .then((r) => r.json())
       .then((data) => {
         setPlayerTeam(data.player_team?.full || '')
@@ -524,11 +530,11 @@ export default function App() {
         if (data.next_game_date) setGameDate(data.next_game_date)
       })
       .catch(() => { setPlayerTeam('') })
-    fetch(`${API}/players/${encodeURIComponent(selectedPlayer)}/context`)
+    fetch(`${API}${prefix}/players/${encodeURIComponent(selectedPlayer)}/context`)
       .then((r) => r.json())
       .then(setPlayerContext)
       .catch(() => {})
-  }, [selectedPlayer])
+  }, [selectedPlayer, sport])
 
   // Auto-fill stat line from OddsAPI when player + stat type are both set
   useEffect(() => {
@@ -541,7 +547,8 @@ export default function App() {
     setLineLoading(true)
     setLineSource(null)
     setLineNote('')
-    fetch(`${API}/lines/${encodeURIComponent(selectedPlayer)}/${encodeURIComponent(statType)}`)
+    const prefix = sport === 'WNBA' ? '/wnba' : ''
+    fetch(`${API}${prefix}/lines/${encodeURIComponent(selectedPlayer)}/${encodeURIComponent(statType)}`)
       .then((r) => r.json())
       .then((data) => {
         if (!active) return
@@ -556,7 +563,7 @@ export default function App() {
       .catch(() => {})
       .finally(() => { if (active) setLineLoading(false) })
     return () => { active = false }
-  }, [selectedPlayer, statType])
+  }, [selectedPlayer, statType, sport])
 
   const handleBuildSlip = async () => {
     setSlipLoading(true)
@@ -598,6 +605,27 @@ export default function App() {
     setGameDate('')
   }
 
+  const handleSportChange = (newSport) => {
+    if (newSport === sport) return
+    setSport(newSport)
+    setPlayerQuery('')
+    setSelectedPlayer('')
+    setPlayerTeam('')
+    setOpponent('')
+    setStatLine('')
+    setStatType('')
+    setIsHome(false)
+    setIsBackToBack(false)
+    setPlayerContext(null)
+    setOpponentInjuries([])
+    setResult(null)
+    setError('')
+    setLineSource(null)
+    setLineLoading(false)
+    setLineNote('')
+    setGameDate('')
+  }
+
   const canPredict =
     selectedPlayer && playerTeam && opponent && statLine && parseFloat(statLine) > 0 && statType
 
@@ -618,7 +646,7 @@ export default function App() {
           is_home: isHome,
           is_back_to_back: isBackToBack,
           game_date: gameDate || null,
-          league: 'NBA',
+          league: sport,
         }),
       })
       if (!res.ok) {
@@ -672,11 +700,30 @@ export default function App() {
       {currentPage === 'predict' && <>
         {/* Form card */}
         <div className="card w-full max-w-lg rounded-2xl p-6 shadow-2xl space-y-4">
+          {/* Sport toggle */}
+          <div className="flex gap-2">
+            {['NBA', 'WNBA'].map((s) => (
+              <button
+                key={s}
+                onClick={() => handleSportChange(s)}
+                className="px-4 py-1.5 rounded-full text-xs font-bold transition-all duration-150"
+                style={{
+                  backgroundColor: sport === s ? 'var(--accent)' : 'var(--bg-tertiary)',
+                  color: sport === s ? '#fff' : 'var(--text-muted)',
+                }}
+              >
+                {s}
+              </button>
+            ))}
+          </div>
+
           <PlayerSearch
             value={playerQuery}
             onChange={setPlayerQuery}
             onSelect={handlePlayerSelect}
             onClear={resetAll}
+            searchUrl={`${API}${sportPrefix}/players/search`}
+            placeholder={`Search ${sport} players…`}
           />
 
           {playerContext?.injury_status && (
@@ -741,35 +788,39 @@ export default function App() {
           )}
         </div>
 
-        <div className="w-full max-w-lg mt-4 space-y-2">
-          <div className="flex items-center gap-2">
-            <span className="text-xs font-semibold uppercase tracking-widest" style={{ color: 'var(--text-muted)' }}>
-              Legs
-            </span>
-            {[2, 3, 4, 5].map((n) => (
+        {sport === 'NBA' && (
+          <>
+            <div className="w-full max-w-lg mt-4 space-y-2">
+              <div className="flex items-center gap-2">
+                <span className="text-xs font-semibold uppercase tracking-widest" style={{ color: 'var(--text-muted)' }}>
+                  Legs
+                </span>
+                {[2, 3, 4, 5].map((n) => (
+                  <button
+                    key={n}
+                    onClick={() => setSlipSize(n)}
+                    className="px-3 py-1 rounded-full text-xs font-bold transition-all duration-150"
+                    style={{
+                      backgroundColor: slipSize === n ? 'var(--accent)' : 'var(--bg-tertiary)',
+                      color: slipSize === n ? '#fff' : 'var(--text-muted)',
+                    }}
+                  >
+                    {n}
+                  </button>
+                ))}
+              </div>
               <button
-                key={n}
-                onClick={() => setSlipSize(n)}
-                className="px-3 py-1 rounded-full text-xs font-bold transition-all duration-150"
-                style={{
-                  backgroundColor: slipSize === n ? 'var(--accent)' : 'var(--bg-tertiary)',
-                  color: slipSize === n ? '#fff' : 'var(--text-muted)',
-                }}
+                onClick={handleBuildSlip}
+                disabled={slipLoading}
+                className="btn-ghost w-full py-3 rounded-xl text-sm font-medium"
               >
-                {n}
+                {slipLoading ? 'Building your slip…' : '🎯 Build Me a Slip'}
               </button>
-            ))}
-          </div>
-          <button
-            onClick={handleBuildSlip}
-            disabled={slipLoading}
-            className="btn-ghost w-full py-3 rounded-xl text-sm font-medium"
-          >
-            {slipLoading ? 'Building your slip…' : '🎯 Build Me a Slip'}
-          </button>
-        </div>
+            </div>
 
-        <SlipCard slip={slipResult} onClear={() => setSlipResult(null)} />
+            <SlipCard slip={slipResult} onClear={() => setSlipResult(null)} />
+          </>
+        )}
 
         {result && (
           <div className="w-full max-w-lg">

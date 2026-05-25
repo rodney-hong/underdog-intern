@@ -18,6 +18,7 @@ import pandas as pd
 from data_fetcher import (
     get_game_logs, get_injury_context, full_to_abbrev,
     get_team_def_rating_last5, get_player_id,
+    get_wnba_game_logs, get_wnba_injury_status,
 )
 from database import DB_PATH
 
@@ -50,6 +51,11 @@ _ML_STAT_TYPES = {"Points", "Assists", "Rebounds", "3PM"}
 _MODELS: dict = {}
 _MODELS_LOADED = False
 
+# WNBA
+_WNBA_ML_STAT_TYPES = {"Points", "Assists", "Rebounds", "3PM"}
+_WNBA_MODELS: dict = {}
+_WNBA_MODELS_LOADED = False
+
 # 2025 NBA playoffs started April 19 2025
 _PLAYOFF_START = datetime(2025, 4, 19)
 
@@ -70,6 +76,22 @@ def _load_models() -> dict:
     return _MODELS
 
 
+def _load_wnba_models() -> dict:
+    global _WNBA_MODELS, _WNBA_MODELS_LOADED
+    if _WNBA_MODELS_LOADED:
+        return _WNBA_MODELS
+    for stat_type in _WNBA_ML_STAT_TYPES:
+        mp = os.path.join(_MODEL_DIR, f"model_wnba_{stat_type}.pkl")
+        if os.path.exists(mp):
+            _WNBA_MODELS[stat_type] = joblib.load(mp)
+    if _WNBA_MODELS:
+        print(f"[predictor] Loaded WNBA models: {sorted(_WNBA_MODELS)}")
+    else:
+        print("[predictor] No WNBA models found — using heuristic scorer for WNBA.")
+    _WNBA_MODELS_LOADED = True
+    return _WNBA_MODELS
+
+
 # ---------------------------------------------------------------------------
 # Home/away split helper  (direct DB query — game logs don't carry home flag)
 # ---------------------------------------------------------------------------
@@ -77,6 +99,11 @@ def _load_models() -> dict:
 _HA_COL_MAP = {
     "Points": "points", "Assists": "assists",
     "Rebounds": "reboundsTotal", "3PM": "threePointersMade",
+}
+
+_WNBA_HA_COL_MAP = {
+    "Points": "points", "Assists": "assists",
+    "Rebounds": "rebounds", "3PM": "three_pm",
 }
 
 
@@ -97,6 +124,23 @@ def _get_home_away_split(player_name: str, stat_type: str, is_home: bool) -> flo
         f"SELECT home, AVG({col}) FROM player_stats "
         f"WHERE personId = ? AND {col} IS NOT NULL GROUP BY home",
         (player_id,),
+    ).fetchall()
+    conn.close()
+    avgs = {int(r[0]): float(r[1]) for r in rows if r[0] in (0, 1)}
+    home_avg = avgs.get(1, 0.0)
+    away_avg = avgs.get(0, 0.0)
+    return (home_avg - away_avg) * (1 if is_home else -1)
+
+
+def _get_wnba_home_away_split(player_name: str, stat_type: str, is_home: bool) -> float:
+    col = _WNBA_HA_COL_MAP.get(stat_type)
+    if not col:
+        return 0.0
+    conn = sqlite3.connect(DB_PATH)
+    rows = conn.execute(
+        f"SELECT home, AVG({col}) FROM wnba_player_stats "
+        f"WHERE player_name = ? AND {col} IS NOT NULL GROUP BY home",
+        (player_name,),
     ).fetchall()
     conn.close()
     avgs = {int(r[0]): float(r[1]) for r in rows if r[0] in (0, 1)}
@@ -469,6 +513,214 @@ def predict(
             confidence = round(float(max(proba)), 4)
         else:
             use_ml = False  # not enough games — fall through to heuristic
+
+    if not use_ml:
+        raw_score  = score_features(features)
+        outcome    = "OVER" if raw_score >= 0 else "UNDER"
+        confidence = score_to_confidence(abs(raw_score))
+
+    explanation = build_explanation(
+        player_name, stat_type, stat_line, opponent_team, features, outcome
+    )
+
+    return {
+        "outcome":     outcome,
+        "confidence":  confidence,
+        "explanation": explanation,
+    }
+
+
+# ---------------------------------------------------------------------------
+# WNBA prediction
+# ---------------------------------------------------------------------------
+
+def _compute_wnba_ml_features(
+    player_name: str,
+    opponent_team: str,
+    stat_type: str,
+    stat_line: float,
+    is_home: bool,
+    is_back_to_back: bool,
+) -> dict | None:
+    df = get_wnba_game_logs(player_name, last_n=40)
+    if df.empty or len(df) < 10:
+        return None
+
+    stat_values = _compute_stat(df, stat_type)
+
+    avg5  = float(stat_values.head(5).mean())
+    avg10 = float(stat_values.head(10).mean())
+    season_avg = float(stat_values.mean())
+    hit_rate   = float((stat_values.head(10) > season_avg).mean())
+    trend      = avg5 - avg10
+
+    # Opponent matching via opponent_team column (already a full team name)
+    opp_games = (
+        df[df["opponent_team"].str.lower() == opponent_team.lower()]
+        if "opponent_team" in df.columns
+        else pd.DataFrame()
+    )
+    vs_opp = (
+        float(_compute_stat(opp_games, stat_type).mean())
+        if not opp_games.empty
+        else avg10
+    )
+
+    line_diff   = avg10 - stat_line
+    consistency = float(stat_values.head(10).std()) if len(stat_values) >= 2 else 0.0
+
+    if "GAME_DATE" in df.columns and len(df) > 0 and pd.notna(df["GAME_DATE"].iloc[0]):
+        most_recent = df["GAME_DATE"].iloc[0]
+        cutoff = most_recent - pd.Timedelta(days=15)
+        games_last15 = int((df["GAME_DATE"] > cutoff).sum())
+    else:
+        games_last15 = 5
+
+    # opp_def_rating_last5 not available for WNBA — use neutral
+    opp_def = 0.0
+
+    # WNBA playoffs start in September
+    is_playoff = int(datetime.now().month >= 9)
+
+    if "MIN" in df.columns and df["MIN"].notna().any():
+        min_vals  = df["MIN"].dropna()
+        avg_min5  = float(min_vals.head(5).mean())  if len(min_vals) >= 5  else float(min_vals.mean())
+        avg_min10 = float(min_vals.head(10).mean()) if len(min_vals) >= 10 else float(min_vals.mean())
+    else:
+        avg_min5 = avg_min10 = 25.0
+    minutes_trend     = avg_min5 - avg_min10
+    avg_minutes_last5 = avg_min5
+
+    if (
+        "MIN" in df.columns
+        and "GAME_DATE" in df.columns
+        and len(df) > 1
+        and pd.notna(df["GAME_DATE"].iloc[0])
+    ):
+        most_recent = df["GAME_DATE"].iloc[0]
+        cutoff = most_recent - pd.Timedelta(days=7)
+        prior = df.iloc[1:]
+        fatigue_score = float(
+            prior.loc[prior["GAME_DATE"] >= cutoff, "MIN"].sum()
+        )
+    else:
+        fatigue_score = 0.0
+
+    home_away_split = _get_wnba_home_away_split(player_name, stat_type, is_home)
+
+    return {
+        "avg_pts_last5":        avg5,
+        "avg_pts_last10":       avg10,
+        "hit_rate_last10":      hit_rate,
+        "trend":                trend,
+        "vs_opponent_avg":      vs_opp,
+        "line_diff":            line_diff,
+        "consistency":          consistency,
+        "games_played_last15":  float(games_last15),
+        "opp_def_rating_last5": opp_def,
+        "is_playoff":           is_playoff,
+        "minutes_trend":        minutes_trend,
+        "avg_minutes_last5":    avg_minutes_last5,
+        "fatigue_score":        fatigue_score,
+        "home_away_split":      home_away_split,
+        "opp_game_count":       len(opp_games),
+    }
+
+
+def compute_wnba_features(
+    player_name: str,
+    opponent_team: str,
+    stat_line: float,
+    stat_type: str,
+    is_home: bool = False,
+    is_back_to_back: bool = False,
+) -> dict:
+    df = get_wnba_game_logs(player_name, last_n=40)
+
+    if df.empty:
+        return _empty_features(stat_line)
+
+    stat_values = _compute_stat(df, stat_type)
+
+    last5  = stat_values.head(5)
+    last10 = stat_values.head(10)
+
+    avg5  = float(last5.mean())  if len(last5)  > 0 else 0.0
+    avg10 = float(last10.mean()) if len(last10) > 0 else 0.0
+    hit_rate = float((stat_values > stat_line).mean()) if len(stat_values) > 0 else 0.5
+    trend = avg5 - avg10
+
+    opp_games = (
+        df[df["opponent_team"].str.lower() == opponent_team.lower()]
+        if "opponent_team" in df.columns
+        else pd.DataFrame()
+    )
+    if not opp_games.empty:
+        opp_stat   = _compute_stat(opp_games, stat_type)
+        avg_vs_opp = float(opp_stat.mean())
+        opp_sample = len(opp_games)
+    else:
+        avg_vs_opp = avg10
+        opp_sample = 0
+
+    injury_info = get_wnba_injury_status(player_name)
+    injury_note = injury_info.get("status", "") if injury_info else ""
+
+    return {
+        "avg5":           avg5,
+        "avg10":          avg10,
+        "hit_rate":       hit_rate,
+        "trend":          trend,
+        "is_home":        is_home,
+        "avg_vs_opp":     avg_vs_opp,
+        "opp_sample":     opp_sample,
+        "opp_game_count": opp_sample,
+        "b2b":            is_back_to_back,
+        "injury_note":    injury_note,
+        "stat_line":      stat_line,
+        "games_played":   len(df),
+    }
+
+
+def predict_wnba(
+    player_name: str,
+    opponent_team: str,
+    stat_line: float,
+    stat_type: str,
+    is_home: bool = False,
+    is_back_to_back: bool = False,
+) -> dict:
+    features = compute_wnba_features(
+        player_name, opponent_team, stat_line, stat_type,
+        is_home=is_home, is_back_to_back=is_back_to_back,
+    )
+
+    if features["games_played"] == 0:
+        return {
+            "outcome": "OVER",
+            "confidence": 0.52,
+            "explanation": (
+                f"Insufficient game log data found for {player_name} in WNBA. "
+                "The prediction is based on limited information and should be treated with caution."
+            ),
+        }
+
+    models  = _load_wnba_models()
+    use_ml  = stat_type in _WNBA_ML_STAT_TYPES and stat_type in models
+
+    if use_ml:
+        ml_feats = _compute_wnba_ml_features(
+            player_name, opponent_team, stat_type, stat_line, is_home, is_back_to_back
+        )
+        if ml_feats is not None:
+            model  = models[stat_type]
+            X      = pd.DataFrame([ml_feats])[FEATURE_COLS]
+            proba  = model.predict_proba(X)[0]
+            p_over = float(proba[1])
+            outcome    = "OVER" if p_over > 0.5 else "UNDER"
+            confidence = round(float(max(proba)), 4)
+        else:
+            use_ml = False
 
     if not use_ml:
         raw_score  = score_features(features)
