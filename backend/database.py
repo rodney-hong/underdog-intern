@@ -1,9 +1,18 @@
 import sqlite3
 import os
+import unicodedata
 import pandas as pd
 from datetime import datetime
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "predictions.db")
+
+
+def _ascii_normalize(s: str | None) -> str | None:
+    """Strip diacritics so accented names match their ASCII equivalents."""
+    if s is None:
+        return None
+    return unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode()
+
 
 # Columns to load from each CSV (subset of available columns)
 _STATS_COLS = [
@@ -148,7 +157,7 @@ def resolve_pending_predictions() -> int:
     today_et = datetime.now(ZoneInfo("America/New_York")).date().isoformat()
     conn = get_connection()
     pending = conn.execute(
-        "SELECT id, timestamp, player_name, stat_type, stat_line, opponent_team "
+        "SELECT id, timestamp, player_name, stat_type, stat_line, opponent_team, game_date "
         "FROM predictions WHERE actual_result IS NULL"
         "  AND (game_date IS NULL OR game_date < ?)",
         (today_et,),
@@ -158,9 +167,11 @@ def resolve_pending_predictions() -> int:
     if not pending:
         return 0
 
-    resolved = 0
-    dnp_count = 0
+    resolved      = 0
+    dnp_zero_min  = 0
+    dnp_absence   = 0
     conn = get_connection()
+    conn.create_function("ascii_norm", 1, _ascii_normalize)
     try:
         for row in pending:
             stat_cols = _RESOLVE_STAT_COLS.get(row["stat_type"])
@@ -188,12 +199,35 @@ def resolve_pending_predictions() -> int:
             cols_sql = ", ".join(select_cols)
             game = conn.execute(
                 f"SELECT {cols_sql} FROM player_stats "
-                "WHERE firstName = ? AND lastName = ? AND opponentteamName = ? "
+                "WHERE ascii_norm(firstName) = ascii_norm(?) "
+                "  AND ascii_norm(lastName)  = ascii_norm(?) "
+                "  AND opponentteamName = ? "
                 "ORDER BY ABS(julianday(gameDateTimeEst) - julianday(?)) LIMIT 1",
                 (first_name, last_name, opp_nickname, pred_ts.isoformat()),
             ).fetchone()
 
             if not game:
+                # DNP-by-absence: if the game was loaded but the player has no row,
+                # mark as DNP.  If no rows at all exist for that date/matchup, the
+                # game hasn't been loaded yet — leave pending.
+                game_date_val = (
+                    row["game_date"]
+                    if row["game_date"]
+                    else pred_ts.date().isoformat()
+                )
+                game_played = conn.execute(
+                    "SELECT COUNT(*) FROM player_stats "
+                    "WHERE DATE(gameDateTimeEst) = ? "
+                    "  AND (opponentteamName = ? OR playerteamName = ?)",
+                    (game_date_val, opp_nickname, opp_nickname),
+                ).fetchone()[0]
+                if game_played > 0:
+                    conn.execute(
+                        "UPDATE predictions SET actual_result = 'DNP' WHERE id = ?",
+                        (row["id"],),
+                    )
+                    dnp_absence += 1
+                    resolved += 1
                 continue
 
             try:
@@ -209,7 +243,7 @@ def resolve_pending_predictions() -> int:
             minutes_val = game["numMinutes"] if "numMinutes" in select_cols else None
             if minutes_val is None or float(minutes_val or 0) == 0:
                 actual_result = "DNP"
-                dnp_count += 1
+                dnp_zero_min += 1
             else:
                 actual_value = sum(float(game[c] or 0) for c in stat_cols if c in select_cols)
                 actual_result = "OVER" if actual_value > row["stat_line"] else "UNDER"
@@ -225,7 +259,13 @@ def resolve_pending_predictions() -> int:
         conn.close()
 
     if resolved:
-        print(f"Resolved {resolved} pending prediction(s) — {dnp_count} DNP(s).")
+        normal = resolved - dnp_zero_min - dnp_absence
+        print(
+            f"Resolved {resolved} pending prediction(s) — "
+            f"{normal} OVER/UNDER, "
+            f"{dnp_zero_min} DNP (zero minutes), "
+            f"{dnp_absence} DNP (absent from box score)."
+        )
     return resolved
 
 
