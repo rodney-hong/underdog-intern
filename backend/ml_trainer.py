@@ -17,6 +17,14 @@ from sklearn.metrics import accuracy_score, roc_auc_score
 from xgboost import XGBClassifier
 
 from database import DB_PATH
+from real_lines import build_real_line_lookup, REAL_LINE_STATS, _norm_name as _rl_norm_name
+
+# When True, Points/Rebounds/Assists/3PM train on REAL book lines joined from
+# historical_player_props (label hit = actual > real_line); rows with no matched
+# real line are dropped entirely (no mixing with simulated labels). When False,
+# every stat trains on the simulated-line target. Combo stats (PRA/PR/PA/RA) have
+# no real lines and always use the simulated target regardless of this flag.
+USE_REAL_LINES = True
 
 MODEL_DIR = os.path.dirname(__file__)
 MODEL_PATH = os.path.join(MODEL_DIR, "model_Points.pkl")  # sentinel for main.py existence check
@@ -45,6 +53,19 @@ _TRAIN_STAT_COLS = {
     "Assists":  "assists",
     "3PM":      "threePointersMade",
 }
+
+# Combo stat types: trained on summed columns via the same pipeline. No real book
+# lines exist for these, so they always use the simulated-line target. The summed
+# source columns (prefixed "_sum_") are materialized on the frame in build_training_data.
+_COMBO_STAT_COLS = {
+    "PRA": "_sum_PRA",   # points + reboundsTotal + assists
+    "PR":  "_sum_PR",    # points + reboundsTotal
+    "PA":  "_sum_PA",    # points + assists
+    "RA":  "_sum_RA",    # reboundsTotal + assists
+}
+
+# All NBA per-stat models produced by train_model(), in order.
+_ALL_MODEL_STATS = list(_TRAIN_STAT_COLS) + list(_COMBO_STAT_COLS)
 
 _WNBA_STAT_COLS = {
     "Points":   "points",
@@ -163,10 +184,26 @@ def build_training_data() -> pd.DataFrame:
     )
     df["fatigue_score"] = _fat.values
 
+    # Summed source columns for the combo stat types (simulated target only).
+    df["_sum_PRA"] = df["points"] + df["reboundsTotal"] + df["assists"]
+    df["_sum_PR"]  = df["points"] + df["reboundsTotal"]
+    df["_sum_PA"]  = df["points"] + df["assists"]
+    df["_sum_RA"]  = df["reboundsTotal"] + df["assists"]
+
+    # Real book-line lookup: {(norm_name, et_date_str, stat_type): real_line}.
+    # Built once, only when the flag is on. Keyed the same way we key each row below.
+    real_lookup: dict = {}
+    if USE_REAL_LINES:
+        real_lookup, _ = build_real_line_lookup()
+        print(f"  real-line lookup: {len(real_lookup):,} (player,date,stat) keys")
+    df["_normname"] = df["player_name"].map(_rl_norm_name)
+
     all_frames: list[pd.DataFrame] = []
     np.random.seed(42)
 
-    for stat_label, col in _TRAIN_STAT_COLS.items():
+    for stat_label, col in {**_TRAIN_STAT_COLS, **_COMBO_STAT_COLS}.items():
+        use_real = USE_REAL_LINES and stat_label in REAL_LINE_STATS
+
         g = df.groupby("personId")[col]
 
         avg5  = g.transform(lambda x: x.shift(1).rolling(5,  min_periods=5).mean())
@@ -183,11 +220,24 @@ def build_training_data() -> pd.DataFrame:
 
         trend = avg5 - avg10
 
+        # Always draw the simulated line (keeps the RNG sequence — and thus the combo
+        # stats' simulated labels — identical whether or not USE_REAL_LINES is on).
         noise = np.random.uniform(-1.5, 1.5, size=len(df))
         simulated_line = exp_mean_lagged + noise
 
+        if use_real:
+            # Real book line per (player, ET game date, stat). No match -> NaN,
+            # dropped below so real and simulated labels never mix in one set.
+            line = pd.Series(
+                [real_lookup.get((nn, ds, stat_label))
+                 for nn, ds in zip(df["_normname"], df["game_date_str"])],
+                index=df.index, dtype="float64",
+            )
+        else:
+            line = simulated_line
+
         consistency = g.transform(lambda x: x.shift(1).rolling(10, min_periods=10).std())
-        line_diff = avg10 - simulated_line
+        line_diff = avg10 - line
 
         df["_stat"] = df[col]
         vs_opp = df.groupby(["personId", "opponentteamId"])["_stat"].transform(
@@ -227,8 +277,12 @@ def build_training_data() -> pd.DataFrame:
         home_away_split = (df["_home_avg"] - df["_away_avg"]) * direction
         df.drop(columns=["_home_avg", "_away_avg"], inplace=True)
 
-        target = (df[col] > simulated_line).astype(int)
+        target = (df[col] > line).astype(int)
         valid = avg10.notna()
+        if use_real:
+            valid = valid & line.notna()  # drop rows with no matched real line
+        src = "real" if use_real else "sim"
+        print(f"  [{src:>4}] {stat_label:<7}: {int(valid.sum()):,} training rows")
 
         stat_df = pd.DataFrame(
             {
@@ -270,10 +324,12 @@ def train_model() -> dict:
         raise RuntimeError("No training data — make sure player_stats is populated via ETL.")
 
     print(f"  {len(data):,} labelled rows across {data['stat_type'].nunique()} stat types")
+    print(f"  USE_REAL_LINES = {USE_REAL_LINES} "
+          f"(real lines apply to {sorted(REAL_LINE_STATS)}; combos always simulated)")
 
     models: dict = {}
 
-    for stat_type in _TRAIN_STAT_COLS:
+    for stat_type in _ALL_MODEL_STATS:
         stat_data = (
             data[data["stat_type"] == stat_type]
             .sort_values("game_date")

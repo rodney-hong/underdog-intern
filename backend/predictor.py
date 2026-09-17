@@ -45,8 +45,9 @@ FEATURE_COLS = [
     "home_away_split",
 ]
 
-# Combined stat types are not in the training set — route them to the heuristic
-_ML_STAT_TYPES = {"Points", "Assists", "Rebounds", "3PM"}
+# Combo stat types now have trained models (summed columns, simulated-line target),
+# so they route to ML alongside the single stats instead of the heuristic.
+_ML_STAT_TYPES = {"Points", "Assists", "Rebounds", "3PM", "PRA", "PR", "PA", "RA"}
 
 _MODELS: dict = {}
 _MODELS_LOADED = False
@@ -99,6 +100,12 @@ def _load_wnba_models() -> dict:
 _HA_COL_MAP = {
     "Points": "points", "Assists": "assists",
     "Rebounds": "reboundsTotal", "3PM": "threePointersMade",
+    # Combo stats: SQL sum expressions so AVG({col}) stays valid and the
+    # home/away split feature is computed the same way it is in training.
+    "PRA": "(points + reboundsTotal + assists)",
+    "PR":  "(points + reboundsTotal)",
+    "PA":  "(points + assists)",
+    "RA":  "(reboundsTotal + assists)",
 }
 
 _WNBA_HA_COL_MAP = {

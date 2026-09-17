@@ -2,7 +2,7 @@ import sqlite3
 import os
 import unicodedata
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, date, timedelta
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "predictions.db")
 
@@ -475,32 +475,29 @@ def run_etl() -> bool:
     return True
 
 
-def run_wnba_etl() -> bool:
-    """
-    Fetch WNBA historical box scores from ESPN's public API (no auth required).
-    Covers seasons 2022, 2023, 2024 (May 1 – Oct 15 each year).
-    Skips if wnba_player_stats already has rows.
-    WARNING: first run takes 15–30 minutes due to ESPN rate-limit sleeping.
-    Returns True if ETL ran, False if skipped.
-    """
-    import time
-    import datetime as _dt
-    import httpx as _httpx
+# ---------------------------------------------------------------------------
+# WNBA ETL — shared helpers (used by run_wnba_etl() and wnba_backfill.py)
+# ---------------------------------------------------------------------------
 
-    # --- Skip check ---
-    conn = sqlite3.connect(DB_PATH)
-    try:
-        count = conn.execute("SELECT COUNT(*) FROM wnba_player_stats").fetchone()[0]
-        if count > 0:
-            print(f"WNBA data already loaded ({count:,} rows), skipping ETL.")
-            conn.close()
-            return False
-    except sqlite3.OperationalError:
-        pass  # table doesn't exist yet
-    conn.close()
+_WNBA_SCOREBOARD_URL = "https://site.api.espn.com/apis/site/v2/sports/basketball/wnba/scoreboard"
+_WNBA_SUMMARY_URL    = "https://site.api.espn.com/apis/site/v2/sports/basketball/wnba/summary"
+_WNBA_BACKFILL_START_YEAR    = 2022  # first season the historical backfill covers
+_WNBA_SEASON_START_MD        = (5, 1)   # WNBA regular slate opens ~May 1
+_WNBA_SEASON_END_MD          = (10, 15)  # …and wraps by mid-October
+_WNBA_STARTUP_MAX_DELTA_DAYS = 30    # startup only fetches a delta this small; larger
+                                     # gaps defer to wnba_backfill.py so boot never blocks
 
-    # --- Create table ---
-    conn = sqlite3.connect(DB_PATH)
+_WNBA_INSERT_SQL = """
+    INSERT INTO wnba_player_stats
+        (player_name, player_id, game_id, game_date, home, player_team,
+         opponent_team, minutes, points, rebounds, assists, three_pm,
+         steals, blocks, turnovers, oreb, dreb, plus_minus)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+"""
+
+
+def _wnba_ensure_table(conn: sqlite3.Connection) -> None:
+    """Create wnba_player_stats and its indexes if they don't exist."""
     conn.execute("""
         CREATE TABLE IF NOT EXISTS wnba_player_stats (
             player_name   TEXT,
@@ -523,62 +520,100 @@ def run_wnba_etl() -> bool:
             plus_minus    REAL
         )
     """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_wnba_player ON wnba_player_stats(player_name)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_wnba_date   ON wnba_player_stats(game_date)")
     conn.commit()
-    conn.close()
 
-    _SCOREBOARD = "https://site.api.espn.com/apis/site/v2/sports/basketball/wnba/scoreboard"
-    _SUMMARY    = "https://site.api.espn.com/apis/site/v2/sports/basketball/wnba/summary"
 
-    def _safe_float(s, default=0.0):
-        try:
-            return float(str(s).strip())
-        except Exception:
-            return default
+def _wnba_watermark(conn: sqlite3.Connection) -> str | None:
+    """Return MAX(game_date) already stored, or None if the table is empty/missing."""
+    try:
+        row = conn.execute("SELECT MAX(game_date) FROM wnba_player_stats").fetchone()
+    except sqlite3.OperationalError:
+        return None
+    return row[0] if row and row[0] else None
 
-    def _parse_made(s):
-        try:
-            return float(str(s).split("-")[0].strip())
-        except Exception:
-            return 0.0
 
-    # --- Collect all unique game IDs ---
-    print("WNBA ETL: scanning ESPN scoreboard for 2022–2024 game IDs…")
-    print("  (This takes ~4 minutes — 0.5 s per day × 168 days × 3 seasons)")
+def _wnba_stored_game_ids(conn: sqlite3.Connection) -> set:
+    """Return the set of game_ids already stored, for dedupe."""
+    try:
+        return {r[0] for r in conn.execute("SELECT DISTINCT game_id FROM wnba_player_stats")}
+    except sqlite3.OperationalError:
+        return set()
+
+
+def _wnba_safe_float(s, default=0.0):
+    try:
+        return float(str(s).strip())
+    except Exception:
+        return default
+
+
+def _wnba_parse_made(s):
+    try:
+        return float(str(s).split("-")[0].strip())
+    except Exception:
+        return 0.0
+
+
+def _wnba_collect_game_ids(start_date: date, end_date: date, verbose: bool = True) -> set:
+    """
+    Scan ESPN's scoreboard day-by-day for game IDs between start_date and end_date
+    (both inclusive), restricted to each year's WNBA in-season window so off-season
+    days aren't queried. 0.5 s sleep per day to respect ESPN rate limits.
+    """
+    import time
+    import httpx as _httpx
+
     game_ids: set = set()
-    for year in [2022, 2023, 2024]:
-        start = _dt.date(year, 5, 1)
-        end   = _dt.date(year, 10, 15)
-        cur   = start
-        while cur <= end:
+    for year in range(start_date.year, end_date.year + 1):
+        season_start = date(year, *_WNBA_SEASON_START_MD)
+        season_end   = date(year, *_WNBA_SEASON_END_MD)
+        lo = max(season_start, start_date)
+        hi = min(season_end, end_date)
+        if lo > hi:
+            continue  # requested window doesn't overlap this season
+        cur = lo
+        while cur <= hi:
             try:
-                r = _httpx.get(_SCOREBOARD, params={"dates": cur.strftime("%Y%m%d")}, timeout=10)
+                r = _httpx.get(_WNBA_SCOREBOARD_URL, params={"dates": cur.strftime("%Y%m%d")}, timeout=10)
                 r.raise_for_status()
                 for event in r.json().get("events", []):
                     game_ids.add(event["id"])
             except Exception:
                 pass
-            cur += _dt.timedelta(days=1)
+            cur += timedelta(days=1)
             time.sleep(0.5)
-        print(f"  {year}: {len(game_ids)} unique game IDs so far")
+        if verbose:
+            print(f"  {year}: {len(game_ids)} unique game IDs so far")
+    return game_ids
 
-    print(f"WNBA ETL: fetching box scores for {len(game_ids)} games…")
-    print("  (This takes ~5–10 minutes — 0.5 s per game)")
 
-    _INSERT_SQL = """
-        INSERT INTO wnba_player_stats
-            (player_name, player_id, game_id, game_date, home, player_team,
-             opponent_team, minutes, points, rebounds, assists, three_pm,
-             steals, blocks, turnovers, oreb, dreb, plus_minus)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+def _wnba_fetch_and_store(
+    conn: sqlite3.Connection,
+    game_ids: set,
+    skip_ids: set = frozenset(),
+    verbose: bool = True,
+) -> int:
     """
+    Fetch box scores for every game_id not already in skip_ids and insert player rows.
+    Returns the number of rows inserted. 0.5 s sleep per game for ESPN rate limits.
+    """
+    import time
+    import httpx as _httpx
+
+    to_fetch = sorted(g for g in game_ids if g not in skip_ids)
+    if verbose:
+        print(f"WNBA ETL: fetching box scores for {len(to_fetch)} new games…")
+        print("  (~0.5 s per game)")
 
     rows_buf: list = []
+    inserted = 0
     games_done = 0
-    conn = sqlite3.connect(DB_PATH)
 
-    for game_id in sorted(game_ids):
+    for game_id in to_fetch:
         try:
-            r = _httpx.get(_SUMMARY, params={"event": game_id}, timeout=10)
+            r = _httpx.get(_WNBA_SUMMARY_URL, params={"event": game_id}, timeout=10)
             r.raise_for_status()
             data = r.json()
         except Exception:
@@ -616,41 +651,90 @@ def run_wnba_etl() -> bool:
                             is_home,
                             team_name,
                             opp_name,
-                            stats[0],               # MIN (keep as string "MM:SS")
-                            _safe_float(stats[1]),  # PTS
-                            _safe_float(stats[5]),  # REB
-                            _safe_float(stats[6]),  # AST
-                            _parse_made(stats[3]),  # 3PT made from "2-5"
-                            _safe_float(stats[8]),  # STL
-                            _safe_float(stats[9]),  # BLK
-                            _safe_float(stats[7]),  # TO
-                            _safe_float(stats[10]), # OREB
-                            _safe_float(stats[11]), # DREB
-                            _safe_float(stats[13]), # +/-
+                            stats[0],                     # MIN (keep as string "MM:SS")
+                            _wnba_safe_float(stats[1]),   # PTS
+                            _wnba_safe_float(stats[5]),   # REB
+                            _wnba_safe_float(stats[6]),   # AST
+                            _wnba_parse_made(stats[3]),   # 3PT made from "2-5"
+                            _wnba_safe_float(stats[8]),   # STL
+                            _wnba_safe_float(stats[9]),   # BLK
+                            _wnba_safe_float(stats[7]),   # TO
+                            _wnba_safe_float(stats[10]),  # OREB
+                            _wnba_safe_float(stats[11]),  # DREB
+                            _wnba_safe_float(stats[13]),  # +/-
                         ))
         except Exception:
             pass
 
         games_done += 1
-        if games_done % 100 == 0:
-            print(f"  …{games_done}/{len(game_ids)} games processed, {len(rows_buf)} rows buffered")
-
         if len(rows_buf) >= 500:
-            conn.executemany(_INSERT_SQL, rows_buf)
+            conn.executemany(_WNBA_INSERT_SQL, rows_buf)
             conn.commit()
+            inserted += len(rows_buf)
             rows_buf.clear()
+        if verbose and games_done % 100 == 0:
+            print(f"  …{games_done}/{len(to_fetch)} games processed, {inserted + len(rows_buf)} rows so far")
 
         time.sleep(0.5)
 
     if rows_buf:
-        conn.executemany(_INSERT_SQL, rows_buf)
+        conn.executemany(_WNBA_INSERT_SQL, rows_buf)
         conn.commit()
+        inserted += len(rows_buf)
 
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_wnba_player ON wnba_player_stats(player_name)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_wnba_date   ON wnba_player_stats(game_date)")
-    conn.commit()
+    return inserted
 
-    final = conn.execute("SELECT COUNT(*) FROM wnba_player_stats").fetchone()[0]
+
+def run_wnba_etl() -> bool:
+    """
+    Incremental startup ETL: fetch only WNBA games newer than the stored watermark
+    (MAX(game_date)), deduped by game_id.
+
+    The full multi-minute historical backfill lives in wnba_backfill.py and must be run
+    manually once — this function never performs it, so server startup is never blocked:
+      * empty table            → print a hint to run wnba_backfill.py, return False
+      * watermark > 30 days old → defer to wnba_backfill.py, return False
+      * otherwise              → fetch the small delta since the watermark
+
+    Returns True only if new player rows were inserted (so the caller retrains).
+    """
+    conn = sqlite3.connect(DB_PATH)
+    _wnba_ensure_table(conn)
+    watermark = _wnba_watermark(conn)
+
+    if watermark is None:
+        conn.close()
+        print("WNBA table is empty — run `python wnba_backfill.py` once to load history. "
+              "Skipping startup ETL.")
+        return False
+
+    try:
+        wm_date = datetime.strptime(watermark[:10], "%Y-%m-%d").date()
+    except Exception:
+        conn.close()
+        print(f"WNBA watermark '{watermark}' is unparseable — run `python wnba_backfill.py`. "
+              "Skipping startup ETL.")
+        return False
+
+    today = date.today()
+    gap_days = (today - wm_date).days
+    if gap_days > _WNBA_STARTUP_MAX_DELTA_DAYS:
+        conn.close()
+        print(f"WNBA data is {gap_days} days behind (watermark {wm_date}); exceeds the "
+              f"{_WNBA_STARTUP_MAX_DELTA_DAYS}-day startup cap. Run `python wnba_backfill.py` "
+              "to catch up. Skipping startup ETL so boot isn't blocked.")
+        return False
+
+    # Scan from the watermark day (inclusive) so games that finished after the last run
+    # on that same day are still picked up; game_id dedupe prevents duplicate rows.
+    print(f"WNBA ETL: checking for games since {wm_date} (through {today})…")
+    game_ids = _wnba_collect_game_ids(wm_date, today, verbose=False)
+    stored   = _wnba_stored_game_ids(conn)
+    inserted = _wnba_fetch_and_store(conn, game_ids, skip_ids=stored, verbose=False)
     conn.close()
-    print(f"WNBA ETL complete: {games_done} games processed, {final:,} player rows loaded.")
-    return True
+
+    if inserted:
+        print(f"WNBA ETL: added {inserted:,} new player rows since {wm_date}.")
+        return True
+    print(f"WNBA ETL: no new games since {wm_date}.")
+    return False

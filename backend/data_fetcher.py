@@ -566,21 +566,58 @@ def get_player_news(player_name: str) -> str:
 _ODDS_API_KEY = os.getenv("ODDS_API_KEY", "")
 _ODDS_EVENTS_URL = "https://api.the-odds-api.com/v4/sports/basketball_nba/events"
 _ODDS_PROPS_URL  = "https://api.the-odds-api.com/v4/sports/basketball_nba/events/{event_id}/odds"
-_PREFERRED_BOOKS = ["fanduel", "draftkings"]
-_PROP_MARKETS    = "player_points,player_rebounds,player_assists,player_threes,player_steals,player_blocks,player_blocks_steals"
+_PREFERRED_BOOKS = ["underdog"]
+# Only the markets Underdog actually carries (confirmed via check_underdog_markets.py,
+# WNBA slate 2026-08-25). Underdog carries the combo markets (PR/PA/RA/PRA) but NOT
+# threes, steals, blocks, or blocks+steals — requesting those risks a 422 on the whole
+# props call, so they are deliberately omitted here and from _STAT_TYPE_MAP below.
+_PROP_MARKETS    = "player_points,player_rebounds,player_assists,player_points_rebounds,player_points_assists,player_rebounds_assists,player_points_rebounds_assists"
 _STAT_TYPE_MAP   = {
-    "Points":       "player_points",
-    "Rebounds":     "player_rebounds",
-    "Assists":      "player_assists",
-    "3PM":          "player_threes",
-    "Steals":       "player_steals",
-    "Blocks":       "player_blocks",
-    "Blocks+Steals": "player_blocks_steals",  # DraftKings only; FanDuel doesn't carry this market
+    "Points":   "player_points",
+    "Rebounds": "player_rebounds",
+    "Assists":  "player_assists",
+    "PR":       "player_points_rebounds",
+    "PA":       "player_points_assists",
+    "RA":       "player_rebounds_assists",
+    "PRA":      "player_points_rebounds_assists",
 }
-_CACHE_TTL = 6 * 3600  # 6 hours
+_CACHE_TTL = 45 * 60  # 45 minutes — DFS lines move with user selections
 
 _lines_cache: dict = {}
 _lines_cache_ts: float = 0.0
+
+
+def _log_underdog_lines(player_lines: dict, game_date: str, league: str) -> None:
+    """Persist every line pulled into underdog_lines for future model training."""
+    if not player_lines:
+        return
+    captured_at = dt.datetime.now(dt.timezone.utc).isoformat()
+    try:
+        conn = get_db()
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS underdog_lines (
+                player_name TEXT, market_key TEXT, stat_line REAL,
+                game_date TEXT, game_id TEXT, home_team TEXT, away_team TEXT,
+                league TEXT, captured_at TEXT,
+                PRIMARY KEY (player_name, market_key, game_date, league)
+            )
+        """)
+        for player, entry in player_lines.items():
+            for market_key, val in entry.items():
+                if not isinstance(val, dict) or "value" not in val:
+                    continue
+                conn.execute("""
+                    INSERT OR REPLACE INTO underdog_lines
+                    (player_name, market_key, stat_line, game_date, game_id,
+                     home_team, away_team, league, captured_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (player, market_key, val["value"], game_date,
+                      entry.get("game_id"), entry.get("home_team"),
+                      entry.get("away_team"), league, captured_at))
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass  # non-fatal
 
 
 def get_todays_lines() -> dict:
@@ -666,7 +703,7 @@ def get_todays_lines() -> dict:
                 _ODDS_PROPS_URL.format(event_id=game_id),
                 params={
                     "apiKey":      _ODDS_API_KEY,
-                    "regions":     "us",
+                    "regions":     "us_dfs",
                     "markets":     _PROP_MARKETS,
                     "oddsFormat":  "american",
                 },
@@ -702,13 +739,14 @@ def get_todays_lines() -> dict:
                             "home_team": home_team,
                             "away_team": away_team,
                         }
-                    # First book to provide a market key wins (fanduel > draftkings)
+                    # Only one book in _PREFERRED_BOOKS (underdog); first value wins
                     if market_key not in player_lines[player]:
                         player_lines[player][market_key] = {
                             "value":  point,
                             "source": book_key,
                         }
 
+        _log_underdog_lines(player_lines, today_et.isoformat(), "NBA")
         new_cache.update(player_lines)
 
     # Persist to SQLite so the cache survives restarts
@@ -734,13 +772,12 @@ def get_player_line(player_name: str, stat_type: str) -> tuple[float | None, str
     """
     Return (line_value, bookmaker_key) for the given player and stat type,
     or (None, None) if unavailable.
-    Combined stat types (PRA, PR, PA, RA) always return (None, None).
     Uses fuzzy name matching (cutoff 0.85) to handle minor OddsAPI name differences.
 
-    For Blocks+Steals (player_blocks_steals): FanDuel does not carry this market.
-    The cache is populated with _PREFERRED_BOOKS = ["fanduel", "draftkings"], so FanDuel
-    is checked first and DraftKings fills in as the fallback — the returned source will
-    be "draftkings" for this market.
+    Lines are sourced solely from Underdog Fantasy (_PREFERRED_BOOKS = ["underdog"]),
+    so the returned source is always "underdog". Underdog carries Points, Rebounds,
+    Assists and the combo markets PR/PA/RA/PRA (see _STAT_TYPE_MAP); stat types it does
+    not carry (3PM, Steals, Blocks, Blocks+Steals) map to nothing and return (None, None).
     """
     market_key = _STAT_TYPE_MAP.get(stat_type)
     if not market_key:
@@ -754,11 +791,6 @@ def get_player_line(player_name: str, stat_type: str) -> tuple[float | None, str
         entry = cache.get(name, {}).get(market_key)
         if entry:
             return entry["value"], entry["source"]
-        # For Blocks+Steals, FanDuel won't carry the market; DraftKings data lands here.
-        if stat_type == "Blocks+Steals":
-            dk_entry = cache.get(name, {}).get("player_blocks_steals")
-            if dk_entry:
-                return dk_entry["value"], dk_entry["source"]
         return None, None
 
     # Exact match first
@@ -1126,7 +1158,7 @@ def get_wnba_todays_lines() -> dict:
         try:
             resp = httpx.get(
                 _WNBA_ODDS_PROPS.format(event_id=game_id),
-                params={"apiKey": _ODDS_API_KEY, "regions": "us",
+                params={"apiKey": _ODDS_API_KEY, "regions": "us_dfs",
                         "markets": _PROP_MARKETS, "oddsFormat": "american"},
                 timeout=10,
             )
@@ -1154,6 +1186,7 @@ def get_wnba_todays_lines() -> dict:
                                                 "home_team": home_team, "away_team": away_team}
                     if market_key not in player_lines[player]:
                         player_lines[player][market_key] = {"value": point, "source": book_key}
+        _log_underdog_lines(player_lines, today_et.isoformat(), "WNBA")
         new_cache.update(player_lines)
 
     cached_at = dt.datetime.now(dt.timezone.utc).isoformat()
