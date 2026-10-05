@@ -1,0 +1,10 @@
+# Compiled artifacts
+__pycache__/
+
+# SQLite rollback journals / WAL (never useful to commit)
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
+
+# Report output is regenerable from the cache
+results*.json
