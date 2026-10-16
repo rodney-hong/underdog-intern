@@ -1,0 +1,384 @@
+{
+  "break_even": 0.3333333333333333,
+  "seed": 20261005,
+  "n_boot": 10000,
+  "descriptive_only": true,
+  "ci_primary": 95.0,
+  "ci_bonferroni": 99.58333333333333,
+  "line_source": "fanduel_historical",
+  "label": "FanDuel lines, hypothesis for Underdog",
+  "results": [
+    {
+      "n_pairs": 21536,
+      "n_games": 1120,
+      "joint": 0.2908153789004458,
+      "pA": 0.5369149331352154,
+      "pB": 0.5198736998514116,
+      "indep": 0.2791279527944777,
+      "lift": 0.011687426105968068,
+      "pair_type": [
+        "teammate",
+        "3PM:under",
+        "Assists:under"
+      ],
+      "ci95": {
+        "joint_lo": 0.2805403553181272,
+        "joint_hi": 0.3011661850881215,
+        "lift_lo": 0.008729804905211348,
+        "lift_hi": 0.014906544713216304
+      },
+      "ci_bonf": {
+        "joint_lo": 0.275579885972758,
+        "joint_hi": 0.30551501633843453,
+        "lift_lo": 0.007314368596885625,
+        "lift_hi": 0.01636580720018185
+      },
+      "dev_joint": 0.28639273177782365,
+      "pass_95": false,
+      "pass_bonf": false,
+      "lift_sig_95": true,
+      "underdog_actionable": false
+    },
+    {
+      "n_pairs": 16438,
+      "n_games": 1091,
+      "joint": 0.29042462586689377,
+      "pA": 0.5405767124954374,
+      "pB": 0.5453826499574157,
+      "indep": 0.29482115996602964,
+      "lift": -0.004396534099135874,
+      "pair_type": [
+        "opposing",
+        "3PM:under",
+        "3PM:under"
+      ],
+      "ci95": {
+        "joint_lo": 0.27822295919222123,
+        "joint_hi": 0.3023042663761173,
+        "lift_lo": -0.008118373625143593,
+        "lift_hi": -0.0007331339409790162
+      },
+      "ci_bonf": {
+        "joint_lo": 0.2731663269419545,
+        "joint_hi": 0.3077337284857545,
+        "lift_lo": -0.00998911098780132,
+        "lift_hi": 0.0008867990552709099
+      },
+      "dev_joint": 0.2857354319830266,
+      "pass_95": false,
+      "pass_bonf": false,
+      "lift_sig_95": true,
+      "underdog_actionable": false
+    },
+    {
+      "n_pairs": 13995,
+      "n_games": 1116,
+      "joint": 0.29424794569489104,
+      "pA": 0.5471954269381922,
+      "pB": 0.5420507324044301,
+      "indep": 0.29660768194020193,
+      "lift": -0.002359736245310884,
+      "pair_type": [
+        "teammate",
+        "3PM:under",
+        "3PM:under"
+      ],
+      "ci95": {
+        "joint_lo": 0.2818322896230049,
+        "joint_hi": 0.30683806892268706,
+        "lift_lo": -0.006320906787988119,
+        "lift_hi": 0.0015697932528317652
+      },
+      "ci_bonf": {
+        "joint_lo": 0.2765242089797647,
+        "joint_hi": 0.3127823911696548,
+        "lift_lo": -0.007978064701380154,
+        "lift_hi": 0.0035037386950389302
+      },
+      "dev_joint": 0.2822423478161183,
+      "pass_95": false,
+      "pass_bonf": false,
+      "lift_sig_95": false,
+      "underdog_actionable": false
+    },
+    {
+      "n_pairs": 46144,
+      "n_games": 1098,
+      "joint": 0.28023144937586686,
+      "pA": 0.5434075936199723,
+      "pB": 0.5170986477115118,
+      "indep": 0.28099533181705444,
+      "lift": -0.00076388244118758,
+      "pair_type": [
+        "opposing",
+        "3PM:under",
+        "Points:under"
+      ],
+      "ci95": {
+        "joint_lo": 0.2716140303153476,
+        "joint_hi": 0.28898729077954616,
+        "lift_lo": -0.002988838395529031,
+        "lift_hi": 0.0014672377277102353
+      },
+      "ci_bonf": {
+        "joint_lo": 0.26764870704447813,
+        "joint_hi": 0.29267294039977887,
+        "lift_lo": -0.003965996294129124,
+        "lift_hi": 0.00233483287039273
+      },
+      "dev_joint": 0.2765393070620083,
+      "pass_95": false,
+      "pass_bonf": false,
+      "lift_sig_95": false,
+      "underdog_actionable": false
+    },
+    {
+      "n_pairs": 30882,
+      "n_games": 1122,
+      "joint": 0.2772812641668286,
+      "pA": 0.520141182565896,
+      "pB": 0.5147658830386633,
+      "indep": 0.26775093514830806,
+      "lift": 0.009530329018520522,
+      "pair_type": [
+        "teammate",
+        "Assists:under",
+        "Points:under"
+      ],
+      "ci95": {
+        "joint_lo": 0.26851696888456394,
+        "joint_hi": 0.2862460558252427,
+        "lift_lo": 0.007063452466974543,
+        "lift_hi": 0.011982374657389503
+      },
+      "ci_bonf": {
+        "joint_lo": 0.26501787531353205,
+        "joint_hi": 0.2899818523049142,
+        "lift_lo": 0.006071664217720967,
+        "lift_hi": 0.012917588988803264
+      },
+      "dev_joint": 0.2754517516902274,
+      "pass_95": false,
+      "pass_bonf": false,
+      "lift_sig_95": true,
+      "underdog_actionable": true
+    },
+    {
+      "n_pairs": 40618,
+      "n_games": 1098,
+      "joint": 0.28017135260229453,
+      "pA": 0.5417795066226796,
+      "pB": 0.5195479836525678,
+      "indep": 0.2814804502500962,
+      "lift": -0.0013090976478016825,
+      "pair_type": [
+        "opposing",
+        "3PM:under",
+        "Rebounds:under"
+      ],
+      "ci95": {
+        "joint_lo": 0.2717610812338636,
+        "joint_hi": 0.28847763903917634,
+        "lift_lo": -0.003661038341891934,
+        "lift_hi": 0.0010209396672914677
+      },
+      "ci_bonf": {
+        "joint_lo": 0.26804751662347664,
+        "joint_hi": 0.2921894067950042,
+        "lift_lo": -0.004812288285880338,
+        "lift_hi": 0.002063999874581608
+      },
+      "dev_joint": 0.2747992442135097,
+      "pass_95": false,
+      "pass_bonf": false,
+      "lift_sig_95": false,
+      "underdog_actionable": false
+    },
+    {
+      "n_pairs": 35456,
+      "n_games": 1122,
+      "joint": 0.28263199458483756,
+      "pA": 0.5414316335740073,
+      "pB": 0.522393953068592,
+      "indep": 0.2828406113791111,
+      "lift": -0.00020861679427353064,
+      "pair_type": [
+        "teammate",
+        "3PM:under",
+        "Rebounds:under"
+      ],
+      "ci95": {
+        "joint_lo": 0.2744261311612032,
+        "joint_hi": 0.29119792360441576,
+        "lift_lo": -0.002727511935876979,
+        "lift_hi": 0.002290168513382693
+      },
+      "ci_bonf": {
+        "joint_lo": 0.27075165041529037,
+        "joint_hi": 0.29499123542807276,
+        "lift_lo": -0.003983164241760545,
+        "lift_hi": 0.0034784101017848812
+      },
+      "dev_joint": 0.27475110312867246,
+      "pass_95": false,
+      "pass_bonf": false,
+      "lift_sig_95": false,
+      "underdog_actionable": false
+    },
+    {
+      "n_pairs": 25218,
+      "n_games": 1091,
+      "joint": 0.2753588706479499,
+      "pA": 0.5168530414783091,
+      "pB": 0.5243080339440083,
+      "indep": 0.2709902020154732,
+      "lift": 0.004368668632476702,
+      "pair_type": [
+        "opposing",
+        "Rebounds:under",
+        "Rebounds:under"
+      ],
+      "ci95": {
+        "joint_lo": 0.26418304857941544,
+        "joint_hi": 0.28642934445914925,
+        "lift_lo": 0.0013572096355241412,
+        "lift_hi": 0.0073037912264561035
+      },
+      "ci_bonf": {
+        "joint_lo": 0.2595835404597318,
+        "joint_hi": 0.29092342217915335,
+        "lift_lo": -0.000126390779308062,
+        "lift_hi": 0.008698650715623634
+      },
+      "dev_joint": 0.2721844316537905,
+      "pass_95": false,
+      "pass_bonf": false,
+      "lift_sig_95": true,
+      "underdog_actionable": true
+    },
+    {
+      "n_pairs": 25377,
+      "n_games": 1096,
+      "joint": 0.28399732040824366,
+      "pA": 0.5447452417543445,
+      "pB": 0.5208653505142452,
+      "indep": 0.28373892128734385,
+      "lift": 0.00025839912089981043,
+      "pair_type": [
+        "opposing",
+        "3PM:under",
+        "Assists:under"
+      ],
+      "ci95": {
+        "joint_lo": 0.2742891217898858,
+        "joint_hi": 0.2939266557123035,
+        "lift_lo": -0.0025926412530529017,
+        "lift_hi": 0.0030944388402425077
+      },
+      "ci_bonf": {
+        "joint_lo": 0.2702899742870563,
+        "joint_hi": 0.29805684926936615,
+        "lift_lo": -0.0039326016291920405,
+        "lift_hi": 0.004387395415805665
+      },
+      "dev_joint": 0.27132475577793663,
+      "pass_95": false,
+      "pass_bonf": false,
+      "lift_sig_95": false,
+      "underdog_actionable": false
+    },
+    {
+      "n_pairs": 21979,
+      "n_games": 1122,
+      "joint": 0.2681195686791938,
+      "pA": 0.5204513399153737,
+      "pB": 0.5197688702852723,
+      "indep": 0.27051440498627005,
+      "lift": -0.0023948363070762646,
+      "pair_type": [
+        "teammate",
+        "Rebounds:under",
+        "Rebounds:under"
+      ],
+      "ci95": {
+        "joint_lo": 0.2572688199967904,
+        "joint_hi": 0.2789246010320974,
+        "lift_lo": -0.005367135574775794,
+        "lift_hi": 0.0007662832797954138
+      },
+      "ci_bonf": {
+        "joint_lo": 0.25276211396402354,
+        "joint_hi": 0.28443075161515274,
+        "lift_lo": -0.006956238528096377,
+        "lift_hi": 0.002202829478820503
+      },
+      "dev_joint": 0.2689840317969458,
+      "pass_95": false,
+      "pass_bonf": false,
+      "lift_sig_95": false,
+      "underdog_actionable": true
+    },
+    {
+      "n_pairs": 50098,
+      "n_games": 1123,
+      "joint": 0.2677751606850573,
+      "pA": 0.5161882709888619,
+      "pB": 0.5203800550920197,
+      "indep": 0.26861408089503835,
+      "lift": -0.0008389202099810533,
+      "pair_type": [
+        "teammate",
+        "Points:under",
+        "Rebounds:under"
+      ],
+      "ci95": {
+        "joint_lo": 0.2604552101229846,
+        "joint_hi": 0.27502314952069323,
+        "lift_lo": -0.002838533019600395,
+        "lift_hi": 0.001181857204025596
+      },
+      "ci_bonf": {
+        "joint_lo": 0.2572108765134588,
+        "joint_hi": 0.27826075840240183,
+        "lift_lo": -0.003636811458529843,
+        "lift_hi": 0.0021279215606208137
+      },
+      "dev_joint": 0.2688528794217115,
+      "pass_95": false,
+      "pass_bonf": false,
+      "lift_sig_95": false,
+      "underdog_actionable": true
+    },
+    {
+      "n_pairs": 32546,
+      "n_games": 1096,
+      "joint": 0.2678362932464819,
+      "pA": 0.5204633441897621,
+      "pB": 0.5135500522337615,
+      "indep": 0.2672839775944105,
+      "lift": 0.0005523156520713668,
+      "pair_type": [
+        "opposing",
+        "Points:under",
+        "Points:under"
+      ],
+      "ci95": {
+        "joint_lo": 0.2589240443641266,
+        "joint_hi": 0.2768104713785011,
+        "lift_lo": -0.0017104425238393644,
+        "lift_hi": 0.0027976868607278603
+      },
+      "ci_bonf": {
+        "joint_lo": 0.2550676678395278,
+        "joint_hi": 0.28079965864603684,
+        "lift_lo": -0.0027029517660548228,
+        "lift_hi": 0.003971697023814157
+      },
+      "dev_joint": 0.2684194036864916,
+      "pass_95": false,
+      "pass_bonf": false,
+      "lift_sig_95": false,
+      "underdog_actionable": true
+    }
+  ]
+}
