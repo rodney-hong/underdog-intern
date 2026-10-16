@@ -20,6 +20,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from database import DB_PATH
+import line_logger
 
 
 # ---------------------------------------------------------------------------
@@ -672,9 +673,11 @@ def get_todays_lines() -> dict:
         except Exception:
             pass  # corrupted row — fall through to API fetch
 
-    # 3. Fetch today's events
+    # 3. Fetch today's events (free; logged to odds_pull_log so the cap sees every call)
     try:
         resp = httpx.get(_ODDS_EVENTS_URL, params={"apiKey": _ODDS_API_KEY}, timeout=10)
+        _, remaining = line_logger.record_call(resp, endpoint="events", phase="slip",
+                                               remaining_before=None)
         resp.raise_for_status()
         events = resp.json()
     except Exception:
@@ -691,6 +694,26 @@ def get_todays_lines() -> dict:
                 today_events.append(event)
         except Exception:
             continue
+
+    # Refuse a fresh pull that would dip into the scheduled line-logging reserve.
+    # Fall back to today's cached lines (stale is fine), else {} -> manual entry.
+    slip_cost = len(today_events) * len(_PROP_MARKETS.split(","))  # markets x 1 region, upper bound
+    ok, reason, _ = line_logger.check_unscheduled_spend(slip_cost, events)
+    if not ok:
+        line_logger.log_skip(endpoint="event_odds", phase="slip", reason=reason,
+                             game_date=today_et.isoformat(), remaining=remaining)
+        if _lines_cache:
+            return _lines_cache
+        try:
+            conn = get_db()
+            row = conn.execute("SELECT data, cached_at FROM odds_cache LIMIT 1").fetchone()
+            conn.close()
+            if row and dt.datetime.fromisoformat(row["cached_at"]).replace(
+                    tzinfo=dt.timezone.utc).astimezone(eastern).date() == today_et:
+                return json.loads(row["data"])
+        except Exception:
+            pass
+        return {}
 
     # Fetch props for each game and merge into one player map
     new_cache: dict = {}
@@ -709,6 +732,9 @@ def get_todays_lines() -> dict:
                 },
                 timeout=10,
             )
+            _, remaining = line_logger.record_call(
+                resp, endpoint="event_odds", phase="slip", remaining_before=remaining,
+                game_id=game_id, game_date=today_et.isoformat())
             resp.raise_for_status()
             data = resp.json()
         except Exception:

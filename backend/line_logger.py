@@ -45,6 +45,10 @@ MONTHLY_CREDIT_CAP = int(os.getenv("ODDS_MONTHLY_CREDIT_CAP", "500"))
 OPEN_PULL_HOUR_ET  = int(os.getenv("LINE_LOG_OPEN_HOUR_ET", "10"))
 PRETIP_MINUTES     = int(os.getenv("LINE_LOG_PRETIP_MINUTES", "45"))
 
+SCHEDULED_PULLS_PER_GAME = 2      # open + pretip
+EVENT_PULLS_PER_DAY_MAX  = 3      # ceiling for news-triggered pulls, not a quota
+RESERVE_BUFFER           = 0.10   # reserve = remaining scheduled pulls x (1 + buffer)
+
 EASTERN = ZoneInfo("America/New_York")
 
 
@@ -96,9 +100,15 @@ def init_tables() -> None:
             credits_used      INTEGER,
             rows_inserted     INTEGER,
             books_returned    TEXT,
-            error             TEXT
+            error             TEXT,
+            skip_reason       TEXT,           -- set when a pull was refused before calling
+            note              TEXT            -- free text, e.g. what triggered an event pull
         );
     """)
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(odds_pull_log)")}
+    for col in ("skip_reason", "note"):
+        if col not in cols:
+            conn.execute(f"ALTER TABLE odds_pull_log ADD COLUMN {col} TEXT")
     conn.commit()
     conn.close()
 
@@ -136,6 +146,138 @@ def credits_used_this_month() -> int:
     return int(row[0])
 
 
+def last_known_remaining() -> int | None:
+    conn = get_db()
+    row = conn.execute(
+        "SELECT remaining_after FROM odds_pull_log WHERE remaining_after IS NOT NULL "
+        "ORDER BY id DESC LIMIT 1").fetchone()
+    conn.close()
+    return row[0] if row else None
+
+
+def record_call(resp: httpx.Response, *, endpoint: str, phase: str,
+                remaining_before: int | None, game_id: str | None = None,
+                game_date: str | None = None, rows: int | None = None,
+                books: str | None = None, note: str | None = None) -> tuple[int, int | None]:
+    """
+    Log one completed OddsAPI call to odds_pull_log. Used by this module and by
+    data_fetcher's slip path so the monthly cap sees every credit spent.
+    Returns (credits_used, x-requests-remaining after).
+    """
+    remaining_after = _int_header(resp, "x-requests-remaining")
+    last            = _int_header(resp, "x-requests-last")
+    if last is not None:
+        credits = last
+    elif remaining_before is not None and remaining_after is not None:
+        credits = remaining_before - remaining_after
+    else:
+        credits = 0 if endpoint == "events" else 1  # don't undercount odds calls
+    _log_pull(endpoint=endpoint, game_id=game_id, game_date=game_date, pull_phase=phase,
+              http_status=resp.status_code, remaining_before=remaining_before,
+              remaining_after=remaining_after, requests_last=last, credits_used=credits,
+              rows_inserted=rows, books_returned=books, note=note,
+              error=None if resp.status_code == 200 else resp.text[:300])
+    return credits, remaining_after
+
+
+def log_skip(*, endpoint: str, phase: str, reason: str, game_id: str | None = None,
+             game_date: str | None = None, remaining: int | None = None,
+             note: str | None = None) -> None:
+    """Record a pull that was refused before any API call was made."""
+    print(f"[line_logger] SKIP {phase} {game_id or ''}: {reason}")
+    _log_pull(endpoint=endpoint, game_id=game_id, game_date=game_date, pull_phase=phase,
+              remaining_before=remaining, credits_used=0, skip_reason=reason, note=note)
+
+
+# ---------------------------------------------------------------------------
+# Budget reserve for unscheduled spend (news-triggered pulls, slip endpoint)
+# ---------------------------------------------------------------------------
+
+def _last_season_daily_rate(month: int) -> float:
+    """
+    Games per calendar day for this month last season, from the `schedule` table
+    (regular season, play-in, playoffs, cup final; excludes preseason and
+    All-Star). Rate is games / days spanned by that month's first-to-last game.
+    """
+    conn = get_db()
+    row = conn.execute("""
+        SELECT COUNT(*), MIN(substr(gameDateTimeEst,1,10)), MAX(substr(gameDateTimeEst,1,10))
+        FROM schedule
+        WHERE CAST(substr(gameDateTimeEst,6,2) AS INTEGER) = ?
+          AND substr(printf('%010d', gameId), 3, 1) IN ('2','4','5','6')
+    """, (month,)).fetchone()
+    conn.close()
+    n, first, last = row
+    if not n:
+        return 0.0
+    span = (dt.date.fromisoformat(last) - dt.date.fromisoformat(first)).days + 1
+    return n / span
+
+
+def remaining_scheduled_pulls(all_events: list[dict] | None) -> dict:
+    """
+    Project the scheduled (open + pretip) pulls still to come this ET month.
+      today:  pulls not yet made for today's unstarted games, from the feed
+      later:  per day, max(games in feed that day, last season's daily rate for
+              the month), counting only days on/after the first game in the feed.
+    With no feed (call failed), every remaining day uses the historical rate.
+    """
+    now_utc  = dt.datetime.now(dt.timezone.utc)
+    today_et = now_utc.astimezone(EASTERN).date()
+
+    feed_by_day: dict[dt.date, int] = {}
+    today_pending = 0
+    for e in all_events or []:
+        commence = _commence(e)
+        day = commence.astimezone(EASTERN).date()
+        feed_by_day[day] = feed_by_day.get(day, 0) + 1
+        if day == today_et and commence > now_utc:
+            gd = day.isoformat()
+            today_pending += (not _already_pulled(e["id"], "open", gd)) + \
+                             (not _already_pulled(e["id"], "pretip", gd))
+
+    season_start = min(feed_by_day) if feed_by_day else None
+    rate = _last_season_daily_rate(today_et.month)
+    later_games = 0.0
+    day = today_et + dt.timedelta(days=1)
+    while day.month == today_et.month:
+        if all_events is None or (season_start is not None and day >= season_start):
+            later_games += max(feed_by_day.get(day, 0), rate)
+        day += dt.timedelta(days=1)
+
+    later_pulls = later_games * SCHEDULED_PULLS_PER_GAME
+    return {
+        "today_pending_pulls": today_pending,
+        "later_pulls":         round(later_pulls, 1),
+        "total_pulls":         today_pending + later_pulls,
+        "daily_rate_last_season": round(rate, 2),
+    }
+
+
+def budget_snapshot(all_events: list[dict] | None) -> dict:
+    used      = credits_used_this_month()
+    remaining = last_known_remaining()
+    available = MONTHLY_CREDIT_CAP - used
+    if remaining is not None:
+        available = min(available, remaining)
+    proj    = remaining_scheduled_pulls(all_events)
+    reserve = int(-(-proj["total_pulls"] * (1 + RESERVE_BUFFER) // 1))  # ceil
+    return {"used_this_month": used, "cap": MONTHLY_CREDIT_CAP,
+            "last_remaining_header": remaining, "available": available,
+            "reserve": reserve, "spendable": available - reserve, **proj}
+
+
+def check_unscheduled_spend(cost: int, all_events: list[dict] | None) -> tuple[bool, str, dict]:
+    """True if `cost` credits can be spent without dipping into the scheduled-pull reserve."""
+    snap = budget_snapshot(all_events)
+    if cost <= snap["spendable"]:
+        return True, "", snap
+    reason = (f"would dip into reserve: cost {cost} > spendable {snap['spendable']} "
+              f"(available {snap['available']}, reserve {snap['reserve']} = "
+              f"{snap['total_pulls']:.1f} remaining scheduled pulls x {1 + RESERVE_BUFFER:.1f})")
+    return False, reason, snap
+
+
 def _already_pulled(game_id: str, phase: str, game_date: str) -> bool:
     conn = get_db()
     row = conn.execute(
@@ -155,43 +297,46 @@ def _commence(event: dict) -> dt.datetime:
 # API calls
 # ---------------------------------------------------------------------------
 
-def fetch_todays_events() -> tuple[list[dict], int | None]:
+def fetch_events(phase: str | None = None) -> tuple[list[dict] | None, int | None]:
     """
-    Return (today's ET-slate events, x-requests-remaining). The events endpoint
-    does not cost credits; it is also logged so that claim is checked on every run.
+    Return (all upcoming NBA events, x-requests-remaining), or (None, None) on
+    failure. The events endpoint costs 0 credits; it is logged so that is checked.
     """
     if not ODDS_API_KEY:
         print("[line_logger] ODDS_API_KEY not set — skipping")
-        return [], None
-
-    today_et = dt.datetime.now(EASTERN).date()
+        return None, None
+    today = dt.datetime.now(EASTERN).date().isoformat()
     try:
         resp = httpx.get(EVENTS_URL, params={"apiKey": ODDS_API_KEY}, timeout=15)
     except Exception as exc:
         print(f"[line_logger] events call failed: {exc!r}")
-        _log_pull(endpoint="events", game_date=today_et.isoformat(), error=repr(exc))
-        return [], None
-
-    remaining = _int_header(resp, "x-requests-remaining")
-    last      = _int_header(resp, "x-requests-last")
-    _log_pull(
-        endpoint="events", game_date=today_et.isoformat(), http_status=resp.status_code,
-        remaining_after=remaining, requests_last=last, credits_used=last or 0,
-        error=None if resp.status_code == 200 else resp.text[:300],
-    )
+        _log_pull(endpoint="events", game_date=today, pull_phase=phase, error=repr(exc))
+        return None, None
+    _, remaining = record_call(resp, endpoint="events", phase=phase,
+                               remaining_before=None, game_date=today)
     if resp.status_code != 200:
         print(f"[line_logger] events HTTP {resp.status_code}: {resp.text[:200]}")
-        return [], remaining
-
-    events = [e for e in resp.json() if _commence(e).astimezone(EASTERN).date() == today_et]
-    return events, remaining
+        return None, remaining
+    return resp.json(), remaining
 
 
-def pull_event(event: dict, phase: str, remaining_before: int | None) -> tuple[int, int | None]:
+def todays(events: list[dict] | None) -> list[dict]:
+    today_et = dt.datetime.now(EASTERN).date()
+    return [e for e in events or [] if _commence(e).astimezone(EASTERN).date() == today_et]
+
+
+def fetch_todays_events(phase: str | None = None) -> tuple[list[dict], int | None]:
+    events, remaining = fetch_events(phase)
+    return todays(events), remaining
+
+
+def pull_event(event: dict, phase: str, remaining_before: int | None,
+               note: str | None = None) -> tuple[int, int | None]:
     """
     One OddsAPI call for one event: Points, all three books. Stores every
     outcome. Returns (rows_inserted, x-requests-remaining after the call).
-    Enforces the monthly credit cap before calling.
+    Enforces the hard monthly credit cap before calling; the reserve rule for
+    unscheduled pulls is applied by the caller (try_event_pull).
     """
     game_id   = event["id"]
     commence  = _commence(event)
@@ -200,16 +345,14 @@ def pull_event(event: dict, phase: str, remaining_before: int | None) -> tuple[i
     used = credits_used_this_month()
     # Expected cost is 1 (1 market x 1 region-equivalent); refuse if that would breach the cap.
     if used + 1 > MONTHLY_CREDIT_CAP:
-        msg = f"monthly cap reached ({used}/{MONTHLY_CREDIT_CAP})"
-        print(f"[line_logger] skip {game_id}: {msg}")
-        _log_pull(endpoint="event_odds", game_id=game_id, game_date=game_date,
-                  pull_phase=phase, remaining_before=remaining_before, error=msg)
+        log_skip(endpoint="event_odds", phase=phase, game_id=game_id, game_date=game_date,
+                 remaining=remaining_before, note=note,
+                 reason=f"monthly cap reached ({used}/{MONTHLY_CREDIT_CAP})")
         return 0, remaining_before
     if remaining_before is not None and remaining_before < 1:
-        msg = f"account quota exhausted (remaining={remaining_before})"
-        print(f"[line_logger] skip {game_id}: {msg}")
-        _log_pull(endpoint="event_odds", game_id=game_id, game_date=game_date,
-                  pull_phase=phase, remaining_before=remaining_before, error=msg)
+        log_skip(endpoint="event_odds", phase=phase, game_id=game_id, game_date=game_date,
+                 remaining=remaining_before, note=note,
+                 reason=f"account quota exhausted (remaining={remaining_before})")
         return 0, remaining_before
 
     captured_at = dt.datetime.now(dt.timezone.utc).isoformat()
@@ -227,24 +370,15 @@ def pull_event(event: dict, phase: str, remaining_before: int | None) -> tuple[i
     except Exception as exc:
         print(f"[line_logger] {game_id} request failed: {exc!r}")
         _log_pull(endpoint="event_odds", game_id=game_id, game_date=game_date,
-                  pull_phase=phase, remaining_before=remaining_before, error=repr(exc))
+                  pull_phase=phase, remaining_before=remaining_before, error=repr(exc),
+                  note=note)
         return 0, remaining_before
-
-    remaining_after = _int_header(resp, "x-requests-remaining")
-    last            = _int_header(resp, "x-requests-last")
-    if last is not None:
-        credits = last
-    elif remaining_before is not None and remaining_after is not None:
-        credits = remaining_before - remaining_after
-    else:
-        credits = 1  # assume the documented cost rather than undercount
 
     if resp.status_code != 200:
         print(f"[line_logger] {game_id} HTTP {resp.status_code}: {resp.text[:200]}")
-        _log_pull(endpoint="event_odds", game_id=game_id, game_date=game_date,
-                  pull_phase=phase, http_status=resp.status_code,
-                  remaining_before=remaining_before, remaining_after=remaining_after,
-                  requests_last=last, credits_used=credits, error=resp.text[:300])
+        _, remaining_after = record_call(resp, endpoint="event_odds", phase=phase,
+                                         remaining_before=remaining_before,
+                                         game_id=game_id, game_date=game_date, note=note)
         return 0, remaining_after
 
     data = resp.json()
@@ -279,11 +413,9 @@ def pull_event(event: dict, phase: str, remaining_before: int | None) -> tuple[i
     conn.close()
 
     books = ",".join(sorted(b["key"] for b in data.get("bookmakers", [])))
-    _log_pull(endpoint="event_odds", game_id=game_id, game_date=game_date,
-              pull_phase=phase, http_status=200,
-              remaining_before=remaining_before, remaining_after=remaining_after,
-              requests_last=last, credits_used=credits, rows_inserted=inserted,
-              books_returned=books)
+    credits, remaining_after = record_call(
+        resp, endpoint="event_odds", phase=phase, remaining_before=remaining_before,
+        game_id=game_id, game_date=game_date, rows=inserted, books=books, note=note)
     print(f"[line_logger] {phase} {event.get('away_team')} @ {event.get('home_team')}: "
           f"{inserted} rows, books=[{books}], credits={credits}, "
           f"remaining {remaining_before} -> {remaining_after}")
@@ -329,6 +461,56 @@ def run_pretip_pull(event: dict) -> None:
     pull_event(event, "pretip", remaining)
 
 
+def event_pulls_today() -> int:
+    """News-triggered pulls that reached the API today (ET). Skips don't count."""
+    today = dt.datetime.now(EASTERN).date().isoformat()
+    conn = get_db()
+    row = conn.execute(
+        "SELECT COUNT(*) FROM odds_pull_log WHERE endpoint = 'event_odds' "
+        "AND pull_phase = 'event' AND game_date = ? AND http_status IS NOT NULL",
+        (today,)).fetchone()
+    conn.close()
+    return int(row[0])
+
+
+def try_event_pull(game_id: str, note: str | None = None) -> tuple[int, str]:
+    """
+    One extra, news-triggered pull for a game on today's slate (Phase 4).
+    Refused, with the reason logged to odds_pull_log, when:
+      - the game is not on today's ET slate or has already started
+      - EVENT_PULLS_PER_DAY_MAX event pulls already reached the API today
+      - the 1-credit cost would dip into the scheduled-pull reserve
+    Returns (rows_inserted, skip_reason or "").
+    """
+    init_tables()
+    today = dt.datetime.now(EASTERN).date().isoformat()
+
+    def _skip(reason: str, remaining=None) -> tuple[int, str]:
+        log_skip(endpoint="event_odds", phase="event", game_id=game_id, game_date=today,
+                 remaining=remaining, reason=reason, note=note)
+        return 0, reason
+
+    n_today = event_pulls_today()
+    if n_today >= EVENT_PULLS_PER_DAY_MAX:
+        return _skip(f"daily event-pull ceiling reached ({n_today}/{EVENT_PULLS_PER_DAY_MAX})")
+
+    all_events, remaining = fetch_events(phase="event")
+    if all_events is None:
+        return _skip("events feed unavailable", remaining)
+    event = next((e for e in todays(all_events) if e["id"] == game_id), None)
+    if event is None:
+        return _skip("game not on today's ET slate", remaining)
+    if _commence(event) <= dt.datetime.now(dt.timezone.utc):
+        return _skip("game already started", remaining)
+
+    ok, reason, _ = check_unscheduled_spend(1, all_events)
+    if not ok:
+        return _skip(reason, remaining)
+
+    rows, _ = pull_event(event, "event", remaining, note=note)
+    return rows, ""
+
+
 def _schedule_pretip(scheduler, event: dict) -> None:
     run_at = _commence(event) - dt.timedelta(minutes=PRETIP_MINUTES)
     now    = dt.datetime.now(dt.timezone.utc)
@@ -352,13 +534,13 @@ def start_scheduler():
     global _scheduler
     if _scheduler is not None:
         return _scheduler
+    init_tables()  # odds_pull_log must exist for the slip path even if logging is disabled
     if os.getenv("LINE_LOGGER_ENABLED", "1") != "1":
         print("[line_logger] disabled via LINE_LOGGER_ENABLED")
         return None
 
     from apscheduler.schedulers.background import BackgroundScheduler
 
-    init_tables()
     sched = BackgroundScheduler(timezone=EASTERN)
     sched.add_job(
         run_open_pull, "cron", hour=OPEN_PULL_HOUR_ET, minute=0,
@@ -405,6 +587,11 @@ def _status() -> None:
     print(f"month {month}: {r['pulls']} event pulls over {r['days']} game days, "
           f"{r['credits']} credits (cap {MONTHLY_CREDIT_CAP})")
     print(f"last x-requests-remaining: {last[0] if last else 'n/a'}")
+    events, _ = fetch_events(phase="status")
+    snap = budget_snapshot(events)
+    print(f"reserve: {snap['reserve']} credits for {snap['total_pulls']:.1f} remaining scheduled "
+          f"pulls (+{RESERVE_BUFFER:.0%}); available {snap['available']}; "
+          f"spendable on unscheduled pulls: {snap['spendable']}")
 
 
 if __name__ == "__main__":
