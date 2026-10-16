@@ -1,7 +1,8 @@
 """
 news_ingest.py
 Raw news ingestion (Phase 2). No LLM, no betting logic, nothing here feeds
-predictions. Every 20 minutes it polls:
+predictions. ESPN is polled every 20 minutes; the official report 2 minutes
+after each of its 15-minute publishing slots.
 
   espn_injuries        ESPN injuries API (data_fetcher._fetch_espn_injuries).
                        One item per player entry; a new item whenever the
@@ -13,9 +14,12 @@ predictions. Every 20 minutes it polls:
                        time, so an unchanged row in the next report is a
                        duplicate and a new item means the row changed.
 
+  derived              Deterministic drop-off rows: a player in the previous
+                       official report (same report day) is absent from the
+                       next one while their game is still listed. url = the
+                       newer report, related_url = the previous one.
+
 Dedupe: news_items.hash is UNIQUE; inserts are INSERT OR IGNORE.
-Known gap: a player who drops OFF the official report (became available) has
-no row to ingest, so that change is not captured here.
 
 CLI:
     python news_ingest.py --poll-once
@@ -26,6 +30,7 @@ import os
 import re
 import io
 import time
+import json
 import hashlib
 import sqlite3
 import argparse
@@ -37,10 +42,16 @@ import httpx
 from database import DB_PATH
 
 EASTERN = ZoneInfo("America/New_York")
-POLL_MINUTES = int(os.getenv("NEWS_POLL_MINUTES", "20"))
+POLL_MINUTES = int(os.getenv("NEWS_POLL_MINUTES", "20"))   # ESPN
+# Official report publishes on :00/:15/:30/:45; poll 2 minutes after each slot.
+NBA_REPORT_CRON_MINUTES = os.getenv("NBA_REPORT_CRON_MINUTES", "2,17,32,47")
 
 ESPN_INJURIES_API = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/injuries"
 NBA_REPORT_URL    = "https://ak-static.cms.nba.com/referee/injury/Injury-Report_{date}_{hh}_{mm}{ampm}.pdf"
+# Until mid-December 2025 reports were hourly with no minutes ("..._05PM.pdf"); the
+# 15-minute format above replaced it. On-the-hour slots try both, since it is not
+# known which format the 2026-27 season starts with.
+NBA_REPORT_URL_HOURLY = "https://ak-static.cms.nba.com/referee/injury/Injury-Report_{date}_{hh}{ampm}.pdf"
 NBA_REPORT_LOOKBACK_SLOTS = 4   # try the latest 15-min slot, then up to 3 earlier ones
 _HEADERS = {"User-Agent": "Mozilla/5.0"}
 
@@ -61,12 +72,13 @@ def init_tables(conn: sqlite3.Connection | None = None) -> None:
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS news_items (
             id           INTEGER PRIMARY KEY AUTOINCREMENT,
-            source       TEXT NOT NULL,   -- espn_injuries / nba_injury_report
-            url          TEXT,
+            source       TEXT NOT NULL,   -- espn_injuries / nba_injury_report / derived
+            url          TEXT,            -- for derived rows: the report the player is absent from
             raw_text     TEXT NOT NULL,
             published_at TEXT,            -- UTC ISO; source's own timestamp
             fetched_at   TEXT NOT NULL,   -- UTC ISO
-            hash         TEXT NOT NULL UNIQUE
+            hash         TEXT NOT NULL UNIQUE,
+            related_url  TEXT             -- derived rows: the previous report the player was in
         );
         CREATE INDEX IF NOT EXISTS idx_news_items_fetched ON news_items (fetched_at);
 
@@ -80,7 +92,19 @@ def init_tables(conn: sqlite3.Connection | None = None) -> None:
             items_new   INTEGER,
             error       TEXT
         );
+
+        -- Full player roster of every ingested official report: news_items only keeps
+        -- changed rows, so this is what "previous report" comparisons read from.
+        CREATE TABLE IF NOT EXISTS nba_report_index (
+            url          TEXT PRIMARY KEY,
+            published_at TEXT NOT NULL,   -- UTC ISO, from the report title
+            report_day   TEXT NOT NULL,   -- ET date of published_at
+            rows_json    TEXT NOT NULL    -- [{game_date, matchup, team, player, status, reason}]
+        );
     """)
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(news_items)")}
+    if "related_url" not in cols:
+        conn.execute("ALTER TABLE news_items ADD COLUMN related_url TEXT")
     conn.commit()
     if own:
         conn.close()
@@ -94,10 +118,11 @@ def _store(conn, source: str, items: list[dict], fetched_at: str) -> int:
     """items: dicts with url, raw_text, published_at, hash_text. Returns new rows."""
     before = conn.total_changes
     conn.executemany(
-        "INSERT OR IGNORE INTO news_items (source, url, raw_text, published_at, fetched_at, hash) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
+        "INSERT OR IGNORE INTO news_items "
+        "(source, url, raw_text, published_at, fetched_at, hash, related_url) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
         [(source, it["url"], it["raw_text"], it["published_at"], fetched_at,
-          _hash(source, it["hash_text"])) for it in items],
+          _hash(source, it["hash_text"]), it.get("related_url")) for it in items],
     )
     conn.commit()
     return conn.total_changes - before
@@ -174,6 +199,14 @@ def report_url(slot: dt.datetime) -> str:
     hh = slot.strftime("%I")
     return NBA_REPORT_URL.format(date=slot.strftime("%Y-%m-%d"), hh=hh,
                                  mm=slot.strftime("%M"), ampm=slot.strftime("%p"))
+
+
+def report_urls(slot: dt.datetime) -> list[str]:
+    urls = [report_url(slot)]
+    if slot.minute == 0:
+        urls.append(NBA_REPORT_URL_HOURLY.format(date=slot.strftime("%Y-%m-%d"),
+                                                 hh=slot.strftime("%I"), ampm=slot.strftime("%p")))
+    return urls
 
 
 def latest_slots(now_et: dt.datetime, n: int) -> list[dt.datetime]:
@@ -326,63 +359,130 @@ def report_items(rows: list[dict], url: str, published_at: str) -> list[dict]:
     return items
 
 
-_last_report_url: str | None = None
+def _row_key(r: dict) -> tuple:
+    return (r["game_date"], r["matchup"], r["team"], r["player"])
+
+
+def dropped_items(prev_rows: list[dict], prev_url: str, cur_rows: list[dict],
+                  cur_url: str, published_at: str) -> list[dict]:
+    """
+    Deterministic drop-off detection: a player listed in the previous report is
+    absent from this one, while their game is still on this report (a game
+    leaving the report after tip-off is not a drop for its players).
+    """
+    cur_keys  = {_row_key(r) for r in cur_rows}
+    cur_games = {(r["game_date"], r["matchup"]) for r in cur_rows}
+    items = []
+    for r in prev_rows:
+        if not r["player"]:
+            continue                          # NOT YET SUBMITTED placeholder rows
+        if (r["game_date"], r["matchup"]) not in cur_games or _row_key(r) in cur_keys:
+            continue
+        game = f"{r['game_date']} {r.get('game_time', '')} {r['matchup']}".replace("  ", " ").strip()
+        items.append({
+            "url": cur_url,
+            "related_url": prev_url,
+            "raw_text": " | ".join([game, r["team"], r["player"], "DROPPED OFF REPORT",
+                                    f"previously {r['status']}: {r['reason']}"]),
+            "published_at": published_at,
+            "hash_text": f"dropped|{prev_url}|{cur_url}|{'|'.join(_row_key(r))}",
+        })
+    return items
+
+
+def ingest_report(conn, url: str, pdf_bytes: bytes, slot: dt.datetime, fetched_at: str) -> tuple[int, int]:
+    """Store one report's changed rows, its roster, and any drop-offs. Returns (new, dropped)."""
+    rows = parse_report(pdf_bytes)
+    published_at = report_published(pdf_bytes, slot)
+    report_day = dt.datetime.fromisoformat(published_at).astimezone(EASTERN).date().isoformat()
+
+    new = _store(conn, "nba_injury_report", report_items(rows, url, published_at), fetched_at)
+
+    prev = conn.execute(
+        "SELECT url, rows_json FROM nba_report_index WHERE report_day = ? AND published_at < ? "
+        "ORDER BY published_at DESC LIMIT 1", (report_day, published_at)).fetchone()
+    dropped = 0
+    if prev is not None:
+        dropped = _store(conn, "derived",
+                         dropped_items(json.loads(prev["rows_json"]), prev["url"], rows, url,
+                                       published_at), fetched_at)
+
+    conn.execute("INSERT OR REPLACE INTO nba_report_index (url, published_at, report_day, rows_json) "
+                 "VALUES (?, ?, ?, ?)", (url, published_at, report_day, json.dumps(rows)))
+    conn.commit()
+    _log_poll(conn, source="nba_injury_report", url=url, http_status=200,
+              items_seen=len(rows), items_new=new + dropped)
+    print(f"[news] nba_injury_report {slot:%H:%M}: {len(rows)} rows, {new} new, {dropped} dropped off")
+    return new, dropped
 
 
 def poll_nba_report(conn, now_et: dt.datetime | None = None) -> int:
-    global _last_report_url
+    """
+    Ingest every not-yet-ingested report in the lookback window, oldest first, so a
+    report published late is not skipped and consecutive reports are compared in order.
+    """
     now_et = now_et or dt.datetime.now(EASTERN)
     fetched_at = dt.datetime.now(dt.timezone.utc).isoformat()
-    last_status = None
-    for slot in latest_slots(now_et, NBA_REPORT_LOOKBACK_SLOTS):
-        url = report_url(slot)
-        if url == _last_report_url:
-            _log_poll(conn, source="nba_injury_report", url=url, http_status=304,
-                      items_seen=0, items_new=0, error="already ingested this report")
-            print("[news] nba_injury_report: no newer report")
-            return 0
-        try:
-            resp = httpx.get(url, headers=_HEADERS, timeout=20)
-        except Exception as exc:
-            last_status = repr(exc)[:300]
+    total, fetched_any, last_status = 0, False, None
+    for slot in reversed(latest_slots(now_et, NBA_REPORT_LOOKBACK_SLOTS)):
+        candidates = report_urls(slot)
+        if any(conn.execute("SELECT 1 FROM nba_report_index WHERE url = ?", (u,)).fetchone()
+               for u in candidates):
             continue
-        if resp.status_code != 200:
-            last_status = resp.status_code
+        resp = None
+        for url in candidates:
+            try:
+                r = httpx.get(url, headers=_HEADERS, timeout=20)
+            except Exception as exc:
+                last_status = repr(exc)[:300]
+                continue
+            if r.status_code == 200:
+                resp = r
+                break
+            last_status = r.status_code
+        if resp is None:
             continue
+        fetched_any = True
         try:
-            rows = parse_report(resp.content)
+            new, dropped = ingest_report(conn, url, resp.content, slot, fetched_at)
+            total += new + dropped
         except Exception as exc:
             _log_poll(conn, source="nba_injury_report", url=url, http_status=200,
                       error=f"parse failed: {exc!r}"[:300])
-            print(f"[news] nba_injury_report parse failed: {exc!r}")
-            return 0
-        items = report_items(rows, url, report_published(resp.content, slot))
-        new = _store(conn, "nba_injury_report", items, fetched_at)
-        _log_poll(conn, source="nba_injury_report", url=url, http_status=200,
-                  items_seen=len(items), items_new=new)
-        _last_report_url = url
-        print(f"[news] nba_injury_report {slot:%H:%M}: {len(items)} rows, {new} new")
-        return new
-    # No report in the lookback window: normal on non-game days and in preseason.
-    _log_poll(conn, source="nba_injury_report", url=report_url(latest_slots(now_et, 1)[0]),
-              http_status=last_status if isinstance(last_status, int) else None,
-              items_seen=0, items_new=0,
-              error=None if isinstance(last_status, int) else last_status)
-    print(f"[news] nba_injury_report: no report in last {NBA_REPORT_LOOKBACK_SLOTS} slots "
-          f"(last status {last_status})")
-    return 0
+            print(f"[news] nba_injury_report parse failed for {url}: {exc!r}")
+    if not fetched_any:
+        # Nothing new in the window: normal between reports, on non-game days and in preseason.
+        _log_poll(conn, source="nba_injury_report", url=report_url(latest_slots(now_et, 1)[0]),
+                  http_status=last_status if isinstance(last_status, int) else None,
+                  items_seen=0, items_new=0,
+                  error=None if last_status is None or isinstance(last_status, int) else last_status)
+        print(f"[news] nba_injury_report: nothing new (last status {last_status})")
+    return total
 
 
 # ---------------------------------------------------------------------------
 # Poll job + scheduler
 # ---------------------------------------------------------------------------
 
-def poll_once() -> dict:
+def _job(fn) -> int:
     conn = get_db()
-    init_tables(conn)
-    out = {"espn_injuries": poll_espn(conn), "nba_injury_report": poll_nba_report(conn)}
-    conn.close()
-    return out
+    try:
+        init_tables(conn)
+        return fn(conn)
+    finally:
+        conn.close()
+
+
+def poll_espn_job() -> int:
+    return _job(poll_espn)
+
+
+def poll_nba_report_job() -> int:
+    return _job(poll_nba_report)
+
+
+def poll_once() -> dict:
+    return {"espn_injuries": poll_espn_job(), "nba_injury_report": poll_nba_report_job()}
 
 
 _scheduler = None
@@ -398,12 +498,16 @@ def start_scheduler():
         return None
     from apscheduler.schedulers.background import BackgroundScheduler
     sched = BackgroundScheduler(timezone=EASTERN)
-    sched.add_job(poll_once, "interval", minutes=POLL_MINUTES, id="news_poll",
-                  next_run_time=dt.datetime.now(EASTERN), coalesce=True,
-                  max_instances=1, misfire_grace_time=POLL_MINUTES * 60)
+    now = dt.datetime.now(EASTERN)
+    sched.add_job(poll_espn_job, "interval", minutes=POLL_MINUTES, id="news_espn",
+                  next_run_time=now, coalesce=True, max_instances=1,
+                  misfire_grace_time=POLL_MINUTES * 60)
+    sched.add_job(poll_nba_report_job, "cron", minute=NBA_REPORT_CRON_MINUTES, id="news_nba_report",
+                  next_run_time=now, coalesce=True, max_instances=1, misfire_grace_time=15 * 60)
     sched.start()
     _scheduler = sched
-    print(f"[news] poller started: every {POLL_MINUTES} min")
+    print(f"[news] poller started: ESPN every {POLL_MINUTES} min, "
+          f"official report at :{NBA_REPORT_CRON_MINUTES.replace(',', ',:')}")
     return sched
 
 
