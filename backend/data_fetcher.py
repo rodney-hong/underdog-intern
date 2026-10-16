@@ -696,13 +696,20 @@ def get_todays_lines() -> dict:
             continue
 
     # Refuse a fresh pull that would dip into the scheduled line-logging reserve.
-    # Fall back to today's cached lines (stale is fine), else {} -> manual entry.
+    # Fallback order, no API calls: today's logged Underdog lines (line_snapshots,
+    # Points only) -> today's cached lines (stale is fine) -> {} (manual entry).
     slip_cost = len(today_events) * len(_PROP_MARKETS.split(","))  # markets x 1 region, upper bound
     ok, reason, _ = line_logger.check_unscheduled_spend(slip_cost, events)
     if not ok:
         line_logger.log_skip(endpoint="event_odds", phase="slip", reason=reason,
                              game_date=today_et.isoformat(), remaining=remaining)
-        if _lines_cache:
+        try:
+            logged = line_logger.todays_underdog_lines(today_et.isoformat())
+            if logged:
+                return logged
+        except Exception:
+            pass
+        if _lines_cache and dt.datetime.fromtimestamp(_lines_cache_ts, tz=eastern).date() == today_et:
             return _lines_cache
         try:
             conn = get_db()

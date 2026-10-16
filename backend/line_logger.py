@@ -278,6 +278,33 @@ def check_unscheduled_spend(cost: int, all_events: list[dict] | None) -> tuple[b
     return False, reason, snap
 
 
+def todays_underdog_lines(game_date: str) -> dict:
+    """
+    Latest logged Underdog line per player/market for game_date (ET), in the
+    shape data_fetcher.get_todays_lines() returns. Read-only; no API call.
+    Only Points is logged, so only player_points appears.
+    """
+    conn = get_db()
+    rows = conn.execute("""
+        SELECT s.player_name, s.market_key, s.point, s.game_id, s.home_team, s.away_team
+        FROM line_snapshots s
+        JOIN (SELECT player_name, market_key, MAX(captured_at) AS cap
+              FROM line_snapshots
+              WHERE game_date = ? AND bookmaker = 'underdog' AND side = 'Over'
+              GROUP BY player_name, market_key) m
+          ON s.player_name = m.player_name AND s.market_key = m.market_key
+         AND s.captured_at = m.cap
+        WHERE s.game_date = ? AND s.bookmaker = 'underdog' AND s.side = 'Over'
+    """, (game_date, game_date)).fetchall()
+    conn.close()
+    lines: dict = {}
+    for r in rows:
+        entry = lines.setdefault(r["player_name"], {
+            "game_id": r["game_id"], "home_team": r["home_team"], "away_team": r["away_team"]})
+        entry[r["market_key"]] = {"value": r["point"], "source": "underdog"}
+    return lines
+
+
 def _already_pulled(game_id: str, phase: str, game_date: str) -> bool:
     conn = get_db()
     row = conn.execute(
