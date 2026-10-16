@@ -14,6 +14,7 @@ import data_fetcher
 import predictor
 import database
 import line_logger
+import news_ingest
 
 app = FastAPI(title="SportsBettr API", version="1.0.0")
 
@@ -36,6 +37,7 @@ def startup_event():
     # Paper-mode line logging (Points, UD/FD/DK). Started before the ETL so a long
     # ETL doesn't delay the open pull; it never touches predictions.
     line_logger.start_scheduler()
+    news_ingest.start_scheduler()  # raw injury news every 20 min; no LLM, feeds nothing
 
     etl_ran = database.run_etl()
 
@@ -59,6 +61,7 @@ def startup_event():
 @app.on_event("shutdown")
 def shutdown_event():
     line_logger.stop_scheduler()
+    news_ingest.stop_scheduler()
 
 
 # ---------------------------------------------------------------------------
