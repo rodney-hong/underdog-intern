@@ -136,7 +136,35 @@ def main() -> None:
           f"{_projection(three + dfs_cost)}")
     print(f"    c) regions=us,us_dfs in one call (~2 regions x 1 market = 2/pull): "
           f"{_projection(2)}")
+    _print_fallback(three, dfs_cost)
     print("\nNo code was changed. Decide which option to adopt before the next scheduled pull.")
+
+
+def _print_fallback(three: int, dfs: int) -> None:
+    """Which schedule still fits the cap if Underdog needs its own call."""
+    peak_games = max(LAST_SEASON_GAMES.values())
+    configs = [  # (label, credits per game), most Underdog coverage first
+        ("both calls at open + pretip", 2 * (three + dfs)),
+        ("three-book at open + pretip, Underdog call at pretip only", 2 * three + dfs),
+        ("both calls at pretip only (no open pull; loses line movement)", three + dfs),
+    ]
+    print("\n    FALLBACK if Underdog requires its own call "
+          f"(peak month = {peak_games} games, cap {L.MONTHLY_CREDIT_CAP}):")
+    chosen = None
+    for label, per_game in configs:
+        peak = peak_games * per_game
+        reserve = int(-(-peak * (1 + L.RESERVE_BUFFER) // 1))
+        fits = peak <= L.MONTHLY_CREDIT_CAP
+        print(f"      {'fits' if fits else 'OVER'}  {label}: {per_game}/game -> peak {peak}; "
+              f"start-of-month reserve {reserve} -> "
+              f"{'room for news pulls' if reserve < L.MONTHLY_CREDIT_CAP else 'no room for news/slip pulls early in the month'}")
+        if fits and chosen is None:
+            chosen = label
+    if chosen:
+        print(f"    -> You would need: {chosen}.")
+    else:
+        print(f"    -> Nothing with Underdog fits; keep the three-book call without Underdog "
+              f"({2 * three}/game, peak {peak_games * 2 * three}).")
 
 
 if __name__ == "__main__":
