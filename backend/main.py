@@ -13,6 +13,7 @@ from pydantic import BaseModel, field_validator
 import data_fetcher
 import predictor
 import database
+import line_logger
 
 app = FastAPI(title="SportsBettr API", version="1.0.0")
 
@@ -32,6 +33,10 @@ def startup_event():
 
     database.init_db()
 
+    # Paper-mode line logging (Points, UD/FD/DK). Started before the ETL so a long
+    # ETL doesn't delay the open pull; it never touches predictions.
+    line_logger.start_scheduler()
+
     etl_ran = database.run_etl()
 
     if etl_ran or not os.path.exists(ml_trainer.MODEL_PATH):
@@ -49,6 +54,11 @@ def startup_event():
         print("WNBA models ready.")
     else:
         print("WNBA models up to date, skipping training.")
+
+
+@app.on_event("shutdown")
+def shutdown_event():
+    line_logger.stop_scheduler()
 
 
 # ---------------------------------------------------------------------------
