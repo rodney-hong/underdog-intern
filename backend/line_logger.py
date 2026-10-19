@@ -10,7 +10,9 @@ event. Stores both sides with price. Keyed so it never overwrites itself:
 
 Schedule (two pulls per game):
     open    — daily at OPEN_PULL_HOUR_ET for every game on today's ET slate
-    pretip  — PRETIP_MINUTES before each game's commence_time
+    pretip  — PRETIP_MINUTES (30) before each game's commence_time, catching the
+              official injury report's late updates; one retry PRETIP_RETRY_MINUTES
+              later if the call itself fails (not if it was refused by the cap)
 
 Every pull is recorded in odds_pull_log with x-requests-remaining before and
 after. A monthly credit cap (ODDS_MONTHLY_CREDIT_CAP, default 500) is enforced
@@ -43,7 +45,9 @@ BOOKMAKERS = "underdog,fanduel,draftkings"
 
 MONTHLY_CREDIT_CAP = int(os.getenv("ODDS_MONTHLY_CREDIT_CAP", "500"))
 OPEN_PULL_HOUR_ET  = int(os.getenv("LINE_LOG_OPEN_HOUR_ET", "10"))
-PRETIP_MINUTES     = int(os.getenv("LINE_LOG_PRETIP_MINUTES", "45"))
+PRETIP_MINUTES     = int(os.getenv("LINE_LOG_PRETIP_MINUTES", "30"))
+PRETIP_RETRY_MINUTES = 5   # one retry after a FAILED pre-tip call (error / non-200),
+                           # only if it still lands >= 1 minute before tip
 
 SCHEDULED_PULLS_PER_GAME = 2      # open + pretip
 EVENT_PULLS_PER_DAY_MAX  = 3      # ceiling for news-triggered pulls, not a quota
@@ -475,7 +479,17 @@ def run_open_pull(phase: str = "open", scheduler=None) -> int:
     return total
 
 
-def run_pretip_pull(event: dict) -> None:
+def _last_attempt(game_id: str, phase: str, game_date: str):
+    conn = get_db()
+    row = conn.execute(
+        "SELECT http_status, skip_reason, error FROM odds_pull_log WHERE endpoint = 'event_odds' "
+        "AND game_id = ? AND pull_phase = ? AND game_date = ? ORDER BY id DESC LIMIT 1",
+        (game_id, phase, game_date)).fetchone()
+    conn.close()
+    return row
+
+
+def run_pretip_pull(event: dict, attempt: int = 1) -> None:
     init_tables()
     commence  = _commence(event)
     game_date = commence.astimezone(EASTERN).date().isoformat()
@@ -485,7 +499,21 @@ def run_pretip_pull(event: dict) -> None:
         return
     # Free events call gives a fresh x-requests-remaining "before" value.
     _, remaining = fetch_todays_events()
-    pull_event(event, "pretip", remaining)
+    pull_event(event, "pretip", remaining, note=None if attempt == 1 else f"retry {attempt}")
+
+    # One retry, only when the call itself failed. A success (even with no Underdog
+    # lines) or a refusal by the cap/reserve is final: retrying would spend or be refused.
+    last = _last_attempt(event["id"], "pretip", game_date)
+    failed = last is not None and last["skip_reason"] is None and last["http_status"] != 200
+    retry_at = dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=PRETIP_RETRY_MINUTES)
+    if failed and attempt == 1 and retry_at <= commence - dt.timedelta(minutes=1):
+        if _scheduler is not None:
+            _scheduler.add_job(run_pretip_pull, "date", run_date=retry_at, args=[event],
+                               kwargs={"attempt": 2}, id=f"pretip-retry:{event['id']}",
+                               replace_existing=True, misfire_grace_time=60)
+            print(f"[line_logger] pretip failed for {event['id']}; retry at {retry_at:%H:%M} UTC")
+        return retry_at
+    return None
 
 
 def event_pulls_today() -> int:
@@ -545,7 +573,8 @@ def _schedule_pretip(scheduler, event: dict) -> None:
         run_at = now + dt.timedelta(seconds=30)  # inside the window already
     scheduler.add_job(
         run_pretip_pull, "date", run_date=run_at, args=[event],
-        id=f"pretip:{event['id']}", replace_existing=True, misfire_grace_time=30 * 60,
+        id=f"pretip:{event['id']}", replace_existing=True,
+        misfire_grace_time=(PRETIP_MINUTES - 5) * 60,
     )
 
 
