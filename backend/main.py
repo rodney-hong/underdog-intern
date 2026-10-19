@@ -5,7 +5,17 @@ Run with: uvicorn main:app --reload --port 8000
 """
 
 import concurrent.futures
+import sys
 import threading
+
+# Never let a print crash startup: when output is redirected (service, log file) Windows
+# falls back to cp1252, and a character like "→" in an ETL message raised
+# UnicodeEncodeError mid-ETL. Unencodable characters now print as "?".
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(errors="replace")
+    except (AttributeError, ValueError):
+        pass
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, field_validator
@@ -27,35 +37,56 @@ app.add_middleware(
 )
 
 # Initialise DB on startup
+def _startup_step(name: str, fn, *args, **kwargs):
+    """
+    Run one startup step; on failure log the full traceback and carry on.
+    Data loading or training problems must never stop the line logger or news
+    poller, which run in their own scheduler threads. Returns (ok, result).
+    """
+    import traceback
+    try:
+        return True, fn(*args, **kwargs)
+    except Exception:
+        print(f"[startup] {name} FAILED — continuing startup; the server stays up.")
+        traceback.print_exc()
+        return False, None
+
+
 @app.on_event("startup")
 def startup_event():
     import os
     import ml_trainer
 
-    database.init_db()
+    # Collection first, each guarded separately so one can't block the other.
+    # Paper-mode line logging (Points, UD/FD/DK); it never touches predictions.
+    _startup_step("line_logger.start_scheduler", line_logger.start_scheduler)
+    # Raw injury news (ESPN every 20 min, official report every 15); no LLM, feeds nothing.
+    _startup_step("news_ingest.start_scheduler", news_ingest.start_scheduler)
 
-    # Paper-mode line logging (Points, UD/FD/DK). Started before the ETL so a long
-    # ETL doesn't delay the open pull; it never touches predictions.
-    line_logger.start_scheduler()
-    news_ingest.start_scheduler()  # raw injury news every 20 min; no LLM, feeds nothing
+    _startup_step("database.init_db", database.init_db)
 
-    etl_ran = database.run_etl()
-
-    if etl_ran or not os.path.exists(ml_trainer.MODEL_PATH):
+    # NBA: if the ETL fails, keep the existing models rather than training on a
+    # partially replaced dataset. Train only when the ETL ran or no model exists.
+    etl_ok, etl_ran = _startup_step("database.run_etl", database.run_etl)
+    if etl_ok and (etl_ran or not os.path.exists(ml_trainer.MODEL_PATH)):
         print("Training XGBoost model…")
-        ml_trainer.train_model()
-        print("Model ready.")
+        if _startup_step("ml_trainer.train_model", ml_trainer.train_model)[0]:
+            print("Model ready.")
+    elif not etl_ok:
+        print("Skipping NBA training: ETL failed; existing models kept.")
     else:
         print("Model up to date, skipping training.")
 
-    wnba_etl_ran = database.run_wnba_etl()
-
-    if wnba_etl_ran or not os.path.exists(ml_trainer.WNBA_MODEL_PATH):
+    wnba_ok, wnba_etl_ran = _startup_step("database.run_wnba_etl", database.run_wnba_etl)
+    if wnba_ok and (wnba_etl_ran or not os.path.exists(ml_trainer.WNBA_MODEL_PATH)):
         print("Training WNBA XGBoost models…")
-        ml_trainer.train_wnba_models()
-        print("WNBA models ready.")
+        if _startup_step("ml_trainer.train_wnba_models", ml_trainer.train_wnba_models)[0]:
+            print("WNBA models ready.")
+    elif not wnba_ok:
+        print("Skipping WNBA training: WNBA ETL failed; existing models kept.")
     else:
         print("WNBA models up to date, skipping training.")
+    print("[startup] complete")
 
 
 @app.on_event("shutdown")

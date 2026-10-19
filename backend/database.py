@@ -30,6 +30,38 @@ _SCHEDULE_COLS = [
 ]
 
 
+def find_schedule_csv(dataset_path: str) -> str:
+    """
+    Return the current-season schedule file in a Kaggle dataset version, e.g.
+    LeagueSchedule26_27.csv. The dataset renames it each season, so pick the
+    LeagueSchedule<YY>_<YY>.csv with the latest season rather than hardcoding it.
+    """
+    import glob
+    import re
+    files = glob.glob(os.path.join(dataset_path, "LeagueSchedule*.csv"))
+    if not files:
+        present = sorted(os.listdir(dataset_path))
+        raise FileNotFoundError(f"No LeagueSchedule*.csv in {dataset_path}; files present: {present}")
+
+    def season(f: str) -> tuple:
+        m = re.search(r"LeagueSchedule(\d{2})_(\d{2})", os.path.basename(f))
+        return (int(m.group(1)), int(m.group(2))) if m else (-1, -1)
+
+    return max(files, key=lambda f: (season(f), os.path.basename(f)))
+
+
+def read_schedule_csv(schedule_path: str) -> pd.DataFrame:
+    """Read the schedule columns we use, matching header names case-insensitively."""
+    header = pd.read_csv(schedule_path, nrows=0).columns
+    by_lower = {c.lower(): c for c in header}
+    missing = [c for c in _SCHEDULE_COLS if c.lower() not in by_lower]
+    if missing:
+        raise ValueError(f"{os.path.basename(schedule_path)} is missing columns {missing}; "
+                         f"columns present: {list(header)}")
+    df = pd.read_csv(schedule_path, usecols=[by_lower[c.lower()] for c in _SCHEDULE_COLS])
+    return df.rename(columns={by_lower[c.lower()]: c for c in _SCHEDULE_COLS})
+
+
 def get_connection():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
@@ -443,10 +475,10 @@ def run_etl() -> bool:
     conn.close()
     print(f"  Done — {len(players_df):,} players")
 
-    # --- LeagueSchedule25_26.csv → schedule ---
-    schedule_path = os.path.join(path, "LeagueSchedule25_26.csv")
-    print("Loading LeagueSchedule25_26.csv...")
-    schedule_df = pd.read_csv(schedule_path, usecols=_SCHEDULE_COLS)
+    # --- LeagueSchedule<current season>.csv → schedule ---
+    schedule_path = find_schedule_csv(path)
+    print(f"Loading {os.path.basename(schedule_path)}...")
+    schedule_df = read_schedule_csv(schedule_path)
     schedule_df = schedule_df[schedule_df["homeTeamId"] != 0]
     conn = sqlite3.connect(DB_PATH)
     schedule_df.to_sql("schedule", conn, if_exists="replace", index=False)
