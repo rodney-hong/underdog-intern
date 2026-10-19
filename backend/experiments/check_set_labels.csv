@@ -1,0 +1,76 @@
+check_id,label_player,label_team,label_status,label_minutes_outlook,label_is_change,label_source_time,label_notes
+1,Kristaps Porzingis,Golden State Warriors,out,unknown,false,,
+2,Tyler Herro,Milwaukee Bucks,out,unknown,true,,
+3,Ja Morant,Memphis Grizzlies,out,unknown,false,,
+4,Anthony Gill,Washington Wizards,available,unknown,true,,
+5,Jimmy Butler III,Golden State Warriors,out,unknown,false,,
+6,Moussa Cisse,Dallas Mavericks,available,unknown,true,,
+7,Khris Middleton,Washington Wizards,unknown,unknown,false,,Reports a past absence; next game (Friday) status not stated. Same rule as 55 and 58.
+8,LeBron James,Philadelphia 76ers,out,restricted,true,,Preseason workload management read as limited in-game minutes.
+9,RayJ Dennis,Atlanta Hawks,doubtful,unknown,false,,
+10,Moussa Cisse,Dallas Mavericks,questionable,unknown,false,,Could sit out as a precaution.
+11,Jamir Watkins,Washington Wizards,out,unknown,true,,Surgery announcement treated as new availability news.
+12,T.J. McConnell,Indiana Pacers,out,unknown,true,,
+13,LJ Cryer,Golden State Warriors,out,unknown,false,,
+14,Cameron Carr,Los Angeles Lakers,unknown,unknown,false,,Status for Friday explicitly unknown.
+15,Nae'Qwan Tomlin,Cleveland Cavaliers,out,unknown,true,,
+16,Aaron Gordon,Denver Nuggets,out,unknown,true,,
+17,CJ McCollum,Atlanta Hawks,out,unknown,true,,
+18,Jayden Quaintance,San Antonio Spurs,out,unknown,false,,
+19,Morez Johnson Jr.,Dallas Mavericks,out,unknown,true,,
+20,Jamal Murray,Denver Nuggets,out,unknown,true,,
+21,Sam Hauser,Boston Celtics,available,unknown,true,,
+22,Caleb Martin,Dallas Mavericks,out,unknown,true,,
+23,Taylor Hendricks,Memphis Grizzlies,out,unknown,false,,
+24,Chet Holmgren,Oklahoma City Thunder,out,unknown,true,,
+25,Jimmy Butler III,Golden State Warriors,out,unknown,false,,
+26,Marvin Bagley III,Dallas Mavericks,available,unknown,true,,
+27,Trayce Jackson-Davis,Toronto Raptors,out,unknown,false,,
+28,Jonathan Isaac,Orlando Magic,unknown,unknown,false,,"Ramping up is practice activity, not game minutes."
+29,Naji Marshall,Dallas Mavericks,out,unknown,true,,
+30,Leonard Miller,Chicago Bulls,probable,unknown,false,,
+31,Marcus Sasser,Dallas Mavericks,available,unknown,true,,"'Expected to play' read as available. Minutes restriction unclear, so unknown."
+32,Jaylen Brown,Boston Celtics,out,unknown,false,,
+33,Stephon Castle,San Antonio Spurs,questionable,unknown,false,,
+34,Kevin Porter Jr.,Milwaukee Bucks,out,unknown,true,,
+35,Isaac Okoro,Chicago Bulls,doubtful,unknown,false,,
+36,Jusuf Nurkic,Utah Jazz,out,unknown,true,,New diagnosis and timeline.
+37,Tristan Vukcevic,Washington Wizards,out,unknown,false,,Re-evaluation of a player already out; not a change.
+38,Dereck Lively II,Dallas Mavericks,out,unknown,true,,
+39,Tyler Smith,Dallas Mavericks,available,unknown,true,,
+40,Julian Strawther,Denver Nuggets,unknown,unknown,true,,Fresh injury counts as a change even before a status.
+41,Dominick Barlow,Philadelphia 76ers,questionable,unknown,false,,Writer says 'questionable at best'; labeled questionable.
+42,Tobias Harris,San Antonio Spurs,out,unknown,false,,"Already ruled out for the preseason, so next game = out. Coach comments, no new status."
+43,Aaron Nesmith,Indiana Pacers,out,unknown,false,,
+44,Cooper Flagg,Dallas Mavericks,probable,unknown,false,,
+45,Anthony Gill,Washington Wizards,questionable,unknown,false,,
+46,Dylan Cardwell,Sacramento Kings,out,unknown,true,,New timeline: miss at least 5-6 games.
+47,Micah Peavy,Memphis Grizzlies,out,unknown,true,,"'Won't play' Friday = ruled out, per guide."
+48,LJ Cryer,Golden State Warriors,available,unknown,false,,
+49,Tari Eason,Houston Rockets,available,unknown,true,,
+50,Otega Oweh,Oklahoma City Thunder,out,unknown,true,,New season-ending surgery.
+51,Adem Bona,Philadelphia 76ers,out,unknown,false,,'Remains out' for Friday.
+52,Anthony Black,Orlando Magic,unknown,unknown,false,,Availability for Friday uncertain; caution is not a game-minutes limit.
+53,Nic Claxton,Chicago Bulls,out,unknown,true,,New hamstring injury; out for the preseason.
+54,Jaylin Williams,Oklahoma City Thunder,out,unknown,false,,
+55,Rocco Zikarsky,Minnesota Timberwolves,unknown,unknown,false,,Past absence; next game status not stated. Same rule as 7 and 58.
+56,Victor Wembanyama,San Antonio Spurs,available,unknown,true,,
+57,Ben Simmons,Sacramento Kings,out,unknown,true,,
+58,Isaac Okoro,Chicago Bulls,unknown,unknown,false,,Past absence; next game status not stated. Same rule as 7 and 55.
+59,GG Jackson,Memphis Grizzlies,out,unknown,false,,"Report writes 'Jackson, GG' with no suffix; usually listed as GG Jackson II. Labeled from the text."
+60,Oso Ighodaro,Phoenix Suns,out,unknown,true,,
+61,Bilal Coulibaly,Washington Wizards,questionable,unknown,false,,
+62,Darius Acuff Jr.,Sacramento Kings,out,unknown,true,,
+63,Ziaire Williams,Los Angeles Lakers,questionable,unknown,false,,Text says he can be considered questionable.
+64,Julius Randle,Minnesota Timberwolves,out,unknown,true,,
+65,Moses Moody,Golden State Warriors,out,unknown,false,,
+66,Zach LaVine,Sacramento Kings,out,unknown,true,,
+67,Sam Merrill,Cleveland Cavaliers,out,unknown,true,,
+68,Jimmy Butler III,Golden State Warriors,out,unknown,false,,
+69,Jalen Green,Phoenix Suns,out,unknown,true,,
+70,Johni Broome,Philadelphia 76ers,out,unknown,false,,
+71,Santi Aldama,Dallas Mavericks,doubtful,unknown,false,,'Unlikely to suit up' mapped to doubtful.
+72,Precious Achiuwa,Sacramento Kings,unknown,unknown,true,,Fresh in-game injury; next game not stated. Same rule as row 40.
+73,Jaime Jaquez Jr.,Milwaukee Bucks,out,unknown,true,,
+74,Max Strus,LA Clippers,out,unknown,true,,New diagnosis; team name as written in item.
+75,Ayo Dosunmu,Minnesota Timberwolves,available,unknown,true,,
