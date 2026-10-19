@@ -15,9 +15,12 @@ import joblib
 import numpy as np
 import pandas as pd
 
+import game_types
+import feature_defs
 from data_fetcher import (
     get_game_logs, get_injury_context, full_to_abbrev,
-    get_team_def_rating_last5, get_player_id,
+    get_team_def_rating_last5, get_player_id, is_playoff_matchup,
+    get_player_history, team_id_for,
     get_wnba_game_logs, get_wnba_injury_status,
 )
 from database import DB_PATH
@@ -57,8 +60,6 @@ _WNBA_ML_STAT_TYPES = {"Points", "Assists", "Rebounds", "3PM"}
 _WNBA_MODELS: dict = {}
 _WNBA_MODELS_LOADED = False
 
-# 2025 NBA playoffs started April 19 2025
-_PLAYOFF_START = datetime(2025, 4, 19)
 
 
 def _load_models() -> dict:
@@ -116,7 +117,8 @@ _WNBA_HA_COL_MAP = {
 
 def _get_home_away_split(player_name: str, stat_type: str, is_home: bool) -> float:
     """
-    Query player_stats for the player's career home-avg minus away-avg on `stat_type`.
+    Query player_stats for the player's career home-avg minus away-avg on `stat_type`,
+    over counted games only (game_types.py), as in ml_trainer.
     Returns (home_avg - away_avg) * +1 when playing at home, -1 on the road.
     Falls back to 0.0 if the player or stat mapping is not found.
     """
@@ -129,7 +131,8 @@ def _get_home_away_split(player_name: str, stat_type: str, is_home: bool) -> flo
     conn = sqlite3.connect(DB_PATH)
     rows = conn.execute(
         f"SELECT home, AVG({col}) FROM player_stats "
-        f"WHERE personId = ? AND {col} IS NOT NULL GROUP BY home",
+        f"WHERE personId = ? AND {col} IS NOT NULL "
+        f"AND gameType IN ({game_types.COUNTED_SQL}) GROUP BY home",
         (player_id,),
     ).fetchall()
     conn.close()
@@ -213,23 +216,16 @@ def _compute_ml_features(
     avg5  = float(stat_values.head(5).mean())
     avg10 = float(stat_values.head(10).mean())
 
-    # Season-avg proxy: mean of all available games in the log
-    season_avg = float(stat_values.mean())
-    hit_rate   = float((stat_values.head(10) > season_avg).mean())
     trend      = avg5 - avg10
 
-    # "Trail Blazers" is two words so split()[-1] gives "Blazers" — handle explicitly.
-    opp_nickname = "Trail Blazers" if "Blazers" in opponent_team else opponent_team.split()[-1]
-    opp_games = (
-        df[df["opponentteamName"].str.strip() == opp_nickname]
-        if "opponentteamName" in df.columns
-        else pd.DataFrame()
-    )
-    vs_opp = (
-        float(_compute_stat(opp_games, stat_type).mean())
-        if not opp_games.empty
-        else avg10
-    )
+    # hit_rate_last10 and vs_opponent_avg: identical definitions to training via
+    # feature_defs (career-to-date mean; full history vs this opponent by team id).
+    history = get_player_history(player_name, stat_type)
+    opp_id = team_id_for(opponent_team)
+    shared = feature_defs.next_game_features(history, "_stat", opp_id)
+    hit_rate = shared["hit_rate_last10"]
+    vs_opp = shared["vs_opponent_avg"] if pd.notna(shared["vs_opponent_avg"]) else avg10
+    opp_game_count = int((history["opponentteamId"] == opp_id).sum()) if opp_id is not None else 0
 
     # line_diff: how far avg10 sits above/below the actual prop line
     line_diff = avg10 - stat_line
@@ -248,8 +244,9 @@ def _compute_ml_features(
     # opp_def_rating_last5: opponent team's recent defensive quality
     opp_def = get_team_def_rating_last5(opponent_team)
 
-    # is_playoff: are we currently in the 2025 post-season?
-    is_playoff = int(datetime.now() > _PLAYOFF_START)
+    # is_playoff: 1 only if the game being predicted is a playoff game (as in training).
+    # Previously datetime.now() > 2025-04-19, which made every prediction since then 1.
+    is_playoff = is_playoff_matchup(opponent_team)
 
     # minutes_trend / avg_minutes_last5 from the player's game log (MIN column)
     if "MIN" in df.columns and df["MIN"].notna().any():
@@ -298,7 +295,7 @@ def _compute_ml_features(
         "avg_minutes_last5":    avg_minutes_last5,
         "fatigue_score":        fatigue_score,
         "home_away_split":      home_away_split,
-        "opp_game_count":       len(opp_games),
+        "opp_game_count":       opp_game_count,
     }
 
 

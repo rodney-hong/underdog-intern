@@ -21,6 +21,7 @@ load_dotenv()
 
 from database import DB_PATH
 import line_logger
+import game_types
 
 
 # ---------------------------------------------------------------------------
@@ -236,7 +237,8 @@ def get_game_logs(
     last_n: int = 20,
 ) -> pd.DataFrame:
     """
-    Return a DataFrame of the player's last `last_n` games across all game types.
+    Return a DataFrame of the player's last `last_n` COUNTED games (game_types.py:
+    no preseason, All-Star or Cup final), matching what ml_trainer trains on.
 
     Columns are renamed to match predictor.py's expectations:
       GAME_DATE, MATCHUP, PTS, REB, AST, FG3M, MIN, PLUS_MINUS, WL
@@ -266,7 +268,7 @@ def get_game_logs(
         f"""
         SELECT {cols_sql}
         FROM player_stats
-        WHERE personId = ?
+        WHERE personId = ? AND gameType IN ({game_types.COUNTED_SQL})
         ORDER BY gameDateTimeEst DESC
         LIMIT ?
         """,
@@ -315,9 +317,74 @@ def get_game_logs(
 # Team defensive rating helper
 # ---------------------------------------------------------------------------
 
+# Base stat columns, and combo sums written in the same order as ml_trainer's
+# _sum_* columns, so inference reproduces training's float arithmetic exactly.
+_HISTORY_STAT_EXPR = {
+    "Points":   lambda h: h["points"],
+    "Rebounds": lambda h: h["reboundsTotal"],
+    "Assists":  lambda h: h["assists"],
+    "3PM":      lambda h: h["threePointersMade"],
+    "PRA":      lambda h: h["points"] + h["reboundsTotal"] + h["assists"],
+    "PR":       lambda h: h["points"] + h["reboundsTotal"],
+    "PA":       lambda h: h["points"] + h["assists"],
+    "RA":       lambda h: h["reboundsTotal"] + h["assists"],
+}
+
+
+def get_player_history(player_name: str, stat_type: str) -> pd.DataFrame:
+    """
+    The player's full counted-game history, chronological, with the same row filters
+    as ml_trainer.build_training_data (numMinutes > 0, counted game types, valid date):
+    columns gameDateTimeEst, opponentteamId, _stat. Empty if unknown player/stat.
+    """
+    expr = _HISTORY_STAT_EXPR.get(stat_type)
+    player_id = get_player_id(player_name)
+    if expr is None or player_id is None:
+        return pd.DataFrame()
+    conn = sqlite3.connect(DB_PATH)
+    h = pd.read_sql_query(
+        f"SELECT gameDateTimeEst, opponentteamId, points, reboundsTotal, assists, threePointersMade "
+        f"FROM player_stats WHERE personId = ? AND numMinutes IS NOT NULL AND numMinutes > 0 "
+        f"AND gameType IN ({game_types.COUNTED_SQL})",
+        conn, params=(player_id,))
+    conn.close()
+    h["gameDateTimeEst"] = pd.to_datetime(h["gameDateTimeEst"], errors="coerce")
+    h = h.dropna(subset=["gameDateTimeEst"]).sort_values("gameDateTimeEst").reset_index(drop=True)
+    h["_stat"] = expr(h)
+    return h[["gameDateTimeEst", "opponentteamId", "_stat"]]
+
+
+def team_id_for(team_name: str):
+    """NBA team id for a full team name, from the schedule table (None if unknown)."""
+    nickname = "Trail Blazers" if "Blazers" in team_name else team_name.split()[-1]
+    conn = get_db()
+    row = conn.execute("SELECT homeTeamId FROM schedule WHERE homeTeamName = ? LIMIT 1",
+                       (nickname,)).fetchone()
+    conn.close()
+    return row[0] if row else None
+
+
+def is_playoff_matchup(opponent_team: str) -> int:
+    """
+    1 if the next scheduled game against `opponent_team` (today or later, ET) is a
+    playoff game, else 0. Mirrors ml_trainer's is_playoff (gameType == 'Playoffs');
+    the schedule has no gameType, so it is read from the gameId type digit.
+    """
+    nickname = "Trail Blazers" if "Blazers" in opponent_team else opponent_team.split()[-1]
+    today = dt.datetime.now(ZoneInfo("America/New_York")).date().isoformat()
+    conn = get_db()
+    row = conn.execute(
+        "SELECT gameId FROM schedule WHERE (homeTeamName = ? OR awayTeamName = ?) "
+        "AND substr(gameDateTimeEst, 1, 10) >= ? ORDER BY gameDateTimeEst LIMIT 1",
+        (nickname, nickname, today)).fetchone()
+    conn.close()
+    return int(bool(row) and game_types.schedule_game_is_playoff(row[0]))
+
+
 def get_team_def_rating_last5(team_name: str) -> float:
     """
-    Return the team's average defensive rating across their last 5 distinct games.
+    Return the team's average defensive rating across their last 5 distinct counted
+    games (game_types.py), as in ml_trainer's opp_def_rating_last5.
     Falls back to 108.0 (approximate NBA league average) if no data is found.
     playerteamName in player_stats stores only the nickname ('Timberwolves', not
     'Minnesota Timberwolves'), so extract the last word of the full name to match.
@@ -326,11 +393,11 @@ def get_team_def_rating_last5(team_name: str) -> float:
     nickname = "Trail Blazers" if "Blazers" in team_name else team_name.split()[-1]
     conn = get_db()
     row = conn.execute(
-        """
+        f"""
         SELECT AVG(avg_def) FROM (
             SELECT gameDateTimeEst, AVG(defensiveRating) AS avg_def
             FROM player_stats
-            WHERE playerteamName = ?
+            WHERE playerteamName = ? AND gameType IN ({game_types.COUNTED_SQL})
             GROUP BY gameDateTimeEst
             ORDER BY gameDateTimeEst DESC
             LIMIT 5

@@ -17,6 +17,8 @@ from sklearn.metrics import accuracy_score, roc_auc_score
 from xgboost import XGBClassifier
 
 from database import DB_PATH
+import game_types
+import feature_defs
 from real_lines import build_real_line_lookup, REAL_LINE_STATS, _norm_name as _rl_norm_name
 
 # When True, Points/Rebounds/Assists/3PM train on REAL book lines joined from
@@ -127,9 +129,20 @@ def build_training_data() -> pd.DataFrame:
 
     df["gameDateTimeEst"] = pd.to_datetime(df["gameDateTimeEst"], errors="coerce")
     df = df.dropna(subset=["gameDateTimeEst"])
+
+    # Keep only counted game types (game_types.py) BEFORE any feature is computed, so
+    # preseason / All-Star / Cup-final games leave both the training rows and every
+    # rolling window (including the opponent def-rating table built below).
+    by_type = df["gameType"].value_counts(dropna=False)
+    keep = df["gameType"].isin(game_types.COUNTED_GAME_TYPES)
+    dropped = by_type[~by_type.index.isin(game_types.COUNTED_GAME_TYPES)]
+    print(f"  game types kept: {int(keep.sum()):,} player-game rows; excluded: "
+          + ", ".join(f"{t}={n:,}" for t, n in dropped.items()))
+    df = df[keep]
+
     df = df.sort_values(["personId", "gameDateTimeEst"]).reset_index(drop=True)
     df["home"] = df["home"].fillna(0).astype(int)
-    df["is_playoff"] = (df["gameType"] != "Regular Season").astype(int)
+    df["is_playoff"] = df["gameType"].isin(game_types.PLAYOFF_GAME_TYPES).astype(int)
     df["player_name"] = df["firstName"].str.strip() + " " + df["lastName"].str.strip()
     df["game_date_str"] = df["gameDateTimeEst"].dt.strftime("%Y-%m-%d")
 
@@ -161,8 +174,12 @@ def build_training_data() -> pd.DataFrame:
         on=["opponentteamId", "gameDateTimeEst"],
         how="left",
     )
-    global_def_mean = float(df["defensiveRating"].mean())
-    df["opp_def_rating_last5"] = df["opp_def_rating_last5"].fillna(global_def_mean)
+    # Missing opponent ratings (a team's first game) are left NaN here and filled per
+    # split in fill_def_rating() with the mean over TRAINING dates only, so the fill
+    # value carries no information from the evaluation period.
+    _daily_def = (df.dropna(subset=["defensiveRating"])
+                    .assign(_day=df["gameDateTimeEst"].dt.normalize())
+                    .groupby("_day")["defensiveRating"].agg(["sum", "count"]))
 
     # avg_minutes_last5 / minutes_trend — lagged rolling means of numMinutes
     _min5 = df.groupby("personId")["numMinutes"].transform(
@@ -207,16 +224,12 @@ def build_training_data() -> pd.DataFrame:
         g = df.groupby("personId")[col]
 
         avg5  = g.transform(lambda x: x.shift(1).rolling(5,  min_periods=5).mean())
-        avg10 = g.transform(lambda x: x.shift(1).rolling(10, min_periods=10).mean())
+        avg10 = feature_defs.lagged_avg(df, col, 10)
 
-        # Expanding season-average proxy (lagged) used for hit_rate computation
-        exp_mean_lagged = g.transform(lambda x: x.shift(1).expanding(min_periods=1).mean())
-
-        beat_avg = (df[col] > exp_mean_lagged).astype(float)
-        df["_beat"] = beat_avg
-        hit_rate = df.groupby("personId")["_beat"].transform(
-            lambda x: x.shift(1).rolling(10, min_periods=10).mean()
-        )
+        # Career-to-date mean before each game; hit_rate and vs_opp come from
+        # feature_defs, which predictor.py also uses for the next game.
+        exp_mean_lagged = feature_defs.lagged_expanding_mean(df, col)
+        hit_rate = feature_defs.hit_rate_last10(df, col, exp_mean_lagged)
 
         trend = avg5 - avg10
 
@@ -239,11 +252,7 @@ def build_training_data() -> pd.DataFrame:
         consistency = g.transform(lambda x: x.shift(1).rolling(10, min_periods=10).std())
         line_diff = avg10 - line
 
-        df["_stat"] = df[col]
-        vs_opp = df.groupby(["personId", "opponentteamId"])["_stat"].transform(
-            lambda x: x.shift(1).expanding(min_periods=1).mean()
-        )
-        vs_opp = vs_opp.fillna(avg10)
+        vs_opp = feature_defs.vs_opponent_avg(df, col, avg10)
 
         # home_away_split: (home expanding avg) minus (away expanding avg),
         # multiplied by +1 at home / -1 away for a directional signal.
@@ -308,16 +317,76 @@ def build_training_data() -> pd.DataFrame:
         all_frames.append(stat_df)
 
     df.drop(columns=["_beat", "_stat"], inplace=True, errors="ignore")
-    return pd.concat(all_frames, ignore_index=True)
+    out = pd.concat(all_frames, ignore_index=True)
+    out.attrs["daily_def"] = _daily_def
+    return out
 
 
-def train_model() -> dict:
+def date_cutoffs(stat_data: pd.DataFrame, fracs: tuple) -> list:
     """
-    Train one XGBoost classifier per stat type on the full player_stats history.
-    Uses an 80/20 temporal split per stat type.
-    Saves model_{stat_type}.pkl and feature_importance_{stat_type}.png for each.
-    Returns a dict mapping stat_type → trained model.
+    Split points on CALENDAR-DAY boundaries (ET game date): for each fraction f, the
+    day of the row at position int(f * n) in date order. Every row from a given day
+    falls on one side, so no game night straddles train and evaluation.
     """
+    day = pd.to_datetime(stat_data["game_date"]).dt.normalize()
+    day = day.sort_values().reset_index(drop=True)
+    return [day.iloc[int(len(day) * f)] for f in fracs]
+
+
+def def_rating_mean(daily_def: pd.DataFrame | None, before=None) -> float:
+    """Mean player-game defensiveRating over days strictly before `before` (all days if None)."""
+    if daily_def is None or daily_def.empty:
+        return 0.0
+    d = daily_def if before is None else daily_def[daily_def.index < before]
+    return float(d["sum"].sum() / d["count"].sum()) if d["count"].sum() else 0.0
+
+
+def fill_def_rating(X: pd.DataFrame, fill: float) -> pd.DataFrame:
+    X = X.copy()
+    X["opp_def_rating_last5"] = X["opp_def_rating_last5"].fillna(fill)
+    return X
+
+
+# ---------------------------------------------------------------------------
+# Frozen 2026-27 NBA models (see experiments/preregistration.md)
+# ---------------------------------------------------------------------------
+
+# Chosen per stat by the pre-declared rule in experiments/model_selection.py:
+# higher 70/15/15 validation AUC wins. No changes until the December check.
+FROZEN_MODEL_TYPES = {
+    "Points": "lr", "Rebounds": "lr", "3PM": "lr",
+    "Assists": "xgb", "PRA": "xgb", "PR": "xgb", "PA": "xgb", "RA": "xgb",
+}
+MODEL_FROZEN = True
+
+
+def make_model(kind: str):
+    """The two model types compared in experiments/model_selection.py, fixed settings."""
+    if kind == "xgb":
+        return XGBClassifier(eval_metric="logloss", n_estimators=200, max_depth=4,
+                             learning_rate=0.05, random_state=42)
+    if kind == "lr":
+        from sklearn.linear_model import LogisticRegression
+        from sklearn.pipeline import make_pipeline
+        from sklearn.preprocessing import StandardScaler
+        return make_pipeline(StandardScaler(), LogisticRegression(C=1.0, max_iter=2000))
+    raise ValueError(kind)
+
+
+def train_model(force: bool = False) -> dict:
+    """
+    Fit the frozen NBA models: one per stat type, model type from FROZEN_MODEL_TYPES,
+    on 100% of the training rows (no holdout; the evidence for each choice is
+    experiments/model_selection.py). Missing opponent def ratings are filled with the
+    mean over all dates.
+
+    The 2026-27 models are frozen: this refuses to run unless force=True, and startup
+    never calls it. Saves model_{stat_type}.pkl and feature_importance_{stat_type}.png.
+    Returns a dict mapping stat_type -> fitted model.
+    """
+    if MODEL_FROZEN and not force:
+        raise RuntimeError("NBA models are frozen for 2026-27 (experiments/preregistration.md); "
+                           "refusing to retrain. Pass force=True only for a deliberate, recorded refit.")
     print("Building training data from player_stats…")
     data = build_training_data()
     if data.empty:
@@ -326,6 +395,7 @@ def train_model() -> dict:
     print(f"  {len(data):,} labelled rows across {data['stat_type'].nunique()} stat types")
     print(f"  USE_REAL_LINES = {USE_REAL_LINES} "
           f"(real lines apply to {sorted(REAL_LINE_STATS)}; combos always simulated)")
+    fill = def_rating_mean(data.attrs.get("daily_def"))
 
     models: dict = {}
 
@@ -339,39 +409,29 @@ def train_model() -> dict:
             print(f"  [{stat_type}] no rows — skipping")
             continue
 
-        X = stat_data[FEATURE_COLS].fillna(0).astype(float)
+        X = fill_def_rating(stat_data[FEATURE_COLS], fill).fillna(0).astype(float)
         y = stat_data["hit"]
-
-        split = int(len(stat_data) * 0.8)
-        X_train, X_test = X.iloc[:split], X.iloc[split:]
-        y_train, y_test = y.iloc[:split], y.iloc[split:]
-
-        model = XGBClassifier(
-            eval_metric="logloss",
-            n_estimators=200,
-            max_depth=4,
-            learning_rate=0.05,
-            random_state=42,
-        )
-        model.fit(X_train, y_train)
-
-        y_pred = model.predict(X_test)
-        y_prob = model.predict_proba(X_test)[:, 1]
-        print(
-            f"  [{stat_type}] accuracy={accuracy_score(y_test, y_pred):.4f}"
-            f"  AUC={roc_auc_score(y_test, y_prob):.4f}"
-        )
+        kind = FROZEN_MODEL_TYPES[stat_type]
+        model = make_model(kind)
+        model.fit(X, y)
+        print(f"  [{stat_type}] {kind} fit on 100% ({len(X):,} rows, "
+              f"{str(stat_data['game_date'].min())[:10]} .. {str(stat_data['game_date'].max())[:10]}), "
+              f"def-rating fill {fill:.2f}")
 
         mp = model_path(stat_type)
         joblib.dump(model, mp)
         print(f"  Model saved → {mp}")
 
         plot_p = os.path.join(MODEL_DIR, f"feature_importance_{stat_type}.png")
-        importances = pd.Series(model.feature_importances_, index=FEATURE_COLS)
+        if kind == "xgb":
+            weights, label = model.feature_importances_, "Importance"
+        else:  # standardized LR coefficients (positive = more likely OVER)
+            weights, label = model[-1].coef_[0], "Standardized coefficient"
+        importances = pd.Series(weights, index=FEATURE_COLS)
         fig, ax = plt.subplots(figsize=(8, 5))
         importances.sort_values().plot.barh(ax=ax)
-        ax.set_title(f"XGBoost Feature Importances — {stat_type}")
-        ax.set_xlabel("Importance")
+        ax.set_title(f"{kind.upper()} — {stat_type}")
+        ax.set_xlabel(label)
         plt.tight_layout()
         plt.savefig(plot_p)
         plt.close(fig)
@@ -559,9 +619,11 @@ def train_wnba_models() -> dict:
         X = stat_data[FEATURE_COLS].fillna(0).astype(float)
         y = stat_data["hit"]
 
-        split = int(len(stat_data) * 0.8)
-        X_train, X_test = X.iloc[:split], X.iloc[split:]
-        y_train, y_test = y.iloc[:split], y.iloc[split:]
+        # 80/20 temporal split on a calendar-day boundary (WNBA has no def ratings)
+        (cut,) = date_cutoffs(stat_data, (0.8,))
+        tr = (pd.to_datetime(stat_data["game_date"]).dt.normalize() < cut).values
+        X_train, X_test = X[tr], X[~tr]
+        y_train, y_test = y[tr], y[~tr]
 
         model = XGBClassifier(
             eval_metric="logloss",

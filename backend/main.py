@@ -65,17 +65,16 @@ def startup_event():
 
     _startup_step("database.init_db", database.init_db)
 
-    # NBA: if the ETL fails, keep the existing models rather than training on a
-    # partially replaced dataset. Train only when the ETL ran or no model exists.
-    etl_ok, etl_ran = _startup_step("database.run_etl", database.run_etl)
-    if etl_ok and (etl_ran or not os.path.exists(ml_trainer.MODEL_PATH)):
-        print("Training XGBoost model…")
-        if _startup_step("ml_trainer.train_model", ml_trainer.train_model)[0]:
-            print("Model ready.")
-    elif not etl_ok:
-        print("Skipping NBA training: ETL failed; existing models kept.")
+    # NBA: the ETL still loads new box scores and resolves pending predictions, but the
+    # 2026-27 models are frozen (experiments/preregistration.md): startup never retrains.
+    _startup_step("database.run_etl", database.run_etl)
+    missing = [st for st in ml_trainer.FROZEN_MODEL_TYPES
+               if not os.path.exists(ml_trainer.model_path(st))]
+    if missing:
+        print(f"[startup] WARNING: frozen NBA model files missing for {missing}; those stat "
+              f"types fall back to the heuristic scorer. Not retraining (models are frozen).")
     else:
-        print("Model up to date, skipping training.")
+        print("NBA models frozen for 2026-27; not retraining.")
 
     wnba_ok, wnba_etl_ran = _startup_step("database.run_wnba_etl", database.run_wnba_etl)
     if wnba_ok and (wnba_etl_ran or not os.path.exists(ml_trainer.WNBA_MODEL_PATH)):
