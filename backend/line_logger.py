@@ -489,6 +489,19 @@ def _last_attempt(game_id: str, phase: str, game_date: str):
     return row
 
 
+def _log_paper_predictions(game_id: str) -> None:
+    """Frozen-model paper predictions for this pre-tip pull (paper_predictions.py).
+    Reads the database only; never allowed to break line logging."""
+    if os.getenv("PAPER_PREDICTIONS_ENABLED", "1") != "1":
+        return
+    try:
+        import paper_predictions
+        res = paper_predictions.log_for_pull(game_id)
+        print(f"[line_logger] paper predictions for {game_id}: {res}")
+    except Exception as exc:
+        print(f"[line_logger] paper predictions FAILED for {game_id}: {exc!r}")
+
+
 def run_pretip_pull(event: dict, attempt: int = 1) -> None:
     init_tables()
     commence  = _commence(event)
@@ -500,6 +513,9 @@ def run_pretip_pull(event: dict, attempt: int = 1) -> None:
     # Free events call gives a fresh x-requests-remaining "before" value.
     _, remaining = fetch_todays_events()
     pull_event(event, "pretip", remaining, note=None if attempt == 1 else f"retry {attempt}")
+
+    if _already_pulled(event["id"], "pretip", game_date):
+        _log_paper_predictions(event["id"])
 
     # One retry, only when the call itself failed. A success (even with no Underdog
     # lines) or a refusal by the cap/reserve is final: retrying would spend or be refused.

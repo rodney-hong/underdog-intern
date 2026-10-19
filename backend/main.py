@@ -68,6 +68,11 @@ def startup_event():
     # NBA: the ETL still loads new box scores and resolves pending predictions, but the
     # 2026-27 models are frozen (experiments/preregistration.md): startup never retrains.
     _startup_step("database.run_etl", database.run_etl)
+    # Paper predictions from the frozen model: fill results from any new box scores.
+    import paper_predictions
+    ok, n = _startup_step("paper_predictions.resolve", paper_predictions.resolve_paper_predictions)
+    if ok:
+        print(f"Paper predictions resolved: {n}")
     missing = [st for st in ml_trainer.FROZEN_MODEL_TYPES
                if not os.path.exists(ml_trainer.model_path(st))]
     if missing:

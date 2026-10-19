@@ -204,14 +204,16 @@ def _compute_ml_features(
     stat_line: float,
     is_home: bool,
     is_back_to_back: bool,
+    min_games: int = 10,
 ) -> dict | None:
     """
     Compute the 14 model features (ml_trainer.FEATURE_COLS) for the player's next game.
     hit_rate_last10 and vs_opponent_avg use feature_defs, shared with training.
-    Returns None if the player has fewer than 10 logged games.
+    Returns None if the player has fewer than `min_games` counted games (the app uses
+    10 and falls back to the heuristic; paper_predictions passes 1 to score everyone).
     """
     df = get_game_logs(player_name, last_n=40)
-    if df.empty or len(df) < 10:
+    if df.empty or len(df) < min_games:
         return None
 
     stat_values = _compute_stat(df, stat_type)
