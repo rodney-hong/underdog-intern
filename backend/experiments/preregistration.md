@@ -228,3 +228,79 @@ correlation: single-leg UNDER hit rates on 2025-26 real lines are Points 0.5171
 3PM 0.5443 [0.5344, 0.5541] — every CI far below the 0.5774 single-leg break-even.
 
 **TEST C: NO PASS.** Recorded as final. FanDuel lines, hypothesis for Underdog.
+
+---
+
+## Frozen 2026-27 NBA model (frozen 2026-10-18, before 2026-10-20 opening night)
+
+**No model changes until the December 2026 check.** `ml_trainer.train_model()` refuses
+to run without `force=True`, and startup never retrains NBA models: new Kaggle versions
+still load box scores and resolve predictions, but the model files below do not change.
+WNBA models are outside this freeze.
+
+### What is frozen
+
+| | |
+| --- | --- |
+| Code commit | `1313d9125f3811322864765476c556fc097bf49d` |
+| Training data | Kaggle `eoinamoore/historical-nba-data-and-player-box-scores` **v519**; `player_stats` 840,793 rows; real lines from `historical_player_props` (FanDuel/DraftKings, resolved by `real_lines.py`) |
+| Environment | Python 3.14.4, xgboost 3.2.0, scikit-learn 1.8.0, pandas 2.3.3, numpy 2.4.4 |
+| Game types | `game_types.py`: kept Regular Season, NBA Emirates Cup (2023 group/QF/SF), Playoffs, Play-in; excluded Preseason (48,082 rows), All-Star (794), Emirates NBA Cup final (18). `is_playoff` = Playoffs only. |
+| Fit | 100% of rows per stat; missing opponent def rating filled with the all-dates mean (105.56) |
+
+| model | type | training rows | lines | SHA-256 |
+| --- | --- | --- | --- | --- |
+| `model_Points.pkl` | LR | 29,836 | real | `50a26f530ef7116b7431d982da1c1f4523294a043034268d61ecc7fd5070a8aa` |
+| `model_Rebounds.pkl` | LR | 26,970 | real | `71d16a7239c7f6f7147b8484d67ccf9daa68a08fd8d737cc264394cceba05ee6` |
+| `model_Assists.pkl` | XGBoost | 17,557 | real | `19b0ac96bedae5b09fa6421e907cf7d3264cd1bb30ff73a2abd57353ae7cbb74` |
+| `model_3PM.pkl` | LR | 21,465 | real | `b5e94bb660619f9d316f8a270dda66b7781abc6c9d6efa2456d9cf250208bcd8` |
+| `model_PRA.pkl` | XGBoost | 752,661 | simulated | `59f3900af84889d2f375c5f5c2bb3444167eaabf22cf1ddcfcea156cf1b4ced1` |
+| `model_PR.pkl` | XGBoost | 752,661 | simulated | `10c195e349ea014156d630622a31d092b1fbe137bd905c8b1b52f7e13afb8208` |
+| `model_PA.pkl` | XGBoost | 752,661 | simulated | `c92b2b98a229ff61aef0b30ab493167feadcd0544bdfe6d0337f4d4a573b8520` |
+| `model_RA.pkl` | XGBoost | 752,661 | simulated | `0c554470399176e587a66cc16a0327040e94c21c215e21ed2172ed767d6a1ad5` |
+
+LR = `StandardScaler` + `LogisticRegression(C=1.0, max_iter=2000)`. XGBoost =
+`n_estimators=200, max_depth=4, learning_rate=0.05, random_state=42`. Neither was tuned.
+
+**Reproducible:** a second refit at this commit on the v519 database produced
+byte-identical files for all 8 models. To check: `sha256sum backend/model_*.pkl`. To
+regenerate (only for verification): at commit `1313d91`, with `player_stats` at v519,
+`PYTHONIOENCODING=utf-8 python -c "import ml_trainer as M; M.train_model(force=True)"`.
+A later ETL replaces `player_stats`, after which a refit will no longer match.
+
+### How the model type was chosen (rule fixed before running)
+
+`experiments/model_selection.py`; results in `experiments/results_model_selection.json`.
+Temporal 70/15/15 on calendar-day boundaries; per stat, higher **validation** AUC wins
+(exact tie → LR); the winner alone was scored **once** on test. Monthly walk-forward
+(2024-10 .. 2026-05) is reported alongside and did not override the rule.
+
+| stat | val AUC XGB / LR | winner | test AUC [95% CI] | walk-forward pooled XGB / LR |
+| --- | --- | --- | --- | --- |
+| Points | 0.514 / 0.527 | LR | 0.522 [0.505, 0.539] | 0.505 / 0.511 |
+| Rebounds | 0.527 / 0.531 | LR | 0.533 [0.515, 0.549] | 0.532 / 0.534 |
+| Assists | 0.531 / 0.526 | XGBoost | 0.508 [0.487, 0.531] | 0.514 / 0.531 |
+| 3PM | 0.535 / 0.568 | LR | 0.556 [0.536, 0.577] | 0.544 / 0.558 |
+| PRA/PR/PA/RA | XGB ahead by ~0.004-0.006 | XGBoost | 0.732-0.747 | XGB ahead in 15-16 of 16 months |
+
+Assists: the rule picked XGBoost on validation; test and walk-forward favour LR. The
+rule was kept as declared (no deviation). Combo numbers are on simulated lines and say
+nothing about real-line performance. On all four real-line stats, XGBoost's log loss is
+worse than predicting the base rate; LR's is at or slightly better.
+
+### Train/inference parity
+
+- `hit_rate_last10` and `vs_opponent_avg` are defined once in `feature_defs.py` and used
+  by both training and `predictor.py`. Training frame bit-identical before/after the
+  refactor; `experiments/feature_parity.py` matches 20/20 historical rows exactly
+  (also `avg_pts_last10`).
+- Game types and `is_playoff` are applied identically at inference.
+- **Not verified identical** (inference still reads the last 40 counted games):
+  `games_played_last15`, `fatigue_score`, `minutes_trend`, `avg_minutes_last5`,
+  `home_away_split`, `opp_def_rating_last5`. Definitions are close but were not shown
+  to match exactly; check at the December review.
+
+### December check
+
+Score frozen-model predictions logged from 2026-10-20 against results, on real Underdog
+lines. Anything learned before then is recorded, not acted on.
