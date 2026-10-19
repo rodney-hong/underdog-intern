@@ -53,6 +53,7 @@ NBA_REPORT_URL    = "https://ak-static.cms.nba.com/referee/injury/Injury-Report_
 # known which format the 2026-27 season starts with.
 NBA_REPORT_URL_HOURLY = "https://ak-static.cms.nba.com/referee/injury/Injury-Report_{date}_{hh}{ampm}.pdf"
 NBA_REPORT_LOOKBACK_SLOTS = 4   # try the latest 15-min slot, then up to 3 earlier ones
+NBA_REPORT_CATCHUP_HOURS  = 24  # at startup, ingest missed reports this far back
 _HEADERS = {"User-Agent": "Mozilla/5.0"}
 
 
@@ -390,22 +391,56 @@ def dropped_items(prev_rows: list[dict], prev_url: str, cur_rows: list[dict],
     return items
 
 
-def ingest_report(conn, url: str, pdf_bytes: bytes, slot: dt.datetime, fetched_at: str) -> tuple[int, int]:
-    """Store one report's changed rows, its roster, and any drop-offs. Returns (new, dropped)."""
+def _ids_by_hash_text(conn, source: str, items: list[dict]) -> dict[str, int]:
+    out = {}
+    for it in items:
+        row = conn.execute("SELECT id FROM news_items WHERE hash = ?",
+                           (_hash(source, it["hash_text"]),)).fetchone()
+        if row:
+            out[it["hash_text"]] = row[0]
+    return out
+
+
+def ingest_report(conn, url: str, pdf_bytes: bytes, slot: dt.datetime, fetched_at: str,
+                  events_kwargs: dict | None = None) -> tuple[int, int]:
+    """
+    Store one report's changed rows, its roster and any drop-offs, then record
+    deterministic events and fire Phase 4 triggers (news_events.process_report).
+    events_kwargs is passed through to process_report (replay injects lines/triggers).
+    Returns (new, dropped).
+    """
+    import news_events
+
     rows = parse_report(pdf_bytes)
     published_at = report_published(pdf_bytes, slot)
     report_day = dt.datetime.fromisoformat(published_at).astimezone(EASTERN).date().isoformat()
 
-    new = _store(conn, "nba_injury_report", report_items(rows, url, published_at), fetched_at)
+    row_items = report_items(rows, url, published_at)
+    new = _store(conn, "nba_injury_report", row_items, fetched_at)
 
     prev = conn.execute(
         "SELECT url, rows_json FROM nba_report_index WHERE report_day = ? AND published_at < ? "
         "ORDER BY published_at DESC LIMIT 1", (report_day, published_at)).fetchone()
-    dropped = 0
+    dropped, drop_items = 0, []
     if prev is not None:
-        dropped = _store(conn, "derived",
-                         dropped_items(json.loads(prev["rows_json"]), prev["url"], rows, url,
-                                       published_at), fetched_at)
+        drop_items = dropped_items(json.loads(prev["rows_json"]), prev["url"], rows, url,
+                                   published_at)
+        dropped = _store(conn, "derived", drop_items, fetched_at)
+
+    # is_change compares against the immediately previous report, any day: the row key
+    # includes the game date, so a game listed on both days still lines up.
+    prev_any = conn.execute(
+        "SELECT rows_json FROM nba_report_index WHERE published_at < ? "
+        "ORDER BY published_at DESC LIMIT 1", (published_at,)).fetchone()
+    ev = news_events.process_report(
+        conn, url=url, rows=rows,
+        prev_rows=json.loads(prev_any["rows_json"]) if prev_any else None,
+        published_at=published_at,
+        item_ids=_ids_by_hash_text(conn, "nba_injury_report", row_items),
+        dropped_ids=list(_ids_by_hash_text(conn, "derived", drop_items).values()),
+        **(events_kwargs or {}))
+    if ev["games_triggered"]:
+        print(f"[news] triggers: {ev['games_triggered']}")
 
     conn.execute("INSERT OR REPLACE INTO nba_report_index (url, published_at, report_day, rows_json) "
                  "VALUES (?, ?, ?, ?)", (url, published_at, report_day, json.dumps(rows)))
@@ -416,15 +451,19 @@ def ingest_report(conn, url: str, pdf_bytes: bytes, slot: dt.datetime, fetched_a
     return new, dropped
 
 
-def poll_nba_report(conn, now_et: dt.datetime | None = None) -> int:
+def poll_nba_report(conn, now_et: dt.datetime | None = None, events_kwargs: dict | None = None,
+                    lookback_slots: int = NBA_REPORT_LOOKBACK_SLOTS) -> int:
     """
     Ingest every not-yet-ingested report in the lookback window, oldest first, so a
     report published late is not skipped and consecutive reports are compared in order.
+    With a lookback longer than the normal window (startup catch-up), reports older
+    than the normal window record events but fire no triggers.
     """
     now_et = now_et or dt.datetime.now(EASTERN)
     fetched_at = dt.datetime.now(dt.timezone.utc).isoformat()
     total, fetched_any, last_status = 0, False, None
-    for slot in reversed(latest_slots(now_et, NBA_REPORT_LOOKBACK_SLOTS)):
+    recent = set(latest_slots(now_et, NBA_REPORT_LOOKBACK_SLOTS))
+    for slot in reversed(latest_slots(now_et, lookback_slots)):
         candidates = report_urls(slot)
         if any(conn.execute("SELECT 1 FROM nba_report_index WHERE url = ?", (u,)).fetchone()
                for u in candidates):
@@ -444,7 +483,10 @@ def poll_nba_report(conn, now_et: dt.datetime | None = None) -> int:
             continue
         fetched_any = True
         try:
-            new, dropped = ingest_report(conn, url, resp.content, slot, fetched_at)
+            kw = dict(events_kwargs or {})
+            if slot not in recent:
+                kw["allow_triggers"] = False
+            new, dropped = ingest_report(conn, url, resp.content, slot, fetched_at, kw)
             total += new + dropped
         except Exception as exc:
             _log_poll(conn, source="nba_injury_report", url=url, http_status=200,
@@ -481,6 +523,13 @@ def poll_nba_report_job() -> int:
     return _job(poll_nba_report)
 
 
+def catch_up_nba_reports_job() -> int:
+    """Startup: ingest official reports missed while the server was down (oldest first)."""
+    n = _job(lambda conn: poll_nba_report(conn, lookback_slots=NBA_REPORT_CATCHUP_HOURS * 4))
+    print(f"[news] official-report catch-up ({NBA_REPORT_CATCHUP_HOURS}h): {n} new items")
+    return n
+
+
 def poll_once() -> dict:
     return {"espn_injuries": poll_espn_job(), "nba_injury_report": poll_nba_report_job()}
 
@@ -502,8 +551,11 @@ def start_scheduler():
     sched.add_job(poll_espn_job, "interval", minutes=POLL_MINUTES, id="news_espn",
                   next_run_time=now, coalesce=True, max_instances=1,
                   misfire_grace_time=POLL_MINUTES * 60)
+    # Catch-up runs once at startup; the regular report job starts at its next cron
+    # minute so the two never overlap on the same slots.
+    sched.add_job(catch_up_nba_reports_job, id="news_nba_catchup", next_run_time=now)
     sched.add_job(poll_nba_report_job, "cron", minute=NBA_REPORT_CRON_MINUTES, id="news_nba_report",
-                  next_run_time=now, coalesce=True, max_instances=1, misfire_grace_time=15 * 60)
+                  coalesce=True, max_instances=1, misfire_grace_time=15 * 60)
     sched.start()
     _scheduler = sched
     print(f"[news] poller started: ESPN every {POLL_MINUTES} min, "
