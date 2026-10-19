@@ -2,9 +2,11 @@
 predictor.py
 Over/under prediction engine for NBA player props.
 
-Uses an XGBoost model (model.pkl) for the four individual stat types
-(Points, Rebounds, Assists, 3PM).  Falls back to the heuristic scorer for
-combined types (PRA, PR, PA, RA) or when model.pkl is absent.
+NBA: uses the frozen per-stat models model_<stat>.pkl (Points, Rebounds, Assists,
+3PM, PRA, PR, PA, RA; LR or XGBoost per ml_trainer.FROZEN_MODEL_TYPES) on the same
+14 features as training. Falls back to the heuristic scorer for other stat types
+or when a model file is absent. WNBA: model_wnba_<stat>.pkl for Points, Rebounds,
+Assists, 3PM.
 """
 
 import os
@@ -204,7 +206,8 @@ def _compute_ml_features(
     is_back_to_back: bool,
 ) -> dict | None:
     """
-    Compute the 19 features used during XGBoost training.
+    Compute the 14 model features (ml_trainer.FEATURE_COLS) for the player's next game.
+    hit_rate_last10 and vs_opponent_avg use feature_defs, shared with training.
     Returns None if the player has fewer than 10 logged games.
     """
     df = get_game_logs(player_name, last_n=40)

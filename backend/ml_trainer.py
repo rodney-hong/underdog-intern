@@ -1,7 +1,11 @@
 """
 ml_trainer.py
-Builds training data from player_stats and trains one XGBoost classifier per
-stat type (Points, Rebounds, Assists, 3PM) with 19 features.
+Builds training data from player_stats (counted game types only, see
+game_types.py) and fits one model per NBA stat type (Points, Rebounds, Assists,
+3PM, PRA, PR, PA, RA) on the 14 FEATURE_COLS. The 2026-27 NBA models are frozen
+(FROZEN_MODEL_TYPES; experiments/preregistration.md): LR or XGBoost per stat, fit
+on 100% of rows, and train_model() refuses to run without force=True.
+WNBA: one XGBoost model per stat type (train_wnba_models).
 """
 
 import os
@@ -591,8 +595,9 @@ def build_wnba_training_data() -> pd.DataFrame:
 
 def train_wnba_models() -> dict:
     """
-    Train one XGBoost classifier per WNBA stat type on the full wnba_player_stats
-    history.  Uses an 80/20 temporal split per stat type.
+    Train one XGBoost classifier per WNBA stat type on wnba_player_stats. Uses an
+    80/20 temporal split on a calendar-day boundary: the saved model is fit on the
+    earlier 80% only and scored on the later 20%.
     Saves model_wnba_{stat_type}.pkl and feature_importance_wnba_{stat_type}.png.
     Returns a dict mapping stat_type → trained model.
     """
