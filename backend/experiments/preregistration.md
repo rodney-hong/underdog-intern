@@ -304,3 +304,93 @@ worse than predicting the base rate; LR's is at or slightly better.
 
 Score frozen-model predictions logged from 2026-10-20 against results, on real Underdog
 lines. Anything learned before then is recorded, not acted on.
+
+---
+
+## Amendment: December and season-end criteria
+
+Recorded on the commit date of this entry (drafted 2026-10-19), before any 2026-27 result is seen: paper_predictions has 0 rows and line_snapshots has no Underdog rows. Earlier sections are unchanged. Repo facts cited here are in backend/experiments/research_review_context.md, committed with this entry.
+
+### 1. Payout and break-even (correction of fact)
+
+Earlier sections assumed a 3x two-pick payout (single leg 0.5774, two legs 0.3333). Underdog's help article "Pick'em Standard & Flex Entry Payouts" (Classic Pick'em section, read 2026-10-19) lists a 2-pick standard entry at 3.5x for 1.0x selections. It also states that per-pick multipliers and correlated projections change the payout.
+
+- On 2026-10-20, before any result is joined, record the 2-pick standard multiplier M shown in the app for this account, with a screenshot saved in backend/experiments/.
+- Single-leg break-even BE = sqrt(1/M). At M = 3.5, BE = 0.5345.
+- Also on 2026-10-20, record whether line_snapshots.price is present for bookmaker 'underdog' and whether it varies across picks.
+  - If it varies, write down the mapping from price to payout multiplier using prices only, before the first check, and grade each pick against its own break-even.
+  - If it is absent or constant, grade every pick at BE and record that per-pick multipliers were unobserved.
+- If no Underdog Points lines have been logged by 2026-11-01, this amendment is replaced by a new dated entry written before any result is joined.
+- Test C, exploratory addendum only: re-score the 12 frozen candidates' eval rows against 1/M with the existing Bonferroni 99.583% intervals. Underdog changes payouts for correlated picks, so the true break-even for same-game pairs stays unknown. The Test C conclusion is not reopened.
+
+### 2. Confirmatory hypotheses
+
+Population: paper_predictions rows with app_path = 'model', Underdog line present, and result OVER or UNDER (PUSH and DNP dropped).
+
+Regular season is decided by matching each row to `schedule` on ET game date plus home and away teams, and keeping games whose gameId type digit is 2 (game_types.py:40-46). Rows with any other digit are excluded, including the Cup final (digit 6). Unmatched rows are excluded, and their count is reported.
+
+- H1 (model)
+  - Side = Over if P(over) > 0.5, else Under. Confidence = max(P, 1 - P).
+  - Slice = top 20% of population rows by confidence. The cutoff is computed from P alone.
+- H2 (market)
+  - Population rows where FanDuel or DraftKings posts the same line number as Underdog, with both sides priced, in the same pre-tip pull (paper_predictions.py:162-164).
+  - Fair P(side) = Shin-devigged probability, averaged over the books available. Side = the side with higher fair P.
+  - Slice = top 20% by fair P.
+  - If per-pick multipliers are unobserved (section 1), a positive H2 is reported as unconfirmed, because Underdog may pay less on exactly the picks H2 selects.
+- Test: hit rate in the slice > BE.
+  - Family-wise alpha = 0.05 one-sided, Bonferroni: 0.025 one-sided per hypothesis.
+  - An edge is declared only if the game-clustered bootstrap one-sided 97.5% lower bound exceeds BE.
+
+### 3. Timing and power
+
+- Interim (first check on or after 2026-12-15): futility only. H1 or H2 is stopped if its two-sided 95% upper bound is below BE. No edge can be declared at the interim.
+- Final: after the last regular-season game. Only the final can declare an edge.
+- Power (80%, one-sided 0.025):
+  - Detecting +2.5 points over BE needs about 3,116 picks per slice; +4 points needs about 1,214.
+  - Expected slice size is about 2,500 rows before the app_path filter (10.3 FanDuel Points lines per game historically, times about 1,230 regular-season games, times 20%; Underdog's count may differ). At that size, the smallest detectable difference is about +2.8 points, and about +3.1 at 2,000 rows, before game clustering.
+  - Only edges of roughly +3 points or more are realistically detectable this season. A smaller true edge will most likely end as inconclusive, which is reported as inconclusive, not as "no edge".
+
+### 4. Exploratory (reported, never decisive)
+
+- Slice hit rate minus always-Under on the same rows.
+- Closing line: share of H1 picks, recomputed at the 10:00 Underdog line, where the pre-tip line moved toward the pick (rows with movement only).
+  - Only line_diff is recomputed. It is the only feature that reads the line (ml_trainer.py:257, predictor.py:236).
+  - The other 13 features are line-independent: inference predictor.py:221-239 and 241-286; training ml_trainer.py:153-206, 230-238, 256, 259 and 261-291.
+- Test A: calibration (Brier, reliability bins) of Shin-devigged FanDuel/DraftKings P(over) at the 10:00 and pre-tip snapshots.
+- News timing: after a play/no-play change for a teammate, how often and how fast the Underdog line moved before pre-tip.
+- Early-season subgroup: not tested. Historical FanDuel/DraftKings Points rows (already seen) gave an October over rate of 0.4846 against 0.4856 overall.
+
+### 5. Feature ablation (Points only; one Holm family; evaluated once, at the final)
+
+Each variant is a logistic regression with the same configuration as model_Points.pkl. It is fit on the same training population (Kaggle version 519, the 29,836 Points rows) and refit on 100% of that data, as the frozen models were.
+
+Variants:
+
+1. 14 features + over_rate_vs_line_last20
+   - Share of prior counted games, up to the last 20, whose stat exceeds the line of the game being predicted (that one line is applied to every earlier game).
+   - Shifted so the current game is excluded; min_periods = 10.
+2. 14 features with line_diff replaced by (median_last10 - line)
+   - median_last10 = shift(1).rolling(10, min_periods=10).median().
+3. 14 features + rest_days
+   - Days between this and the previous counted game (ET dates), capped at 4. Capped at 4 when there is no previous game.
+
+Fitting rules:
+
+- Variant files are fit and their SHA-256 hashes recorded in a new dated entry before any scoring.
+- Any fitting choice not specified here is recorded in that entry as a deviation.
+
+Scoring:
+
+- On the section 2 population, compare against the frozen model's logged P(over).
+- New features are computed from box scores dated before each game.
+- Metric: paired log-loss difference (variant minus frozen) on identical rows.
+- One-sided test that the variant is lower, using game-clustered bootstrap p-values. Holm across the three variants at family-wise alpha = 0.05.
+
+teammate_out is excluded. Historically it can only be built from box scores, which reflect late scratches the pre-game report did not.
+
+### 6. Other definitions
+
+- Parity: for each of the six unverified features, the value logged in paper_predictions.features_json at prediction time is compared with the training-code value recomputed from box scores.
+  - This runs only after the ETL has loaded the 2026-27 box scores for those games.
+  - Pass if |diff| < 1e-9 on 20 resolved rows drawn with seed 20261018.
+- hit_rate_last10 counts games above the player's own career-to-date mean, not the prop line. It is never reported as a line hit rate.
