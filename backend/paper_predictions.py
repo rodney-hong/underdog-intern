@@ -34,7 +34,13 @@ import pandas as pd
 from database import DB_PATH
 
 STAT_TYPE = "Points"
-MARKET_KEY = "player_points"
+# Underdog's Points lines arrive mostly in player_points_alternate (probe 2026-10-20)
+# but also in player_points (opening-day check pull, 2026-10-20), so both are read;
+# ud_market records which one each line came from. FanDuel/DraftKings fd_*/dk_*
+# columns keep their main player_points line; their alternate ladders stay in
+# line_snapshots.
+UD_MARKET_KEYS = ("player_points", "player_points_alternate")
+BOOK_MARKET_KEY = "player_points"
 MODEL_FILE = "model_Points.pkl"
 # Recorded in experiments/preregistration.md for the frozen 2026-27 model.
 FROZEN_SHA256 = "50a26f530ef7116b7431d982da1c1f4523294a043034268d61ecc7fd5070a8aa"
@@ -71,6 +77,7 @@ def init_tables(conn) -> None:
             ud_line             REAL,
             ud_over_price       REAL,
             ud_under_price      REAL,
+            ud_market           TEXT,            -- market(s) the Underdog line came from
             fd_line             REAL,
             fd_over_price       REAL,
             fd_under_price      REAL,
@@ -93,6 +100,9 @@ def init_tables(conn) -> None:
         );
         CREATE INDEX IF NOT EXISTS idx_paper_pred_date ON paper_predictions (game_date);
     """)
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(paper_predictions)")}
+    if "ud_market" not in cols:
+        conn.execute("ALTER TABLE paper_predictions ADD COLUMN ud_market TEXT")
     conn.commit()
 
 
@@ -120,6 +130,27 @@ def _book_lines(rows: list, book: str) -> tuple:
     return line, over["price"] if over else None, under["price"] if under else None
 
 
+def _underdog_line(rows: list) -> dict:
+    """
+    One player's Underdog rows across UD_MARKET_KEYS. One distinct point -> that
+    line, the market(s) it came from, and per side the price if every Underdog row
+    for that side agrees (NULL if the two markets price it differently). More than
+    one distinct point -> no line ("multiple" lists them).
+    """
+    ud = [r for r in rows if r["bookmaker"] == "underdog"]
+    points = sorted({r["point"] for r in ud})
+    markets = ",".join(sorted({r["market_key"] for r in ud}))
+    if len(points) != 1:
+        return {"line": None, "over": None, "under": None, "market": markets, "multiple": points}
+
+    def side_price(side):
+        prices = {r["price"] for r in ud if r["side"] == side}
+        return prices.pop() if len(prices) == 1 else None
+
+    return {"line": points[0], "over": side_price("Over"), "under": side_price("Under"),
+            "market": markets, "multiple": None}
+
+
 def log_for_pull(game_id: str, captured_at: str | None = None, conn=None) -> dict:
     """
     One paper prediction per Underdog Points line in the pull (game_id, captured_at).
@@ -142,8 +173,11 @@ def log_for_pull(game_id: str, captured_at: str | None = None, conn=None) -> dic
         return {"logged": 0, "reason": "no pretip capture for game"}
 
     snap = conn.execute(
-        "SELECT * FROM line_snapshots WHERE game_id = ? AND captured_at = ? AND market_key = ?",
-        (game_id, captured_at, MARKET_KEY)).fetchall()
+        "SELECT * FROM line_snapshots WHERE game_id = ? AND captured_at = ? "
+        "AND ((bookmaker = 'underdog' AND market_key IN (?, ?)) "
+        "     OR (bookmaker IN ('fanduel', 'draftkings') AND market_key = ?)) "
+        "ORDER BY market_key, outcome_index",
+        (game_id, captured_at, *UD_MARKET_KEYS, BOOK_MARKET_KEY)).fetchall()
     ud_players = sorted({r["player_name"] for r in snap if r["bookmaker"] == "underdog"})
     model, sha = _load_model()
     now = dt.datetime.now(dt.timezone.utc).isoformat()
@@ -151,7 +185,7 @@ def log_for_pull(game_id: str, captured_at: str | None = None, conn=None) -> dic
     for player in ud_players:
         rows = [r for r in snap if r["player_name"] == player]
         g = rows[0]
-        ud = _book_lines(rows, "underdog")
+        ud = _underdog_line(rows)
         fd = _book_lines(rows, "fanduel")
         dk = _book_lines(rows, "draftkings")
         rec = {
@@ -159,15 +193,21 @@ def log_for_pull(game_id: str, captured_at: str | None = None, conn=None) -> dic
             "game_date": g["game_date"], "commence_time": g["commence_time"],
             "home_team": g["home_team"], "away_team": g["away_team"], "player_name": player,
             "stat_type": STAT_TYPE,
-            "ud_line": ud[0], "ud_over_price": ud[1], "ud_under_price": ud[2],
+            "ud_line": ud["line"], "ud_over_price": ud["over"], "ud_under_price": ud["under"],
+            "ud_market": ud["market"],
             "fd_line": fd[0], "fd_over_price": fd[1], "fd_under_price": fd[2],
             "dk_line": dk[0], "dk_over_price": dk[1], "dk_under_price": dk[2],
             "model_file": MODEL_FILE, "model_sha256": sha, "model_sha_ok": int(sha == FROZEN_SHA256),
         }
-        try:
-            rec.update(_predict_one(player, g, ud[0], model, data_fetcher, predictor, FEATURE_COLS))
-        except Exception as exc:                       # one bad row never stops the rest
-            rec["status"] = f"error: {exc!r}"[:300]
+        if ud["multiple"]:
+            # No rule picks among several Underdog points (across both markets): the
+            # row is recorded without a line or prediction.
+            rec["status"] = f"multiple underdog lines: {ud['multiple']}"
+        else:
+            try:
+                rec.update(_predict_one(player, g, ud["line"], model, data_fetcher, predictor, FEATURE_COLS))
+            except Exception as exc:                       # one bad row never stops the rest
+                rec["status"] = f"error: {exc!r}"[:300]
         cols = ", ".join(rec)
         cur = conn.execute(f"INSERT OR IGNORE INTO paper_predictions ({cols}) "
                            f"VALUES ({', '.join('?' * len(rec))})", tuple(rec.values()))

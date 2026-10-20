@@ -55,7 +55,11 @@ def _startup_step(name: str, fn, *args, **kwargs):
 @app.on_event("startup")
 def startup_event():
     import os
-    import ml_trainer
+    import importlib
+
+    # WAL first, before any scheduler thread opens a connection: readers no longer
+    # block on writers (ETL, scheduler, news poller, API). Persistent once set.
+    _startup_step("database.enable_wal", database.enable_wal)
 
     # Collection first, each guarded separately so one can't block the other.
     # Paper-mode line logging (Points, UD/FD/DK); it never touches predictions.
@@ -63,16 +67,29 @@ def startup_event():
     # Raw injury news (ESPN every 20 min, official report every 15); no LLM, feeds nothing.
     _startup_step("news_ingest.start_scheduler", news_ingest.start_scheduler)
 
+    ml_ok, ml_trainer = _startup_step("import ml_trainer", importlib.import_module, "ml_trainer")
+
     _startup_step("database.init_db", database.init_db)
 
-    # NBA: the ETL still loads new box scores and resolves pending predictions, but the
-    # 2026-27 models are frozen (experiments/preregistration.md): startup never retrains.
-    _startup_step("database.run_etl", database.run_etl)
+    # NBA: the ETL replaces player_stats/players/schedule in place, so by default it
+    # does not run at startup (SKIP_STARTUP_ETL=1): run it by hand, off game hours,
+    # after a backup. The 2026-27 models are frozen either way: startup never retrains.
+    if os.getenv("SKIP_STARTUP_ETL", "1") == "1":
+        print("[startup] Kaggle ETL SKIPPED (SKIP_STARTUP_ETL=1); player_stats, players and "
+              "schedule are unchanged. Run database.run_etl() by hand, off game hours, after a backup.")
+    else:
+        _startup_step("database.run_etl", database.run_etl)
     # Paper predictions from the frozen model: fill results from any new box scores.
-    import paper_predictions
-    ok, n = _startup_step("paper_predictions.resolve", paper_predictions.resolve_paper_predictions)
-    if ok:
-        print(f"Paper predictions resolved: {n}")
+    pp_ok, paper_predictions = _startup_step("import paper_predictions",
+                                             importlib.import_module, "paper_predictions")
+    if pp_ok:
+        ok, n = _startup_step("paper_predictions.resolve", paper_predictions.resolve_paper_predictions)
+        if ok:
+            print(f"Paper predictions resolved: {n}")
+    if not ml_ok:
+        print("[startup] ml_trainer import failed: skipping the frozen-model check and WNBA training.")
+        print("[startup] complete")
+        return
     missing = [st for st in ml_trainer.FROZEN_MODEL_TYPES
                if not os.path.exists(ml_trainer.model_path(st))]
     if missing:
@@ -245,7 +262,7 @@ def predict_prop(req: PredictRequest):
         except Exception:
             opponent_injuries = []
 
-    database.log_prediction(
+    prediction_id = database.log_prediction(
         player_name=req.player_name,
         stat_type=req.stat_type,
         stat_line=req.stat_line,
@@ -262,7 +279,28 @@ def predict_prop(req: PredictRequest):
         "confidence": round(result["confidence"] * 100, 1),
         "explanation": result["explanation"],
         "opponent_injuries": opponent_injuries,
+        "prediction_id": prediction_id,   # lets the UI ask for the track record before this pick
     }
+
+
+@app.get("/players/{player_name}/track-record")
+def get_player_track_record(
+    player_name: str,
+    stat: str = Query(default="Points"),
+    league: str = Query(default="NBA"),
+    before: str | None = Query(default=None, description="prediction id or ISO timestamp"),
+):
+    """
+    The app's own record on this player and stat, from the predictions table only
+    (never paper_predictions). Display-only: it does not feed the model. With
+    `before`, only picks whose game was on an earlier ET date than that prediction.
+    """
+    try:
+        return database.player_track_record(player_name, stat, league, before)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc).strip("'"))
+    except ValueError:
+        raise HTTPException(status_code=422, detail="before must be a prediction id or an ISO timestamp")
 
 
 @app.get("/predictions/history")

@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
 import History from './History'
+import { fetchTrackRecord, pct, rangeStr } from './trackRecord'
 
 const API = 'http://localhost:8000'
 const STAT_TYPES = [
@@ -351,7 +352,33 @@ function OpponentInjuryReport({ injuries, opponentName }) {
 // Result card
 // ---------------------------------------------------------------------------
 
-function ResultCard({ result }) {
+// Muted, display-only line under the reasoning: the app's record on this player and
+// stat, counting only picks resolved before this prediction. Never alters the result.
+const TRACK_RECORD_SHOW_N = 5   // below this, only "not enough picks yet"; "small sample" until tr.enough (n >= 20)
+
+function TrackRecordLine({ player, stat, league, predictionId }) {
+  const [tr, setTr] = useState(null)
+  useEffect(() => {
+    setTr(null)
+    if (!player || !stat || predictionId == null) return
+    let live = true
+    fetchTrackRecord({ player, stat, league, before: predictionId })
+      .then((d) => { if (live) setTr(d) })
+      .catch(() => {})
+    return () => { live = false }
+  }, [player, stat, league, predictionId])
+  if (!tr) return null
+  return (
+    <p className="text-xs" style={{ color: 'var(--text-muted)' }}>
+      {tr.n >= TRACK_RECORD_SHOW_N
+        ? `Track record: ${tr.wins}–${tr.losses} on ${tr.n} picks · raw ${pct(tr.raw_rate)} (${rangeStr(tr)}) · adjusted ${pct(tr.adjusted_rate)}` +
+          (tr.enough ? '' : ' · small sample')
+        : `Track record: not enough picks yet (${tr.n})`}
+    </p>
+  )
+}
+
+function ResultCard({ result, player, stat, league }) {
   const isOver = result.outcome === 'OVER'
   return (
     <div className="card animate-fade-in mt-6 rounded-2xl p-6 space-y-4">
@@ -373,6 +400,7 @@ function ResultCard({ result }) {
       <p className="text-sm leading-relaxed border-t pt-4" style={{ color: 'var(--text-secondary)', borderTopColor: 'var(--border)' }}>
         {result.explanation}
       </p>
+      <TrackRecordLine player={player} stat={stat} league={league} predictionId={result.prediction_id} />
     </div>
   )
 }
@@ -824,7 +852,7 @@ export default function App() {
 
         {result && (
           <div className="w-full max-w-lg">
-            <ResultCard result={result} />
+            <ResultCard result={result} player={selectedPlayer} stat={statType} league={sport} />
             <OpponentInjuryReport injuries={opponentInjuries} opponentName={opponent} />
             <button
               onClick={resetAll}

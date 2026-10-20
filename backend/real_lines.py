@@ -102,7 +102,7 @@ def build_real_line_lookup(conn: sqlite3.Connection | None = None):
     """
     close = False
     if conn is None:
-        conn = sqlite3.connect(DB_PATH)
+        conn = sqlite3.connect(DB_PATH, timeout=30)
         close = True
 
     box, teamdate, nicks = _load_indexes(conn)

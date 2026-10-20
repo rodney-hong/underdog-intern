@@ -31,9 +31,9 @@ def main() -> None:
     shutil.copy(DEST_DB, BACKUP)
     print(f"Backup created: {BACKUP}")
 
-    dest = sqlite3.connect(DEST_DB)
+    dest = sqlite3.connect(DEST_DB, timeout=30)
     dest.row_factory = sqlite3.Row
-    src  = sqlite3.connect(SRC_DB)
+    src  = sqlite3.connect(SRC_DB, timeout=30)
     src.row_factory = sqlite3.Row
 
     try:

@@ -130,7 +130,7 @@ def _get_home_away_split(player_name: str, stat_type: str, is_home: bool) -> flo
     player_id = get_player_id(player_name)
     if player_id is None:
         return 0.0
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=30)
     rows = conn.execute(
         f"SELECT home, AVG({col}) FROM player_stats "
         f"WHERE personId = ? AND {col} IS NOT NULL "
@@ -148,7 +148,7 @@ def _get_wnba_home_away_split(player_name: str, stat_type: str, is_home: bool) -
     col = _WNBA_HA_COL_MAP.get(stat_type)
     if not col:
         return 0.0
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=30)
     rows = conn.execute(
         f"SELECT home, AVG({col}) FROM wnba_player_stats "
         f"WHERE player_name = ? AND {col} IS NOT NULL GROUP BY home",

@@ -158,7 +158,7 @@ def fingerprint(state: dict, question: Noul) -> str:
 # cache
 # --------------------------------------------------------------------------- #
 def open_cache() -> sqlite3.Connection:
-    conn = sqlite3.connect(CACHE_PATH, check_same_thread=False)
+    conn = sqlite3.connect(CACHE_PATH, check_same_thread=False, timeout=30)
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS jev_answers (

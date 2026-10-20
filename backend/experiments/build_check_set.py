@@ -88,7 +88,7 @@ def stratum(item: dict) -> str | None:
 
 
 def load_live() -> list[dict]:
-    conn = sqlite3.connect(DB)
+    conn = sqlite3.connect(DB, timeout=30)
     conn.row_factory = sqlite3.Row
     rows = conn.execute("SELECT id, source, url, raw_text, published_at FROM news_items "
                         "ORDER BY id").fetchall()
@@ -104,7 +104,7 @@ def load_live() -> list[dict]:
 
 
 def load_replay(path: str) -> list[dict]:
-    conn = sqlite3.connect(path)
+    conn = sqlite3.connect(path, timeout=30)
     conn.row_factory = sqlite3.Row
     reports = conn.execute("SELECT url, published_at, rows_json FROM nba_report_index "
                            "ORDER BY published_at").fetchall()

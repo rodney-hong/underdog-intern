@@ -394,3 +394,90 @@ teammate_out is excluded. Historically it can only be built from box scores, whi
   - This runs only after the ETL has loaded the 2026-27 box scores for those games.
   - Pass if |diff| < 1e-9 on 20 resolved rows drawn with seed 20261018.
 - hit_rate_last10 counts games above the player's own career-to-date mean, not the prop line. It is never reported as a line hit rate.
+
+---
+
+## Entry: Underdog market, logging change, H2 clarification (drafted 2026-10-19)
+
+Recorded on the commit date of this entry, before any 2026-10-20 result was seen: paper_predictions had 0 rows and no 2026-10-20 game had started. Earlier sections are unchanged.
+
+### Probe finding
+
+One OddsAPI event-odds call on 2026-10-20T01:43Z (game 26b036ff107f3c658258eaf4a6f26228, Boston Celtics @ Detroit Pistons), bookmakers=underdog,fanduel,draftkings, markets=player_points,player_points_alternate. Raw response: backend/experiments/probe_20261020T014326Z.json.
+
+- Underdog's Points lines were returned only in player_points_alternate, never in player_points: 17 players, exactly one line each, 15 two-sided and 2 Over-only.
+- FanDuel and DraftKings appeared in both markets. Their alternate markets are ladders:
+  - FanDuel: 2-29 points per player, with repeated player/side/point outcomes at different prices. For 13 of its 14 main lines, the alternate market repeats the main point with the same Over and Under prices.
+  - DraftKings: 5-10 points per player, Over only.
+- The logger requested player_points only, so it would have stored no Underdog rows.
+
+### Logging change
+
+- line_logger requests markets=player_points,player_points_alternate with 10 named bookmakers: underdog, fanduel, draftkings, prizepicks, novig, prophetx, kalshi, betmgm, espnbet, betrivers.
+  - Up to 10 named books count as one region-equivalent, so the expected cost is 2 credits per pull.
+  - A pull whose x-requests-last is not 2 prints a warning.
+- Every outcome from every book returned is stored under its own market key.
+- The line_snapshots key now includes point and the outcome's position in its market, because under the old key alternate rungs collapsed to one row per player and side. The 18 earlier rows were migrated; the old table is kept as line_snapshots_pre_alt_key.
+- paper_predictions reads only Underdog, FanDuel and DraftKings:
+  - The Underdog line and prices come from player_points_alternate.
+  - fd_* and dk_* remain the FanDuel/DraftKings player_points main line.
+  - If an Underdog player ever has more than one line in a pull, the row is recorded with no line and no prediction.
+- The seven additional books (prizepicks, novig, prophetx, kalshi, betmgm, espnbet, betrivers) are logged for exploratory use only. H2 is unchanged: it uses FanDuel and DraftKings only.
+- The NBA slip path no longer calls OddsAPI. It serves today's logged Underdog lines, then today's cached lines, then manual entry.
+
+### 10:00 pull dropped
+
+- The 10:00 ET open pull is turned off. One pull per game remains, at T-30 with one retry on failure; event-triggered pulls stay off.
+- Projected peak month: 239 games x 2 credits = 478 against the 500 cap.
+- Section 4 analyses that needed the 10:00 snapshot are dropped:
+  - "Closing line" (H1 picks recomputed at the 10:00 Underdog line).
+  - Test A's 10:00 snapshot: Test A is computed at the pre-tip snapshot only.
+  - "News timing": with no snapshot before pre-tip and event pulls off, Underdog line movement before pre-tip is not observed.
+
+### Price-to-payout mapping still open
+
+- OddsAPI returns American-odds prices for Underdog (29 distinct values in the probe). Over plus Under implied probabilities sum to 1.184-1.219 on two-sided lines, versus about 1.06-1.07 for FanDuel and DraftKings main lines.
+- These prices are not the in-app multipliers. In-app screenshots from the same evening as the probe (screenshots kept locally, not committed (they show account details)):
+  - Jayson Tatum Higher/Lower 24.5: in-app 1.57x/2.25x; OddsAPI -259/+101 (decimal 1.39/2.01).
+  - Cade Cunningham Higher/Lower 24.5: in-app 1.90x/1.81x; OddsAPI -122/-174 (decimal 1.82/1.57).
+- The same screenshots show 2-pick Standard entries paying 2.7x (LeBron James Higher 14.5 + Jaylen Brown Higher 19.5) and 2.78x (Jayson Tatum Higher 24.5 + Shai Gilgeous-Alexander Higher 29.5).
+- OddsAPI's documentation notes that DFS odds "are indicative only" because they vary with user selections.
+- The price-to-payout mapping that section 1 requires before the first check is therefore not established. Until it is written down in a dated entry, section 1's "absent or constant" branch does not apply, and no pick is graded against a per-pick break-even.
+
+### H2 clarification
+
+These rules define H2's fair probability (section 2). They were fixed on 2026-10-19, before any 2026-27 result existed. Everything else in H2 is unchanged.
+
+a) Per book (fanduel, draftkings only): if the book's player_points line equals ud_point, use that market; otherwise use its player_points_alternate outcomes at ud_point.
+b) If a side has more than one price at that point in the chosen market, convert each to implied probability and average them.
+c) The book qualifies only if both sides are priced at that point (DraftKings' Over-only alternate rungs do not qualify).
+d) Devig each qualifying book with Shin's method; fair P(over) = the average across qualifying books.
+e) If no book qualifies, return None. Such rows are excluded from H2 and counted.
+
+Implementation: `h2_fair_prob(rows, ud_point)` in backend/experiments/h2_rules.py, not wired into anything. Choices the rules leave open, fixed here:
+
+- "The book's player_points line equals ud_point" means the book has at least one player_points outcome at ud_point. Points compare with tolerance 1e-9.
+- Shin's z is solved by bisection so that the two probabilities sum to 1.
+- If a qualifying book's implied probabilities sum to 1 or less, Shin's z is 0 and the probabilities are normalized proportionally. This case is outside rules a)-e) and is flagged when it occurs.
+
+On the probe (line availability only, no results), 13 of the 17 Underdog lines qualified and 4 returned None.
+
+### Known issue: Ron Holland
+
+In an offline run on the probe, the OddsAPI name "Ron Holland" matched no player in player_stats, so paper_predictions records "unmatched player" and no prediction. This is a known prediction-side issue; the fix will be decided later.
+
+No 2026-10-20 result had been seen when this entry was written.
+
+---
+
+## Entry: Underdog lines in player_points too (drafted 2026-10-19)
+
+- The opening-day check pull (2026-10-20T03:58Z, game 26b036ff107f3c658258eaf4a6f26228) returned Underdog Points lines in both markets:
+  - 30 rows (16 players) in player_points_alternate;
+  - 2 rows (Cade Cunningham, 24.5, Over/Under -137) in player_points.
+  No player appeared in both markets.
+- Paper predictions (and the slip fallback) now read Underdog Points lines from both player_points and player_points_alternate. A new column, ud_market, records which market each line came from.
+- The existing rule is unchanged and now applies across both markets: if a player has more than one distinct Underdog point in a pull, the row is recorded with no line and no prediction.
+- If the same point appears in both markets with different prices for a side, that side's Underdog price is recorded as NULL.
+
+Recorded before any 2026-10-20 result was seen: paper_predictions had 0 rows.

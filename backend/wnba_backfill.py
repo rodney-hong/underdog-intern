@@ -22,7 +22,7 @@ import database
 
 
 def main() -> None:
-    conn = sqlite3.connect(database.DB_PATH)
+    conn = sqlite3.connect(database.DB_PATH, timeout=30)
     database._wnba_ensure_table(conn)
 
     start = date(database._WNBA_BACKFILL_START_YEAR, *database._WNBA_SEASON_START_MD)

@@ -4,15 +4,24 @@ Forward line logging for market-structure tests A/B/D
 (see experiments/logging_plan.md). Paper mode only: this module records lines,
 it never feeds predictions, models or slips.
 
-Scope: NBA Points only, bookmakers=underdog,fanduel,draftkings in ONE call per
-event. Stores both sides with price. Keyed so it never overwrites itself:
-    (game_id, player_name, market_key, bookmaker, side, captured_at)
+Scope: NBA Points only, 10 named bookmakers (BOOKMAKERS) in ONE call per
+event, markets=player_points,player_points_alternate (2 credits). Underdog's
+Points lines arrive ONLY in player_points_alternate (probe 2026-10-20,
+experiments/probe_20261020T014326Z.json); FanDuel/DraftKings appear in both, with
+full alternate ladders. Stores every outcome, both sides, with price, under its
+real market key. Keyed so it never overwrites or merges rows:
+    (game_id, player_name, market_key, bookmaker, side, point, outcome_index, captured_at)
+outcome_index is the outcome's position in its market: FanDuel's alternate market
+repeats (player, side, point) at different prices, so point alone is not unique.
 
-Schedule (two pulls per game):
-    open    — daily at OPEN_PULL_HOUR_ET for every game on today's ET slate
+Schedule (one pull per game):
     pretip  — PRETIP_MINUTES (30) before each game's commence_time, catching the
               official injury report's late updates; one retry PRETIP_RETRY_MINUTES
               later if the call itself fails (not if it was refused by the cap)
+    open    — OFF by default (LINE_LOG_OPEN_PULL_ENABLED=1 restores it). With it
+              off, a free events-only job at SCHEDULE_HOUR_ET (06:00, and on startup)
+              schedules the day's pre-tip pulls without spending credits; if that
+              events call fails it retries every 20 min until the last tip-off.
 
 Every pull is recorded in odds_pull_log with x-requests-remaining before and
 after. A monthly credit cap (ODDS_MONTHLY_CREDIT_CAP, default 500) is enforced
@@ -40,16 +49,35 @@ ODDS_API_KEY = os.getenv("ODDS_API_KEY", "")
 EVENTS_URL   = "https://api.the-odds-api.com/v4/sports/basketball_nba/events"
 EVENT_ODDS_URL = "https://api.the-odds-api.com/v4/sports/basketball_nba/events/{event_id}/odds"
 
-MARKETS    = "player_points"
-BOOKMAKERS = "underdog,fanduel,draftkings"
+MARKETS    = "player_points,player_points_alternate"
+# Exactly 10 named books: up to 10 count as one region-equivalent, so cost stays
+# CREDITS_PER_PULL. underdog/fanduel/draftkings feed paper_predictions and H2; the
+# other seven are logged for exploratory use only.
+BOOKMAKERS = ("underdog,fanduel,draftkings,prizepicks,novig,prophetx,kalshi,"
+              "betmgm,espnbet,betrivers")
+UNDERDOG_POINTS_MARKET = "player_points_alternate"  # where most Underdog Points lines come in
+# ...but some arrive in player_points (opening-day check pull, 2026-10-20): read both.
+UNDERDOG_POINTS_MARKETS = ("player_points", "player_points_alternate")
+
+# OddsAPI cost per event-odds call = markets x region-equivalents; up to 10 named
+# bookmakers count as one region-equivalent.
+CREDITS_PER_PULL = len(MARKETS.split(","))
 
 MONTHLY_CREDIT_CAP = int(os.getenv("ODDS_MONTHLY_CREDIT_CAP", "500"))
+OPEN_PULL_ENABLED  = os.getenv("LINE_LOG_OPEN_PULL_ENABLED", "0") == "1"
 OPEN_PULL_HOUR_ET  = int(os.getenv("LINE_LOG_OPEN_HOUR_ET", "10"))
+SCHEDULE_HOUR_ET   = int(os.getenv("LINE_LOG_SCHEDULE_HOUR_ET", "6"))  # free pre-tip scheduling job
+EVENTS_RETRY_MINUTES = 20  # retry a FAILED scheduling events call until today's last tip-off
+MAINTENANCE_HOUR_ET  = 7   # backup -> ETL -> resolve (run_morning_maintenance)
+ETL_PRETIP_GUARD_MINUTES = 60  # skip the ETL if a pre-tip pull is due this soon
+BACKUP_DIR  = os.path.join(os.path.dirname(os.path.abspath(DB_PATH)), "backups")
+BACKUP_KEEP = 3
 PRETIP_MINUTES     = int(os.getenv("LINE_LOG_PRETIP_MINUTES", "30"))
 PRETIP_RETRY_MINUTES = 5   # one retry after a FAILED pre-tip call (error / non-200),
                            # only if it still lands >= 1 minute before tip
 
-SCHEDULED_PULLS_PER_GAME = 2      # open + pretip
+SCHEDULED_PHASES = ("open", "pretip") if OPEN_PULL_ENABLED else ("pretip",)
+SCHEDULED_PULLS_PER_GAME = len(SCHEDULED_PHASES)
 EVENT_PULLS_PER_DAY_MAX  = 3      # ceiling for news-triggered pulls, not a quota
 RESERVE_BUFFER           = 0.10   # reserve = remaining scheduled pulls x (1 + buffer)
 
@@ -67,9 +95,7 @@ def get_db() -> sqlite3.Connection:
     return conn
 
 
-def init_tables() -> None:
-    conn = get_db()
-    conn.executescript("""
+_LINE_SNAPSHOTS_DDL = """
         CREATE TABLE IF NOT EXISTS line_snapshots (
             game_id          TEXT NOT NULL,
             game_date        TEXT NOT NULL,   -- ET date of commence_time
@@ -77,16 +103,58 @@ def init_tables() -> None:
             home_team        TEXT,
             away_team        TEXT,
             player_name      TEXT NOT NULL,
-            market_key       TEXT NOT NULL,
+            market_key       TEXT NOT NULL,   -- player_points / player_points_alternate
             bookmaker        TEXT NOT NULL,
             side             TEXT NOT NULL,   -- 'Over' / 'Under'
             point            REAL,
             price            REAL,            -- american odds as returned
             book_last_update TEXT,            -- bookmaker/market last_update from OddsAPI
             captured_at      TEXT NOT NULL,   -- UTC ISO, shared by all rows of one pull
-            pull_phase       TEXT,            -- open / pretip / manual / event
-            PRIMARY KEY (game_id, player_name, market_key, bookmaker, side, captured_at)
-        );
+            pull_phase       TEXT,            -- open / pretip / manual / event / check
+            outcome_index    INTEGER NOT NULL DEFAULT 0,  -- position within its market's outcomes
+            PRIMARY KEY (game_id, player_name, market_key, bookmaker, side, point,
+                         outcome_index, captured_at)
+        )"""
+_LINE_SNAPSHOTS_BACKUP = "line_snapshots_pre_alt_key"
+
+
+def _migrate_line_snapshots(conn: sqlite3.Connection) -> None:
+    """
+    One-time, atomic migration from the old key (no point, no outcome_index), under
+    which alternate-ladder rows would collapse to one per player/side. The old table
+    is kept, renamed, as a backup; its rows are copied with outcome_index = 0 (unique
+    under the old key, so unique under the new one).
+    """
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(line_snapshots)")]
+    if not cols or "outcome_index" in cols:
+        return
+    old_cols = ", ".join(cols)
+    conn.isolation_level = None
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(f"ALTER TABLE line_snapshots RENAME TO {_LINE_SNAPSHOTS_BACKUP}")
+        conn.execute("DROP INDEX IF EXISTS idx_line_snapshots_date")  # moved with the rename
+        conn.execute(_LINE_SNAPSHOTS_DDL)
+        conn.execute(f"INSERT INTO line_snapshots ({old_cols}, outcome_index) "
+                     f"SELECT {old_cols}, 0 FROM {_LINE_SNAPSHOTS_BACKUP}")
+        n_old = conn.execute(f"SELECT COUNT(*) FROM {_LINE_SNAPSHOTS_BACKUP}").fetchone()[0]
+        n_new = conn.execute("SELECT COUNT(*) FROM line_snapshots").fetchone()[0]
+        if n_old != n_new:
+            raise RuntimeError(f"line_snapshots migration copied {n_new} of {n_old} rows")
+        conn.execute("COMMIT")
+        print(f"[line_logger] line_snapshots migrated to the point/outcome_index key "
+              f"({n_new} rows; old table kept as {_LINE_SNAPSHOTS_BACKUP})")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    finally:
+        conn.isolation_level = ""
+
+
+def init_tables() -> None:
+    conn = get_db()
+    _migrate_line_snapshots(conn)
+    conn.executescript(_LINE_SNAPSHOTS_DDL + """;
         CREATE INDEX IF NOT EXISTS idx_line_snapshots_date
             ON line_snapshots (game_date, market_key);
 
@@ -162,10 +230,12 @@ def last_known_remaining() -> int | None:
 def record_call(resp: httpx.Response, *, endpoint: str, phase: str,
                 remaining_before: int | None, game_id: str | None = None,
                 game_date: str | None = None, rows: int | None = None,
-                books: str | None = None, note: str | None = None) -> tuple[int, int | None]:
+                books: str | None = None, note: str | None = None,
+                expected_cost: int = 1) -> tuple[int, int | None]:
     """
     Log one completed OddsAPI call to odds_pull_log. Used by this module and by
     data_fetcher's slip path so the monthly cap sees every credit spent.
+    expected_cost is charged only when the response carries no usable cost headers.
     Returns (credits_used, x-requests-remaining after).
     """
     remaining_after = _int_header(resp, "x-requests-remaining")
@@ -175,7 +245,7 @@ def record_call(resp: httpx.Response, *, endpoint: str, phase: str,
     elif remaining_before is not None and remaining_after is not None:
         credits = remaining_before - remaining_after
     else:
-        credits = 0 if endpoint == "events" else 1  # don't undercount odds calls
+        credits = 0 if endpoint == "events" else expected_cost  # don't undercount odds calls
     _log_pull(endpoint=endpoint, game_id=game_id, game_date=game_date, pull_phase=phase,
               http_status=resp.status_code, remaining_before=remaining_before,
               remaining_after=remaining_after, requests_last=last, credits_used=credits,
@@ -220,7 +290,7 @@ def _last_season_daily_rate(month: int) -> float:
 
 def remaining_scheduled_pulls(all_events: list[dict] | None) -> dict:
     """
-    Project the scheduled (open + pretip) pulls still to come this ET month.
+    Project the scheduled pulls (SCHEDULED_PHASES) still to come this ET month.
       today:  pulls not yet made for today's unstarted games, from the feed
       later:  per day, max(games in feed that day, last season's daily rate for
               the month), counting only days on/after the first game in the feed.
@@ -237,8 +307,7 @@ def remaining_scheduled_pulls(all_events: list[dict] | None) -> dict:
         feed_by_day[day] = feed_by_day.get(day, 0) + 1
         if day == today_et and commence > now_utc:
             gd = day.isoformat()
-            today_pending += (not _already_pulled(e["id"], "open", gd)) + \
-                             (not _already_pulled(e["id"], "pretip", gd))
+            today_pending += sum(not _already_pulled(e["id"], ph, gd) for ph in SCHEDULED_PHASES)
 
     season_start = min(feed_by_day) if feed_by_day else None
     rate = _last_season_daily_rate(today_et.month)
@@ -265,7 +334,7 @@ def budget_snapshot(all_events: list[dict] | None) -> dict:
     if remaining is not None:
         available = min(available, remaining)
     proj    = remaining_scheduled_pulls(all_events)
-    reserve = int(-(-proj["total_pulls"] * (1 + RESERVE_BUFFER) // 1))  # ceil
+    reserve = int(-(-proj["total_pulls"] * CREDITS_PER_PULL * (1 + RESERVE_BUFFER) // 1))  # ceil, credits
     return {"used_this_month": used, "cap": MONTHLY_CREDIT_CAP,
             "last_remaining_header": remaining, "available": available,
             "reserve": reserve, "spendable": available - reserve, **proj}
@@ -278,34 +347,44 @@ def check_unscheduled_spend(cost: int, all_events: list[dict] | None) -> tuple[b
         return True, "", snap
     reason = (f"would dip into reserve: cost {cost} > spendable {snap['spendable']} "
               f"(available {snap['available']}, reserve {snap['reserve']} = "
-              f"{snap['total_pulls']:.1f} remaining scheduled pulls x {1 + RESERVE_BUFFER:.1f})")
+              f"{snap['total_pulls']:.1f} remaining scheduled pulls x {CREDITS_PER_PULL} credits "
+              f"x {1 + RESERVE_BUFFER:.1f})")
     return False, reason, snap
 
 
 def todays_underdog_lines(game_date: str) -> dict:
     """
-    Latest logged Underdog line per player/market for game_date (ET), in the
+    Latest logged Underdog Points line per player for game_date (ET), in the
     shape data_fetcher.get_todays_lines() returns. Read-only; no API call.
-    Only Points is logged, so only player_points appears.
+    Underdog's Points lines are stored under player_points_alternate and
+    player_points (UNDERDOG_POINTS_MARKETS); both are read and returned under
+    "player_points", the key the slip path looks up. A player with more than one
+    distinct Underdog point across the two markets in his latest pull is left out
+    rather than guessed.
     """
     conn = get_db()
     rows = conn.execute("""
-        SELECT s.player_name, s.market_key, s.point, s.game_id, s.home_team, s.away_team
+        SELECT s.player_name, s.point, s.game_id, s.home_team, s.away_team
         FROM line_snapshots s
-        JOIN (SELECT player_name, market_key, MAX(captured_at) AS cap
+        JOIN (SELECT player_name, MAX(captured_at) AS cap
               FROM line_snapshots
-              WHERE game_date = ? AND bookmaker = 'underdog' AND side = 'Over'
-              GROUP BY player_name, market_key) m
-          ON s.player_name = m.player_name AND s.market_key = m.market_key
-         AND s.captured_at = m.cap
-        WHERE s.game_date = ? AND s.bookmaker = 'underdog' AND s.side = 'Over'
-    """, (game_date, game_date)).fetchall()
+              WHERE game_date = ? AND bookmaker = 'underdog' AND market_key IN (?, ?)
+              GROUP BY player_name) m
+          ON s.player_name = m.player_name AND s.captured_at = m.cap
+        WHERE s.game_date = ? AND s.bookmaker = 'underdog' AND s.market_key IN (?, ?)
+    """, (game_date, *UNDERDOG_POINTS_MARKETS, game_date, *UNDERDOG_POINTS_MARKETS)).fetchall()
     conn.close()
-    lines: dict = {}
+    points: dict = {}
     for r in rows:
-        entry = lines.setdefault(r["player_name"], {
-            "game_id": r["game_id"], "home_team": r["home_team"], "away_team": r["away_team"]})
-        entry[r["market_key"]] = {"value": r["point"], "source": "underdog"}
+        points.setdefault(r["player_name"], {"rows": r, "pts": set()})["pts"].add(r["point"])
+    lines: dict = {}
+    for player, v in points.items():
+        if len(v["pts"]) != 1:
+            continue
+        r = v["rows"]
+        lines[player] = {"game_id": r["game_id"], "home_team": r["home_team"],
+                         "away_team": r["away_team"],
+                         "player_points": {"value": next(iter(v["pts"])), "source": "underdog"}}
     return lines
 
 
@@ -361,11 +440,46 @@ def fetch_todays_events(phase: str | None = None) -> tuple[list[dict], int | Non
     return todays(events), remaining
 
 
+_INSERT_SNAPSHOT_SQL = """
+    INSERT OR IGNORE INTO line_snapshots
+    (game_id, game_date, commence_time, home_team, away_team, player_name,
+     market_key, bookmaker, side, point, price, book_last_update,
+     captured_at, pull_phase, outcome_index)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+"""
+
+
+def parse_event_odds(event: dict, data: dict, captured_at: str, phase: str) -> list[tuple]:
+    """
+    Rows for line_snapshots from one event-odds response: every bookmaker, every
+    market, every Over/Under outcome, each under its own market key and its
+    position in that market (outcome_index). Pure: no I/O.
+    """
+    game_date = _commence(event).astimezone(EASTERN).date().isoformat()
+    rows = []
+    for book in data.get("bookmakers", []):
+        for market in book.get("markets", []):
+            last_update = market.get("last_update") or book.get("last_update")
+            for idx, o in enumerate(market.get("outcomes", [])):
+                player = o.get("description")
+                side   = o.get("name")
+                if not player or side not in ("Over", "Under"):
+                    continue
+                rows.append((
+                    event["id"], game_date, event["commence_time"],
+                    event.get("home_team"), event.get("away_team"),
+                    player, market["key"], book["key"], side,
+                    o.get("point"), o.get("price"), last_update,
+                    captured_at, phase, idx,
+                ))
+    return rows
+
+
 def pull_event(event: dict, phase: str, remaining_before: int | None,
                note: str | None = None) -> tuple[int, int | None]:
     """
-    One OddsAPI call for one event: Points, all three books. Stores every
-    outcome. Returns (rows_inserted, x-requests-remaining after the call).
+    One OddsAPI call for one event: Points (main + alternate), all three books.
+    Stores every outcome. Returns (rows_inserted, x-requests-remaining after the call).
     Enforces the hard monthly credit cap before calling; the reserve rule for
     unscheduled pulls is applied by the caller (try_event_pull).
     """
@@ -374,13 +488,14 @@ def pull_event(event: dict, phase: str, remaining_before: int | None,
     game_date = commence.astimezone(EASTERN).date().isoformat()
 
     used = credits_used_this_month()
-    # Expected cost is 1 (1 market x 1 region-equivalent); refuse if that would breach the cap.
-    if used + 1 > MONTHLY_CREDIT_CAP:
+    # Expected cost is CREDITS_PER_PULL (2 markets x 1 region-equivalent); refuse if
+    # that would breach the cap.
+    if used + CREDITS_PER_PULL > MONTHLY_CREDIT_CAP:
         log_skip(endpoint="event_odds", phase=phase, game_id=game_id, game_date=game_date,
                  remaining=remaining_before, note=note,
                  reason=f"monthly cap reached ({used}/{MONTHLY_CREDIT_CAP})")
         return 0, remaining_before
-    if remaining_before is not None and remaining_before < 1:
+    if remaining_before is not None and remaining_before < CREDITS_PER_PULL:
         log_skip(endpoint="event_odds", phase=phase, game_id=game_id, game_date=game_date,
                  remaining=remaining_before, note=note,
                  reason=f"account quota exhausted (remaining={remaining_before})")
@@ -409,44 +524,36 @@ def pull_event(event: dict, phase: str, remaining_before: int | None,
         print(f"[line_logger] {game_id} HTTP {resp.status_code}: {resp.text[:200]}")
         _, remaining_after = record_call(resp, endpoint="event_odds", phase=phase,
                                          remaining_before=remaining_before,
-                                         game_id=game_id, game_date=game_date, note=note)
+                                         game_id=game_id, game_date=game_date, note=note,
+                                         expected_cost=CREDITS_PER_PULL)
         return 0, remaining_after
 
     data = resp.json()
-    rows = []
-    for book in data.get("bookmakers", []):
-        for market in book.get("markets", []):
-            last_update = market.get("last_update") or book.get("last_update")
-            for o in market.get("outcomes", []):
-                player = o.get("description")
-                side   = o.get("name")
-                if not player or side not in ("Over", "Under"):
-                    continue
-                rows.append((
-                    game_id, game_date, event["commence_time"],
-                    event.get("home_team"), event.get("away_team"),
-                    player, market["key"], book["key"], side,
-                    o.get("point"), o.get("price"), last_update,
-                    captured_at, phase,
-                ))
+    rows = parse_event_odds(event, data, captured_at, phase)
 
     conn = get_db()
     before = conn.total_changes
-    conn.executemany("""
-        INSERT OR IGNORE INTO line_snapshots
-        (game_id, game_date, commence_time, home_team, away_team, player_name,
-         market_key, bookmaker, side, point, price, book_last_update,
-         captured_at, pull_phase)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, rows)
+    conn.executemany(_INSERT_SNAPSHOT_SQL, rows)
     conn.commit()
     inserted = conn.total_changes - before
     conn.close()
 
     books = ",".join(sorted(b["key"] for b in data.get("bookmakers", [])))
+    ud_rows = sum(1 for r in rows if r[7] == "underdog" and r[6] in UNDERDOG_POINTS_MARKETS)
+    if ud_rows == 0:
+        print(f"[line_logger] {game_id}: no Underdog Points rows ({', '.join(UNDERDOG_POINTS_MARKETS)}) "
+              f"in this pull")
     credits, remaining_after = record_call(
         resp, endpoint="event_odds", phase=phase, remaining_before=remaining_before,
-        game_id=game_id, game_date=game_date, rows=inserted, books=books, note=note)
+        game_id=game_id, game_date=game_date, rows=inserted, books=books, note=note,
+        expected_cost=CREDITS_PER_PULL)
+    last = _int_header(resp, "x-requests-last")
+    if last != CREDITS_PER_PULL:
+        print("!" * 78)
+        print(f"[line_logger] WARNING {game_id}: x-requests-last={last}, expected "
+              f"{CREDITS_PER_PULL} for markets={MARKETS} with {len(BOOKMAKERS.split(','))} "
+              f"named books. Credit projection and reserve assume {CREDITS_PER_PULL}/pull.")
+        print("!" * 78)
     print(f"[line_logger] {phase} {event.get('away_team')} @ {event.get('home_team')}: "
           f"{inserted} rows, books=[{books}], credits={credits}, "
           f"remaining {remaining_before} -> {remaining_after}")
@@ -477,6 +584,74 @@ def run_open_pull(phase: str = "open", scheduler=None) -> int:
     if not events:
         print("[line_logger] no NBA events on today's ET slate")
     return total
+
+
+def _last_tip_today_utc() -> dt.datetime | None:
+    """Latest tip-off on today's ET slate from the `schedule` table (ET wall-clock), or None."""
+    today = dt.datetime.now(EASTERN).date().isoformat()
+    conn = get_db()
+    try:
+        row = conn.execute("SELECT MAX(gameDateTimeEst) FROM schedule "
+                           "WHERE substr(gameDateTimeEst, 1, 10) = ?", (today,)).fetchone()
+    except sqlite3.Error:
+        row = None
+    finally:
+        conn.close()
+    if not row or not row[0]:
+        return None
+    try:
+        naive = dt.datetime.fromisoformat(str(row[0])[:19].replace("T", " "))
+    except ValueError:
+        return None
+    return naive.replace(tzinfo=EASTERN).astimezone(dt.timezone.utc)
+
+
+def _retry_scheduling(scheduler, now: dt.datetime) -> None:
+    """After a failed events call: retry in EVENTS_RETRY_MINUTES while today's last game hasn't started."""
+    last_tip = _last_tip_today_utc()
+    if last_tip is None:  # schedule unknown: keep trying until midnight ET
+        tomorrow = dt.datetime.now(EASTERN).date() + dt.timedelta(days=1)
+        last_tip = dt.datetime.combine(tomorrow, dt.time(0, 0), EASTERN).astimezone(dt.timezone.utc)
+    retry_at = now + dt.timedelta(minutes=EVENTS_RETRY_MINUTES)
+    if scheduler is None:
+        print("[line_logger] pre-tip scheduling FAILED: events call failed; no scheduler, no retry")
+    elif retry_at >= last_tip:
+        print(f"[line_logger] pre-tip scheduling FAILED: events call failed; no retry "
+              f"(today's last game starts {last_tip:%H:%M} UTC)")
+    else:
+        scheduler.add_job(schedule_todays_pretips, "date", run_date=retry_at,
+                          kwargs={"scheduler": scheduler}, id="line_pretip_scheduler_retry",
+                          replace_existing=True, misfire_grace_time=10 * 60)
+        print(f"[line_logger] pre-tip scheduling FAILED: events call failed; "
+              f"retry at {retry_at:%H:%M} UTC (every {EVENTS_RETRY_MINUTES} min until "
+              f"{last_tip:%H:%M} UTC)")
+
+
+def schedule_todays_pretips(scheduler=None) -> int:
+    """
+    Free (events-only) daily job used when the open pull is off: schedule a
+    pre-tip pull for every not-yet-started game on today's ET slate. Spends no
+    credits. Returns the number of games scheduled, or -1 if the events call
+    failed (logged in odds_pull_log by fetch_events; retried every
+    EVENTS_RETRY_MINUTES until today's last game has started).
+    """
+    init_tables()
+    all_events, _ = fetch_events(phase="schedule")
+    now = dt.datetime.now(dt.timezone.utc)
+    if all_events is None:
+        _retry_scheduling(scheduler, now)
+        return -1
+    events = todays(all_events)
+    n = 0
+    for event in events:
+        if _commence(event) <= now:
+            continue
+        if scheduler is not None:
+            _schedule_pretip(scheduler, event)
+        n += 1
+    print(f"[line_logger] {n} pre-tip pull(s) scheduled for today's ET slate"
+          if events else "[line_logger] no NBA events on today's ET slate")
+    return n
 
 
 def _last_attempt(game_id: str, phase: str, game_date: str):
@@ -550,7 +725,7 @@ def try_event_pull(game_id: str, note: str | None = None) -> tuple[int, str]:
     Refused, with the reason logged to odds_pull_log, when:
       - the game is not on today's ET slate or has already started
       - EVENT_PULLS_PER_DAY_MAX event pulls already reached the API today
-      - the 1-credit cost would dip into the scheduled-pull reserve
+      - the CREDITS_PER_PULL cost would dip into the scheduled-pull reserve
     Returns (rows_inserted, skip_reason or "").
     """
     init_tables()
@@ -574,7 +749,7 @@ def try_event_pull(game_id: str, note: str | None = None) -> tuple[int, str]:
     if _commence(event) <= dt.datetime.now(dt.timezone.utc):
         return _skip("game already started", remaining)
 
-    ok, reason, _ = check_unscheduled_spend(1, all_events)
+    ok, reason, _ = check_unscheduled_spend(CREDITS_PER_PULL, all_events)
     if not ok:
         return _skip(reason, remaining)
 
@@ -592,6 +767,162 @@ def _schedule_pretip(scheduler, event: dict) -> None:
         id=f"pretip:{event['id']}", replace_existing=True,
         misfire_grace_time=(PRETIP_MINUTES - 5) * 60,
     )
+
+
+# ---------------------------------------------------------------------------
+# Morning maintenance: backup -> ETL (unless a pre-tip pull is near) -> resolve
+# ---------------------------------------------------------------------------
+
+def backup_database(today_et: dt.date | None = None) -> str:
+    """
+    Online backup of predictions.db (SQLite backup API, safe while other connections
+    write) to BACKUP_DIR/predictions_YYYY-MM-DD.db, checked with PRAGMA quick_check
+    before it replaces any file. Then keeps the newest BACKUP_KEEP backups.
+    Raises on any failure; nothing older is deleted unless the new backup is good.
+    """
+    today_et = today_et or dt.datetime.now(EASTERN).date()
+    os.makedirs(BACKUP_DIR, exist_ok=True)
+    final = os.path.join(BACKUP_DIR, f"predictions_{today_et.isoformat()}.db")
+    partial = final + ".partial"
+    if os.path.exists(partial):
+        os.remove(partial)
+    src = sqlite3.connect(DB_PATH, timeout=30)
+    dst = sqlite3.connect(partial, timeout=30)
+    try:
+        src.backup(dst)
+        check = dst.execute("PRAGMA quick_check").fetchone()[0]
+    finally:
+        dst.close()
+        src.close()
+    if check != "ok":
+        os.remove(partial)
+        raise RuntimeError(f"backup failed quick_check: {check}")
+    os.replace(partial, final)
+
+    backups = sorted(f for f in os.listdir(BACKUP_DIR)
+                     if f.startswith("predictions_") and f.endswith(".db"))
+    for old in backups[:-BACKUP_KEEP]:
+        os.remove(os.path.join(BACKUP_DIR, old))
+    return final
+
+
+ETL_TABLES = ("player_stats", "players", "schedule", "kaggle_version")  # what run_etl replaces
+
+
+def restore_etl_tables(backup_path: str) -> dict:
+    """
+    Put back ONLY the tables run_etl replaces (ETL_TABLES) from backup_path, in one
+    transaction: ATTACH the backup, then per table DROP, re-CREATE with the backup's
+    own DDL, copy every row, and re-create the backup's indexes on it. Row counts are
+    checked before COMMIT; any error rolls the whole restore back. Every other table
+    (line_snapshots, odds_pull_log, paper_predictions, news_*, ...) is untouched.
+    A table absent from the backup is left as it is. Returns {table: rows restored}.
+    """
+    conn = sqlite3.connect(DB_PATH, timeout=30)
+    conn.isolation_level = None                       # explicit transaction control
+    restored: dict = {}
+    try:
+        conn.execute("ATTACH DATABASE ? AS bk", (backup_path,))
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                for t in ETL_TABLES:
+                    ddl = conn.execute("SELECT sql FROM bk.sqlite_master WHERE type = 'table' "
+                                       "AND name = ?", (t,)).fetchone()
+                    if not ddl:
+                        continue
+                    idx = [r[0] for r in conn.execute(
+                        "SELECT sql FROM bk.sqlite_master WHERE type = 'index' AND tbl_name = ? "
+                        "AND sql IS NOT NULL", (t,))]
+                    conn.execute(f'DROP TABLE IF EXISTS main."{t}"')
+                    conn.execute(ddl[0])                  # unqualified -> created in main
+                    conn.execute(f'INSERT INTO main."{t}" SELECT * FROM bk."{t}"')
+                    for sql in idx:
+                        conn.execute(sql)
+                    n_main = conn.execute(f'SELECT COUNT(*) FROM main."{t}"').fetchone()[0]
+                    n_bk = conn.execute(f'SELECT COUNT(*) FROM bk."{t}"').fetchone()[0]
+                    if n_main != n_bk:
+                        raise RuntimeError(f"{t}: restored {n_main} of {n_bk} rows")
+                    restored[t] = n_main
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+        finally:
+            conn.execute("DETACH DATABASE bk")
+    finally:
+        conn.close()
+    return restored
+
+
+def _pretips_due_within(scheduler, minutes: int) -> list[str]:
+    """Pre-tip (and pre-tip retry) jobs scheduled to run within `minutes` (or overdue)."""
+    if scheduler is None:
+        return []
+    horizon = dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=minutes)
+    return [f"{j.id} @ {j.next_run_time:%H:%M %Z}" for j in scheduler.get_jobs()
+            if j.id.startswith(("pretip:", "pretip-retry:"))
+            and j.next_run_time is not None and j.next_run_time <= horizon]
+
+
+def run_morning_maintenance(scheduler=None) -> dict:
+    """
+    Daily at MAINTENANCE_HOUR_ET:
+      1. back up predictions.db (abort the whole job if that fails);
+      2. run database.run_etl(), unless a pre-tip pull is scheduled within
+         ETL_PRETIP_GUARD_MINUTES (the ETL replaces player_stats/players/schedule
+         in place, and a pre-tip paper prediction would read the partial tables).
+         If it raises, ETL_TABLES are restored from the step-1 backup (nothing else);
+         if that restore fails too, the job stops before step 3;
+      3. run paper_predictions.resolve_paper_predictions().
+    Each step's outcome is printed. Returns them as a dict.
+    """
+    out: dict = {}
+    print("[maintenance] start")
+    try:
+        path = backup_database()
+        out["backup"] = path
+        print(f"[maintenance] 1/3 backup OK: {path} (keeping newest {BACKUP_KEEP})")
+    except Exception as exc:
+        out["backup"] = f"FAILED: {exc!r}"
+        print(f"[maintenance] 1/3 backup FAILED: {exc!r}. Aborting: no ETL, no resolve.")
+        return out
+
+    due = _pretips_due_within(scheduler, ETL_PRETIP_GUARD_MINUTES)
+    if due:
+        out["etl"] = f"skipped: pre-tip pull(s) within {ETL_PRETIP_GUARD_MINUTES} min: {due}"
+        print(f"[maintenance] 2/3 ETL SKIPPED: pre-tip pull(s) within "
+              f"{ETL_PRETIP_GUARD_MINUTES} min: {due}")
+    else:
+        try:
+            import database
+            ran = database.run_etl()
+            out["etl"] = "ran" if ran else "up to date"
+            print(f"[maintenance] 2/3 ETL OK: {'new Kaggle version loaded' if ran else 'dataset already up to date'}")
+        except Exception as exc:
+            out["etl"] = f"FAILED: {exc!r}"
+            print(f"[maintenance] 2/3 ETL FAILED: {exc!r}")
+            try:
+                out["restored"] = restore_etl_tables(path)
+                print(f"[maintenance] ETL FAILED, tables restored from {path}")
+            except Exception as rexc:
+                out["restored"] = f"FAILED: {rexc!r}"
+                print(f"[maintenance] ETL FAILED and table restore FAILED: {rexc!r}. "
+                      f"player_stats/players/schedule may be partial; restore them from {path}. "
+                      f"Skipping resolve.")
+                print("[maintenance] done")
+                return out
+
+    try:
+        import paper_predictions
+        n = paper_predictions.resolve_paper_predictions()
+        out["resolve"] = n
+        print(f"[maintenance] 3/3 paper predictions resolved: {n}")
+    except Exception as exc:
+        out["resolve"] = f"FAILED: {exc!r}"
+        print(f"[maintenance] 3/3 resolve FAILED: {exc!r}")
+    print("[maintenance] done")
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -614,21 +945,42 @@ def start_scheduler():
     from apscheduler.schedulers.background import BackgroundScheduler
 
     sched = BackgroundScheduler(timezone=EASTERN)
+    if OPEN_PULL_ENABLED:
+        sched.add_job(
+            run_open_pull, "cron", hour=OPEN_PULL_HOUR_ET, minute=0,
+            kwargs={"phase": "open", "scheduler": sched},
+            id="line_open_pull", replace_existing=True, misfire_grace_time=3 * 3600,
+            coalesce=True,
+        )
+        # Restart catch-up: if we're past the open time today, run now. The pull log
+        # makes this a no-op for games already pulled.
+        if dt.datetime.now(EASTERN).hour >= OPEN_PULL_HOUR_ET:
+            sched.add_job(run_open_pull, kwargs={"phase": "open", "scheduler": sched},
+                          id="line_open_catchup", replace_existing=True)
+    else:
+        # No open pull: a free daily events call schedules the pre-tip pulls.
+        sched.add_job(
+            schedule_todays_pretips, "cron", hour=SCHEDULE_HOUR_ET, minute=0,
+            kwargs={"scheduler": sched},
+            id="line_pretip_scheduler", replace_existing=True, misfire_grace_time=3 * 3600,
+            coalesce=True,
+        )
+        # Restart catch-up, any hour: today's pre-tip jobs live only in memory.
+        # run_pretip_pull skips games already pulled, so this never double-spends.
+        sched.add_job(schedule_todays_pretips, kwargs={"scheduler": sched},
+                      id="line_pretip_scheduler_catchup", replace_existing=True)
+    # Morning maintenance (backup -> ETL unless a pre-tip pull is near -> resolve).
     sched.add_job(
-        run_open_pull, "cron", hour=OPEN_PULL_HOUR_ET, minute=0,
-        kwargs={"phase": "open", "scheduler": sched},
-        id="line_open_pull", replace_existing=True, misfire_grace_time=3 * 3600,
-        coalesce=True,
+        run_morning_maintenance, "cron", hour=MAINTENANCE_HOUR_ET, minute=0,
+        kwargs={"scheduler": sched},
+        id="morning_maintenance", replace_existing=True, misfire_grace_time=2 * 3600,
+        coalesce=True, max_instances=1,
     )
-    # Restart catch-up: if we're past the open time today, run now. The pull log
-    # makes this a no-op for games already pulled.
-    if dt.datetime.now(EASTERN).hour >= OPEN_PULL_HOUR_ET:
-        sched.add_job(run_open_pull, kwargs={"phase": "open", "scheduler": sched},
-                      id="line_open_catchup", replace_existing=True)
     sched.start()
     _scheduler = sched
-    print(f"[line_logger] scheduler started: open {OPEN_PULL_HOUR_ET}:00 ET, "
-          f"pretip T-{PRETIP_MINUTES}m, cap {MONTHLY_CREDIT_CAP}/month")
+    print(f"[line_logger] scheduler started: open pull {'ON ' + str(OPEN_PULL_HOUR_ET) + ':00 ET' if OPEN_PULL_ENABLED else 'OFF; pre-tip scheduling ' + str(SCHEDULE_HOUR_ET) + ':00 ET'}, "
+          f"pretip T-{PRETIP_MINUTES}m, markets={MARKETS} ({CREDITS_PER_PULL} credits/pull), "
+          f"cap {MONTHLY_CREDIT_CAP}/month, maintenance {MAINTENANCE_HOUR_ET}:00 ET")
     return sched
 
 

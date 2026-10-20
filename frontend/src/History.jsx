@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback } from 'react'
+import { fetchTrackRecord, pct, rangeStr } from './trackRecord'
 
 const API = 'http://localhost:8000'
 const PAGE_SIZES = [10, 25, 50]
@@ -47,6 +48,55 @@ function FilterSelect({ value, onChange, options }) {
 // Prediction row
 // ---------------------------------------------------------------------------
 
+// Player name with a hover tooltip: the app's current track record on this player
+// and stat (resolved picks only). Fixed-positioned so the truncating cell can't clip it.
+function PlayerName({ name, stat, league }) {
+  const [tip, setTip] = useState(null)   // { x, y, tr, error }
+
+  const show = (e) => {
+    const r = e.currentTarget.getBoundingClientRect()
+    const pos = { x: r.left, y: r.bottom + 6 }
+    setTip({ ...pos, tr: null })
+    fetchTrackRecord({ player: name, stat, league })
+      .then((tr) => setTip((t) => (t ? { ...t, tr } : t)))
+      .catch(() => setTip((t) => (t ? { ...t, error: true } : t)))
+  }
+
+  return (
+    <>
+      <span onMouseEnter={show} onMouseLeave={() => setTip(null)} className="cursor-help">{name}</span>
+      {tip && (
+        <div
+          className="fixed z-50 rounded-xl px-3 py-2 text-xs space-y-0.5 shadow-lg pointer-events-none"
+          style={{ left: tip.x, top: tip.y, backgroundColor: 'var(--bg-secondary)', border: '1px solid var(--border)', color: 'var(--text-secondary)' }}
+        >
+          <div className="font-semibold" style={{ color: 'var(--text-primary)' }}>{name} · {stat}</div>
+          {tip.error ? (
+            <div style={{ color: 'var(--text-muted)' }}>Track record unavailable</div>
+          ) : !tip.tr ? (
+            <div style={{ color: 'var(--text-muted)' }}>Loading…</div>
+          ) : (
+            <>
+              <div className="flex items-center gap-2">
+                <span>Record: {tip.tr.wins}–{tip.tr.losses} ({tip.tr.n} picks)</span>
+                {!tip.tr.enough && (
+                  <span className="rounded px-1.5 py-0.5 text-[10px] font-semibold"
+                        style={{ backgroundColor: 'var(--warning-bg)', color: 'var(--warning)', border: '1px solid var(--warning-border)' }}>
+                    Small sample
+                  </span>
+                )}
+              </div>
+              <div>Raw: {pct(tip.tr.raw_rate)} ({rangeStr(tip.tr)})</div>
+              <div>Adjusted: {pct(tip.tr.adjusted_rate)}</div>
+              <div style={{ color: 'var(--text-muted)' }}>All players, {stat}: {pct(tip.tr.overall_rate)} · resolved picks only</div>
+            </>
+          )}
+        </div>
+      )}
+    </>
+  )
+}
+
 function PredictionRow({ prediction: p, isEditing, editValue, onEdit, onEditChange, onEditConfirm, onEditCancel, stripe }) {
   const isOver = p.predicted_outcome === 'OVER'
   const isDNP = p.actual_result === 'DNP'
@@ -84,7 +134,9 @@ function PredictionRow({ prediction: p, isEditing, editValue, onEdit, onEditChan
     <tr style={{ backgroundColor: stripe ? 'var(--bg-stripe)' : 'transparent' }}>
       <td className="px-2 py-2 text-xs truncate" style={{ color: 'var(--text-muted)' }}>{dateStr}</td>
       <td className="px-2 py-2 text-xs truncate" style={{ color: 'var(--text-muted)' }}>{gameDateStr}</td>
-      <td className="px-2 py-2 truncate" style={{ color: 'var(--text-secondary)' }}>{p.player_name}</td>
+      <td className="px-2 py-2 truncate" style={{ color: 'var(--text-secondary)' }}>
+        <PlayerName name={p.player_name} stat={p.stat_type} league={p.league ?? 'NBA'} />
+      </td>
       <td className="px-2 py-2 truncate" style={{ color: 'var(--text-muted)' }}>{p.stat_type}</td>
       <td className="px-2 py-2 truncate" style={{ color: 'var(--text-secondary)' }}>{p.stat_line}</td>
       <td className="px-2 py-2 truncate" style={{ color: 'var(--text-muted)' }}>{p.opponent_team}</td>

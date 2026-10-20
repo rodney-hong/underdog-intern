@@ -179,7 +179,7 @@ def audit_pairs(c):
 
 
 def main():
-    c = sqlite3.connect(DB_PATH)
+    c = sqlite3.connect(DB_PATH, timeout=30)
     print("database: " + DB_PATH)
     names = audit_columns(c)
     audit_books(c)

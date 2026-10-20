@@ -63,9 +63,26 @@ def read_schedule_csv(schedule_path: str) -> pd.DataFrame:
 
 
 def get_connection():
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.row_factory = sqlite3.Row
     return conn
+
+
+def enable_wal() -> str:
+    """
+    Switch predictions.db to WAL journaling (persistent; a no-op once set). Readers
+    then never wait on a writer. Backups must use the SQLite backup API (or copy the
+    -wal file too); a plain copy of predictions.db alone can miss recent writes.
+    """
+    conn = sqlite3.connect(DB_PATH, timeout=30)
+    try:
+        mode = conn.execute("PRAGMA journal_mode=WAL").fetchone()[0]
+    finally:
+        conn.close()
+    print(f"[startup] SQLite journal_mode={mode}")
+    if mode.lower() != "wal":
+        raise RuntimeError(f"journal_mode is {mode!r}, not 'wal' (another connection may hold a lock)")
+    return mode
 
 
 def init_db():
@@ -162,6 +179,98 @@ def log_prediction(
     conn.commit()
     conn.close()
     return row_id
+
+
+# ---------------------------------------------------------------------------
+# Per-player model track record (app `predictions` table only; display-only —
+# it never feeds the model's confidence, outcome or explanation)
+# ---------------------------------------------------------------------------
+
+TRACK_RECORD_K = 30          # shrinkage weight: pseudo-picks at the overall rate
+TRACK_RECORD_MIN_N = 20      # below this the record is flagged as a small sample
+
+
+def _wilson_interval(wins: int, n: int, z: float = 1.96) -> tuple[float, float] | None:
+    """95% Wilson score interval for wins/n, or None when n == 0."""
+    if n == 0:
+        return None
+    p = wins / n
+    denom = 1 + z * z / n
+    centre = (p + z * z / (2 * n)) / denom
+    half = z * ((p * (1 - p) / n + z * z / (4 * n * n)) ** 0.5) / denom
+    return max(0.0, centre - half), min(1.0, centre + half)
+
+
+def _track_record_cutoff(conn, before: str | None) -> str | None:
+    """
+    ET date before which a pick's game must fall to count, from `before`
+    (a prediction id, or an ISO timestamp; naive timestamps are UTC like the
+    predictions table). Results are known only after the game, so a pick counts
+    as "resolved before" the reference when its game date is strictly earlier
+    than the reference's ET date. Raises KeyError / ValueError on a bad `before`.
+    """
+    if before is None:
+        return None
+    from zoneinfo import ZoneInfo
+    if before.isdigit():
+        row = conn.execute("SELECT timestamp FROM predictions WHERE id = ?", (int(before),)).fetchone()
+        if row is None:
+            raise KeyError(f"prediction {before} not found")
+        before = row["timestamp"]
+    ts = datetime.fromisoformat(before.replace("Z", "+00:00"))
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=ZoneInfo("UTC"))
+    return ts.astimezone(ZoneInfo("America/New_York")).date().isoformat()
+
+
+def player_track_record(player_name: str, stat_type: str = "Points", league: str = "NBA",
+                        before: str | None = None) -> dict:
+    """
+    The app's own record on this player and stat: resolved picks only (actual_result
+    OVER/UNDER; DNP and pending excluded), one row per (player, stat, line,
+    opponent, game date) — the latest id when duplicated — and, with `before`,
+    only games dated before the reference prediction's ET date. A pick wins when
+    predicted_outcome == actual_result. overall_rate uses the same filters for
+    every player; adjusted_rate shrinks raw_rate toward it with TRACK_RECORD_K.
+    """
+    conn = get_connection()
+    try:
+        cutoff = _track_record_cutoff(conn, before)
+        sql = """
+            SELECT player_name, predicted_outcome, actual_result FROM (
+                SELECT player_name, predicted_outcome, actual_result,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY player_name, stat_type, stat_line, opponent_team,
+                                        COALESCE(game_date, substr(timestamp, 1, 10))
+                           ORDER BY id DESC) AS rn
+                FROM predictions
+                WHERE stat_type = ? AND COALESCE(league, 'NBA') = ?
+                  AND actual_result IN ('OVER', 'UNDER')
+                  AND (? IS NULL OR COALESCE(game_date, substr(timestamp, 1, 10)) < ?)
+            ) WHERE rn = 1
+        """
+        rows = conn.execute(sql, (stat_type, league, cutoff, cutoff)).fetchall()
+    finally:
+        conn.close()
+
+    all_w = sum(r["predicted_outcome"] == r["actual_result"] for r in rows)
+    all_n = len(rows)
+    mine = [r for r in rows if r["player_name"] == player_name]
+    wins = sum(r["predicted_outcome"] == r["actual_result"] for r in mine)
+    n = len(mine)
+    overall = all_w / all_n if all_n else None
+    adjusted = (wins + TRACK_RECORD_K * overall) / (n + TRACK_RECORD_K) if overall is not None else None
+    ci = _wilson_interval(wins, n)
+    return {
+        "player_name": player_name, "stat_type": stat_type, "league": league,
+        "before_date": cutoff,
+        "wins": wins, "losses": n - wins, "n": n,
+        "raw_rate": wins / n if n else None,
+        "overall_rate": overall, "overall_n": all_n,
+        "adjusted_rate": adjusted, "k": TRACK_RECORD_K,
+        "raw_rate_ci95": list(ci) if ci else None,
+        "enough": n >= TRACK_RECORD_MIN_N, "min_n": TRACK_RECORD_MIN_N,
+    }
 
 
 _RESOLVE_STAT_COLS = {
@@ -425,7 +534,7 @@ def run_etl() -> bool:
 
     # --- Version check ---
     latest_version = get_latest_kaggle_version()
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=30)
     skip = False
     try:
         stored = conn.execute("SELECT version FROM kaggle_version LIMIT 1").fetchone()
@@ -449,7 +558,7 @@ def run_etl() -> bool:
     stats_path = os.path.join(path, "PlayerStatisticsExtended.csv")
     print("Loading PlayerStatisticsExtended.csv in chunks...")
     total_rows = 0
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=30)
     for i, chunk in enumerate(
         pd.read_csv(stats_path, usecols=_STATS_COLS, chunksize=10_000)
     ):
@@ -470,7 +579,7 @@ def run_etl() -> bool:
     players_df = pd.read_csv(
         players_path, usecols=["personId", "firstName", "lastName"]
     )
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=30)
     players_df.to_sql("players", conn, if_exists="replace", index=False)
     conn.close()
     print(f"  Done — {len(players_df):,} players")
@@ -480,14 +589,14 @@ def run_etl() -> bool:
     print(f"Loading {os.path.basename(schedule_path)}...")
     schedule_df = read_schedule_csv(schedule_path)
     schedule_df = schedule_df[schedule_df["homeTeamId"] != 0]
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=30)
     schedule_df.to_sql("schedule", conn, if_exists="replace", index=False)
     conn.close()
     print(f"  Done — {len(schedule_df):,} games")
 
     # --- Indexes ---
     print("Creating indexes...")
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_stats_person ON player_stats(personId)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_stats_date   ON player_stats(gameDateTimeEst)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_schedule_home ON schedule(homeTeamId)")
@@ -496,7 +605,7 @@ def run_etl() -> bool:
     conn.close()
 
     # --- Store the version we just loaded ---
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.execute("DELETE FROM kaggle_version")
     conn.execute("INSERT INTO kaggle_version (version) VALUES (?)", (latest_version,))
     conn.commit()
@@ -730,7 +839,7 @@ def run_wnba_etl() -> bool:
 
     Returns True only if new player rows were inserted (so the caller retrains).
     """
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=30)
     _wnba_ensure_table(conn)
     watermark = _wnba_watermark(conn)
 

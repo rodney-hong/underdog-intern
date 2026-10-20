@@ -85,7 +85,7 @@ def build_props(use_cache=True):
         print("loaded cached props from " + CACHE)
         return props, diag
 
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=30)
     lookup, _ = build_real_line_lookup(conn)
 
     # box index: (norm_name, date10) -> row fields needed for grading

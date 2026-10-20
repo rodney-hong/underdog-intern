@@ -169,7 +169,7 @@ def main() -> None:
         raise SystemExit(f"{CACHE_PATH} not found — run jev_eval.py first.")
 
     stats = args.stat or STATS
-    conn = sqlite3.connect(CACHE_PATH)
+    conn = sqlite3.connect(CACHE_PATH, timeout=30)
     dump: dict = {"pinned_model": args.model, "slice": args.eval_slice or "all", "stats": {}}
 
     print("=" * 78)

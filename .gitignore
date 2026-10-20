@@ -15,6 +15,18 @@ backend/predictions.db
 backend/model_*.pkl
 backend/feature_importance*.png
 
+# Databases, models, credentials, raw API responses, images, logs (anywhere)
+*.db
+*.sqlite
+*.pkl
+kaggle.json
+probe_*.json
+*.png
+*.jpg
+*.log
+predictions_backup.csv
+backend/backups/
+
 # Node / frontend build artifacts
 frontend/node_modules/
 frontend/dist/

@@ -51,7 +51,7 @@ def _norm(name) -> str:
 
 
 def main() -> None:
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=30)
     c = conn.cursor()
 
     # --- available box-score columns (steals/blocks are optional in some builds) ---

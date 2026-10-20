@@ -69,7 +69,7 @@ SEASONS = [
 # ---------------------------------------------------------------------------
 
 def setup_db() -> None:
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS historical_player_props (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -107,7 +107,7 @@ def setup_db() -> None:
 
 
 def _get_processed_ids(sport: str) -> set:
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=30)
     ids = {r[0] for r in conn.execute(
         "SELECT game_id FROM historical_etl_progress WHERE sport = ?", (sport,)
     ).fetchall()}
@@ -269,7 +269,7 @@ def pull_game_props(
 
     # Commit rows + mark progress in one transaction
     now_str = datetime.now(timezone.utc).replace(tzinfo=None).isoformat()
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=30)
     if rows:
         conn.executemany(
             """

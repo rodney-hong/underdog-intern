@@ -29,7 +29,7 @@ import game_types
 # ---------------------------------------------------------------------------
 
 def get_db() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -341,7 +341,7 @@ def get_player_history(player_name: str, stat_type: str) -> pd.DataFrame:
     player_id = get_player_id(player_name)
     if expr is None or player_id is None:
         return pd.DataFrame()
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=30)
     h = pd.read_sql_query(
         f"SELECT gameDateTimeEst, opponentteamId, points, reboundsTotal, assists, threePointersMade "
         f"FROM player_stats WHERE personId = ? AND numMinutes IS NOT NULL AND numMinutes > 0 "
@@ -632,8 +632,8 @@ def get_player_news(player_name: str) -> str:
 # ---------------------------------------------------------------------------
 
 _ODDS_API_KEY = os.getenv("ODDS_API_KEY", "")
-_ODDS_EVENTS_URL = "https://api.the-odds-api.com/v4/sports/basketball_nba/events"
-_ODDS_PROPS_URL  = "https://api.the-odds-api.com/v4/sports/basketball_nba/events/{event_id}/odds"
+# The NBA slip path makes no OddsAPI calls (see get_todays_lines); the URLs, books and
+# markets below are used by the WNBA path only.
 _PREFERRED_BOOKS = ["underdog"]
 # Only the markets Underdog actually carries (confirmed via check_underdog_markets.py,
 # WNBA slate 2026-08-25). Underdog carries the combo markets (PR/PA/RA/PRA) but NOT
@@ -693,179 +693,50 @@ def get_todays_lines() -> dict:
     Return today's NBA player prop lines keyed by player name:
       {
         "Cade Cunningham": {
-          "player_points": {"value": 27.5, "source": "fanduel"},
-          ...
+          "player_points": {"value": 24.5, "source": "underdog"},
           "game_id": "...", "home_team": "...", "away_team": "..."
         }
       }
-    Cache hierarchy (6-hour TTL):
-      1. In-memory dict  — avoids SQLite reads within the same process lifetime.
-      2. SQLite odds_cache table — survives server restarts.
-      3. OddsAPI fetch — writes result back to both layers.
-    Returns stale memory cache on network/API error; {} if no key configured.
+    Makes NO OddsAPI calls (the NBA slip path spends no credits; line_logger's
+    scheduled pre-tip pull is the only NBA OddsAPI consumer). Fallback order:
+      1. today's logged Underdog lines (line_snapshots via
+         line_logger.todays_underdog_lines; Points only);
+      2. today's cached lines (in-memory, then the SQLite odds_cache row), stale is fine;
+      3. {} -> the slip form falls back to manual line entry.
     """
     global _lines_cache, _lines_cache_ts
 
-    if not _ODDS_API_KEY:
-        return {}
-
-    now      = time.time()
     eastern  = ZoneInfo("America/New_York")
     today_et = dt.datetime.now(eastern).date()
 
-    # 1. In-memory hit — TTL and same calendar day (ET)
-    if _lines_cache and (now - _lines_cache_ts) < _CACHE_TTL:
-        cached_date_et = dt.datetime.fromtimestamp(_lines_cache_ts, tz=eastern).date()
-        if cached_date_et == today_et:
-            return _lines_cache
-        # Different calendar day — fall through to refresh
-
-    # 2. SQLite hit — TTL and same calendar day (ET)
-    conn = get_db()
-    row = conn.execute(
-        "SELECT data, cached_at FROM odds_cache "
-        "WHERE (julianday('now') - julianday(cached_at)) * 86400 < ? LIMIT 1",
-        (_CACHE_TTL,),
-    ).fetchone()
-    conn.close()
-    if row:
-        try:
-            cached_dt     = dt.datetime.fromisoformat(row["cached_at"])
-            cached_dt_utc = cached_dt.replace(tzinfo=dt.timezone.utc)
-            if cached_dt_utc.astimezone(eastern).date() == today_et:
-                _lines_cache    = json.loads(row["data"])
-                _lines_cache_ts = cached_dt_utc.timestamp()
-                return _lines_cache
-            # Different calendar day — fall through to API fetch
-        except Exception:
-            pass  # corrupted row — fall through to API fetch
-
-    # 3. Fetch today's events (free; logged to odds_pull_log so the cap sees every call)
+    # 1. Logged Underdog lines (line_snapshots)
     try:
-        resp = httpx.get(_ODDS_EVENTS_URL, params={"apiKey": _ODDS_API_KEY}, timeout=10)
-        _, remaining = line_logger.record_call(resp, endpoint="events", phase="slip",
-                                               remaining_before=None)
-        resp.raise_for_status()
-        events = resp.json()
+        logged = line_logger.todays_underdog_lines(today_et.isoformat())
+        if logged:
+            return logged
     except Exception:
-        return _lines_cache  # return stale cache rather than crashing
+        pass
 
-    # Filter to games starting today in US/Eastern time
-    today_events = []
-    for event in events:
-        try:
-            commence = dt.datetime.fromisoformat(
-                event["commence_time"].replace("Z", "+00:00")
-            )
-            if commence.astimezone(eastern).date() == today_et:
-                today_events.append(event)
-        except Exception:
-            continue
+    # 2a. In-memory cache from today (ET)
+    if _lines_cache and dt.datetime.fromtimestamp(_lines_cache_ts, tz=eastern).date() == today_et:
+        return _lines_cache
 
-    # Refuse a fresh pull that would dip into the scheduled line-logging reserve.
-    # Fallback order, no API calls: today's logged Underdog lines (line_snapshots,
-    # Points only) -> today's cached lines (stale is fine) -> {} (manual entry).
-    slip_cost = len(today_events) * len(_PROP_MARKETS.split(","))  # markets x 1 region, upper bound
-    ok, reason, _ = line_logger.check_unscheduled_spend(slip_cost, events)
-    if not ok:
-        line_logger.log_skip(endpoint="event_odds", phase="slip", reason=reason,
-                             game_date=today_et.isoformat(), remaining=remaining)
-        try:
-            logged = line_logger.todays_underdog_lines(today_et.isoformat())
-            if logged:
-                return logged
-        except Exception:
-            pass
-        if _lines_cache and dt.datetime.fromtimestamp(_lines_cache_ts, tz=eastern).date() == today_et:
-            return _lines_cache
-        try:
-            conn = get_db()
-            row = conn.execute("SELECT data, cached_at FROM odds_cache LIMIT 1").fetchone()
-            conn.close()
-            if row and dt.datetime.fromisoformat(row["cached_at"]).replace(
-                    tzinfo=dt.timezone.utc).astimezone(eastern).date() == today_et:
-                return json.loads(row["data"])
-        except Exception:
-            pass
-        return {}
-
-    # Fetch props for each game and merge into one player map
-    new_cache: dict = {}
-    for event in today_events:
-        game_id   = event["id"]
-        home_team = event.get("home_team", "")
-        away_team = event.get("away_team", "")
-        try:
-            resp = httpx.get(
-                _ODDS_PROPS_URL.format(event_id=game_id),
-                params={
-                    "apiKey":      _ODDS_API_KEY,
-                    "regions":     "us_dfs",
-                    "markets":     _PROP_MARKETS,
-                    "oddsFormat":  "american",
-                },
-                timeout=10,
-            )
-            _, remaining = line_logger.record_call(
-                resp, endpoint="event_odds", phase="slip", remaining_before=remaining,
-                game_id=game_id, game_date=today_et.isoformat())
-            resp.raise_for_status()
-            data = resp.json()
-        except Exception:
-            continue
-
-        # Build player_lines for this event.
-        # Iterate preferred books in order; first book to set a market wins.
-        player_lines: dict = {}
-        for book_key in _PREFERRED_BOOKS:
-            book = next(
-                (b for b in data.get("bookmakers", []) if b["key"] == book_key),
-                None,
-            )
-            if not book:
-                continue
-            for market in book.get("markets", []):
-                market_key = market["key"]
-                seen: set = set()
-                for outcome in market.get("outcomes", []):
-                    player = outcome.get("description", "")
-                    point  = outcome.get("point")
-                    if not player or point is None or player in seen:
-                        continue
-                    seen.add(player)
-                    if player not in player_lines:
-                        player_lines[player] = {
-                            "game_id":   game_id,
-                            "home_team": home_team,
-                            "away_team": away_team,
-                        }
-                    # Only one book in _PREFERRED_BOOKS (underdog); first value wins
-                    if market_key not in player_lines[player]:
-                        player_lines[player][market_key] = {
-                            "value":  point,
-                            "source": book_key,
-                        }
-
-        _log_underdog_lines(player_lines, today_et.isoformat(), "NBA")
-        new_cache.update(player_lines)
-
-    # Persist to SQLite so the cache survives restarts
-    cached_at = dt.datetime.now(dt.timezone.utc).isoformat()
+    # 2b. SQLite odds_cache row from today (ET)
     try:
         conn = get_db()
-        conn.execute("DELETE FROM odds_cache")
-        conn.execute(
-            "INSERT INTO odds_cache (cached_at, data) VALUES (?, ?)",
-            (cached_at, json.dumps(new_cache)),
-        )
-        conn.commit()
+        row = conn.execute("SELECT data, cached_at FROM odds_cache LIMIT 1").fetchone()
         conn.close()
+        if row:
+            cached_dt = dt.datetime.fromisoformat(row["cached_at"]).replace(tzinfo=dt.timezone.utc)
+            if cached_dt.astimezone(eastern).date() == today_et:
+                _lines_cache    = json.loads(row["data"])
+                _lines_cache_ts = cached_dt.timestamp()
+                return _lines_cache
     except Exception:
-        pass  # non-fatal: memory cache still works if the write fails
+        pass  # missing table or corrupted row -> manual entry
 
-    _lines_cache    = new_cache
-    _lines_cache_ts = now
-    return _lines_cache
+    # 3. Nothing logged or cached today -> manual entry
+    return {}
 
 
 def get_player_line(player_name: str, stat_type: str) -> tuple[float | None, str | None]:
@@ -874,10 +745,10 @@ def get_player_line(player_name: str, stat_type: str) -> tuple[float | None, str
     or (None, None) if unavailable.
     Uses fuzzy name matching (cutoff 0.85) to handle minor OddsAPI name differences.
 
-    Lines are sourced solely from Underdog Fantasy (_PREFERRED_BOOKS = ["underdog"]),
-    so the returned source is always "underdog". Underdog carries Points, Rebounds,
-    Assists and the combo markets PR/PA/RA/PRA (see _STAT_TYPE_MAP); stat types it does
-    not carry (3PM, Steals, Blocks, Blocks+Steals) map to nothing and return (None, None).
+    Lines come from get_todays_lines(), which makes no OddsAPI calls: today's
+    logged Underdog lines (Points only, from line_logger) or today's cache. Other
+    stat types usually return (None, None), i.e. manual entry. Stat types not in
+    _STAT_TYPE_MAP (3PM, Steals, Blocks, Blocks+Steals) always return (None, None).
     """
     market_key = _STAT_TYPE_MAP.get(stat_type)
     if not market_key:

@@ -7,14 +7,16 @@ One-off manual check for opening night (2026-10-20). Run by hand; nothing schedu
     python opening_day_check.py --no-probe      # never spend the us_dfs probe credit
 
 Checks:
-  1. Does Underdog appear with bookmakers=underdog,fanduel,draftkings?
-  2. Per-call credit cost with three named books (x-requests-last, and the
+  1. Does Underdog return Points lines in player_points_alternate (the only market
+     it uses for them, per the 2026-10-20 probe) with
+     line_logger.BOOKMAKERS (10 named books) and line_logger.MARKETS?
+  2. Per-call credit cost with the named books (x-requests-last, and the
      x-requests-remaining delta as a cross-check).
-  3. If Underdog is missing: one probe call with regions=us_dfs (Points only,
-     ~1 credit) to see whether Underdog shows up there and what that costs, then
+  3. If Underdog is missing: one probe call with regions=us_dfs (same markets,
+     ~2 credits) to see whether Underdog shows up there and what that costs, then
      projects the monthly total for each way of getting Underdog.
 
-Cost: 1 credit for check 1-2, +1 for the probe only when Underdog is missing.
+Cost: CREDITS_PER_PULL (2) for check 1-2, +2 for the probe only when Underdog is missing.
 Every call goes through line_logger, so it is in odds_pull_log and counts
 toward the monthly cap. Rows from check 1 are stored in line_snapshots
 (pull_phase='check').
@@ -34,7 +36,7 @@ LAST_SEASON_GAMES = {"Oct": 80, "Nov": 219, "Dec": 198, "Jan": 233, "Feb": 166,
 
 
 def _books_in_log(row_id: int) -> tuple[str, int, int, int]:
-    conn = sqlite3.connect(L.DB_PATH)
+    conn = sqlite3.connect(L.DB_PATH, timeout=30)
     r = conn.execute(
         "SELECT books_returned, requests_last, remaining_before, remaining_after "
         "FROM odds_pull_log WHERE id = ?", (row_id,)).fetchone()
@@ -43,10 +45,23 @@ def _books_in_log(row_id: int) -> tuple[str, int, int, int]:
 
 
 def _last_log_id() -> int:
-    conn = sqlite3.connect(L.DB_PATH)
+    conn = sqlite3.connect(L.DB_PATH, timeout=30)
     r = conn.execute("SELECT MAX(id) FROM odds_pull_log").fetchone()[0]
     conn.close()
     return r
+
+
+def _snapshot_counts(game_id: str) -> list[tuple[str, str, int]]:
+    """(bookmaker, market_key, rows) for this game's latest 'check' pull in line_snapshots."""
+    conn = sqlite3.connect(L.DB_PATH, timeout=30)
+    rows = conn.execute(
+        "SELECT bookmaker, market_key, COUNT(*) FROM line_snapshots "
+        "WHERE game_id = ? AND pull_phase = 'check' AND captured_at = "
+        "(SELECT MAX(captured_at) FROM line_snapshots WHERE game_id = ? AND pull_phase = 'check') "
+        "GROUP BY bookmaker, market_key ORDER BY bookmaker, market_key",
+        (game_id, game_id)).fetchall()
+    conn.close()
+    return rows
 
 
 def _projection(credits_per_pull: int) -> str:
@@ -84,29 +99,38 @@ def main() -> None:
           f"id={event['id']}")
     print(f"x-requests-remaining before: {remaining}\n")
 
-    # ---- Check 1 + 2: three named books, one call
+    # ---- Check 1 + 2: named books (line_logger.BOOKMAKERS), one call
     rows, _ = L.pull_event(event, "check", remaining)
     books, last, before, after = _books_in_log(_last_log_id())
     books_set = set((books or "").split(",")) - {""}
     delta = (before - after) if before is not None and after is not None else None
-    print(f"\n[1] books returned: {sorted(books_set) or 'none'}")
-    print(f"    Underdog present: {'YES' if 'underdog' in books_set else 'NO'}")
-    print(f"[2] credit cost, bookmakers=underdog,fanduel,draftkings: "
+    counts = _snapshot_counts(event["id"])
+    ud_alt = sum(n for b, m, n in counts if b == "underdog" and m == L.UNDERDOG_POINTS_MARKET)
+    print(f"\n[1] books returned: {sorted(books_set) or 'none'}   markets={L.MARKETS}")
+    for b, m, n in counts:
+        print(f"    {b:<11} {m:<25} {n} rows")
+    print(f"    Underdog {L.UNDERDOG_POINTS_MARKET} rows: {ud_alt} "
+          f"({'YES' if ud_alt else 'NO'})")
+    print(f"[2] credit cost, {len(L.BOOKMAKERS.split(','))} named books: "
           f"x-requests-last={last}, remaining delta={delta}")
-    if last is not None and last != 1:
-        print(f"    !! expected 1 credit per call; got {last}. Projection below uses {last}.")
-    print(f"    projected (2 pulls/game x {last or 1} credit): {_projection(last or 1)}")
+    if last is not None and last != L.CREDITS_PER_PULL:
+        print(f"    !! expected {L.CREDITS_PER_PULL} credits per call; got {last}. "
+              f"Projection below uses {last}.")
+    per_pull = last or L.CREDITS_PER_PULL
+    print(f"    projected ({L.SCHEDULED_PULLS_PER_GAME} pull(s)/game x {per_pull} credits): "
+          f"{_projection(per_pull)}")
 
-    if "underdog" in books_set:
-        print("\nPASS: Underdog is in the three-book call. No change needed.")
+    if ud_alt:
+        print(f"\nPASS: Underdog Points lines are in {L.UNDERDOG_POINTS_MARKET} in the "
+              "named-book call. No change needed.")
         return
 
     # ---- Check 3: Underdog missing -> what would us_dfs cost?
-    print("\n[3] Underdog missing from the three-book call.")
+    print("\n[3] Underdog missing from the named-book call.")
     if args.no_probe:
-        print("    --no-probe: skipping the live us_dfs call. Documented cost is "
-              "1 market x 1 region = 1 credit per call.")
-        dfs_cost, ud_in_dfs = 1, None
+        print(f"    --no-probe: skipping the live us_dfs call. Documented cost is "
+              f"{L.CREDITS_PER_PULL} markets x 1 region = {L.CREDITS_PER_PULL} credits per call.")
+        dfs_cost, ud_in_dfs = L.CREDITS_PER_PULL, None
     else:
         _, rem = L.fetch_events(phase="check")
         resp = httpx.get(
@@ -115,12 +139,16 @@ def main() -> None:
                     "markets": L.MARKETS, "oddsFormat": "american"},
             timeout=15,
         )
-        dfs_books = sorted(b["key"] for b in resp.json().get("bookmakers", [])) \
-            if resp.status_code == 200 else []
+        dfs_data = resp.json() if resp.status_code == 200 else {}
+        dfs_books = sorted(b["key"] for b in dfs_data.get("bookmakers", []))
         dfs_cost, _ = L.record_call(resp, endpoint="event_odds", phase="check",
                                     remaining_before=rem, game_id=event["id"],
-                                    books=",".join(dfs_books), note="regions=us_dfs probe")
-        ud_in_dfs = "underdog" in dfs_books
+                                    books=",".join(dfs_books), note="regions=us_dfs probe",
+                                    expected_cost=L.CREDITS_PER_PULL)
+        ud_book = next((b for b in dfs_data.get("bookmakers", []) if b["key"] == "underdog"), None)
+        ud_markets = [m["key"] for m in ud_book.get("markets", [])] if ud_book else []
+        print(f"    underdog markets under us_dfs: {ud_markets or 'none'}")
+        ud_in_dfs = L.UNDERDOG_POINTS_MARKET in ud_markets
         print(f"    regions=us_dfs probe: HTTP {resp.status_code}, books={dfs_books}, "
               f"cost={dfs_cost} credit(s)")
         print(f"    Underdog present under us_dfs: {'YES' if ud_in_dfs else 'NO'}")
@@ -129,13 +157,14 @@ def main() -> None:
         print("\n    Underdog is absent under us_dfs too, so it has most likely not posted "
               "Points for this game yet. Re-run closer to tip before changing anything.")
 
-    three = last or 1
-    print("\n    Options to get Underdog, projected monthly (2 pulls/game):")
-    print(f"    a) keep three-book call, no Underdog  ({three}/pull):  {_projection(three)}")
-    print(f"    b) three-book call + separate us_dfs call ({three}+{dfs_cost}/pull): "
+    three = last or L.CREDITS_PER_PULL
+    print(f"\n    Options to get Underdog, projected monthly "
+          f"({L.SCHEDULED_PULLS_PER_GAME} pull(s)/game):")
+    print(f"    a) keep named-book call, no Underdog  ({three}/pull):  {_projection(three)}")
+    print(f"    b) named-book call + separate us_dfs call ({three}+{dfs_cost}/pull): "
           f"{_projection(three + dfs_cost)}")
-    print(f"    c) regions=us,us_dfs in one call (~2 regions x 1 market = 2/pull): "
-          f"{_projection(2)}")
+    print(f"    c) regions=us,us_dfs in one call (~2 regions x {L.CREDITS_PER_PULL} markets = "
+          f"{2 * L.CREDITS_PER_PULL}/pull): {_projection(2 * L.CREDITS_PER_PULL)}")
     _print_fallback(three, dfs_cost)
     print("\nNo code was changed. Decide which option to adopt before the next scheduled pull.")
 
@@ -143,11 +172,14 @@ def main() -> None:
 def _print_fallback(three: int, dfs: int) -> None:
     """Which schedule still fits the cap if Underdog needs its own call."""
     peak_games = max(LAST_SEASON_GAMES.values())
-    configs = [  # (label, credits per game), most Underdog coverage first
-        ("both calls at open + pretip", 2 * (three + dfs)),
-        ("three-book at open + pretip, Underdog call at pretip only", 2 * three + dfs),
-        ("both calls at pretip only (no open pull; loses line movement)", three + dfs),
-    ]
+    if L.OPEN_PULL_ENABLED:
+        configs = [  # (label, credits per game), most Underdog coverage first
+            ("both calls at open + pretip", 2 * (three + dfs)),
+            ("named-book call at open + pretip, Underdog call at pretip only", 2 * three + dfs),
+            ("both calls at pretip only (no open pull; loses line movement)", three + dfs),
+        ]
+    else:
+        configs = [("both calls at pretip (open pull is off)", three + dfs)]
     print("\n    FALLBACK if Underdog requires its own call "
           f"(peak month = {peak_games} games, cap {L.MONTHLY_CREDIT_CAP}):")
     chosen = None
@@ -163,8 +195,9 @@ def _print_fallback(three: int, dfs: int) -> None:
     if chosen:
         print(f"    -> You would need: {chosen}.")
     else:
-        print(f"    -> Nothing with Underdog fits; keep the three-book call without Underdog "
-              f"({2 * three}/game, peak {peak_games * 2 * three}).")
+        print(f"    -> Nothing with Underdog fits; keep the named-book call without Underdog "
+              f"({L.SCHEDULED_PULLS_PER_GAME * three}/game, "
+              f"peak {peak_games * L.SCHEDULED_PULLS_PER_GAME * three}).")
 
 
 if __name__ == "__main__":
