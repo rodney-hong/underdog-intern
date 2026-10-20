@@ -4,28 +4,32 @@ Forward line logging for market-structure tests A/B/D
 (see experiments/logging_plan.md). Paper mode only: this module records lines,
 it never feeds predictions, models or slips.
 
-Scope: NBA Points only, 10 named bookmakers (BOOKMAKERS) in ONE call per
-event, markets=player_points,player_points_alternate (2 credits). Underdog's
-Points lines arrive ONLY in player_points_alternate (probe 2026-10-20,
-experiments/probe_20261020T014326Z.json); FanDuel/DraftKings appear in both, with
-full alternate ladders. Stores every outcome, both sides, with price, under its
-real market key. Keyed so it never overwrites or merges rows:
+Scope: NBA Points, Rebounds, Assists and 3PM (STAT_MARKETS: each stat's main and
+_alternate market, 8 markets), 10 named bookmakers (BOOKMAKERS) in ONE call per
+event (CREDITS_PER_PULL = 8 at most; OddsAPI bills only the markets returned).
+Underdog's lines arrive mostly in the _alternate markets (Points: probe 2026-10-20,
+experiments/probe_20261020T014326Z.json) and sometimes in the main market;
+FanDuel/DraftKings appear in both, with full alternate ladders. Stores every
+outcome, both sides, with price, under its real market key. Keyed so it never
+overwrites or merges rows:
     (game_id, player_name, market_key, bookmaker, side, point, outcome_index, captured_at)
 outcome_index is the outcome's position in its market: FanDuel's alternate market
 repeats (player, side, point) at different prices, so point alone is not unique.
 
-Schedule (one pull per game):
+Schedule (two pulls per game):
+    open    — OPEN_PULL_HOUR_ET (10:00 ET), every not-yet-started game on today's
+              slate. ON by default (LINE_LOG_OPEN_PULL_ENABLED=0 turns it off).
+              After a restart, caught up only until OPEN_CATCHUP_HOURS past 10:00.
     pretip  — PRETIP_MINUTES (30) before each game's commence_time, catching the
               official injury report's late updates; one retry PRETIP_RETRY_MINUTES
-              later if the call itself fails (not if it was refused by the cap)
-    open    — OFF by default (LINE_LOG_OPEN_PULL_ENABLED=1 restores it). With it
-              off, a free events-only job at SCHEDULE_HOUR_ET (06:00, and on startup)
-              schedules the day's pre-tip pulls without spending credits; if that
-              events call fails it retries every 20 min until the last tip-off.
+              later if the call itself fails (not if it was refused by the cap).
+              Scheduled by a free events-only job at SCHEDULE_HOUR_ET (06:00, and on
+              startup) whether or not the open pull is on; if that events call fails
+              it retries every 20 min until the last tip-off.
 
 Every pull is recorded in odds_pull_log with x-requests-remaining before and
 after. A monthly credit cap (ODDS_MONTHLY_CREDIT_CAP, default 500) is enforced
-before every pull from that log.
+before every pull from that log; set it in .env to the plan's monthly credits.
 
 CLI:
     python line_logger.py --pull-now     # one open-phase pull of today's slate
@@ -49,23 +53,36 @@ ODDS_API_KEY = os.getenv("ODDS_API_KEY", "")
 EVENTS_URL   = "https://api.the-odds-api.com/v4/sports/basketball_nba/events"
 EVENT_ODDS_URL = "https://api.the-odds-api.com/v4/sports/basketball_nba/events/{event_id}/odds"
 
-MARKETS    = "player_points,player_points_alternate"
+# stat_type -> (main market, alternate market). Keys to be confirmed with
+# experiments/market_keys_probe.py (one event-markets call, 1 credit).
+STAT_MARKETS = {
+    "Points":   ("player_points",   "player_points_alternate"),
+    "Rebounds": ("player_rebounds", "player_rebounds_alternate"),
+    "Assists":  ("player_assists",  "player_assists_alternate"),
+    "3PM":      ("player_threes",   "player_threes_alternate"),
+}
+MARKETS = ",".join(k for keys in STAT_MARKETS.values() for k in keys)
 # Exactly 10 named books: up to 10 count as one region-equivalent, so cost stays
 # CREDITS_PER_PULL. underdog/fanduel/draftkings feed paper_predictions and H2; the
 # other seven are logged for exploratory use only.
 BOOKMAKERS = ("underdog,fanduel,draftkings,prizepicks,novig,prophetx,kalshi,"
               "betmgm,espnbet,betrivers")
 UNDERDOG_POINTS_MARKET = "player_points_alternate"  # where most Underdog Points lines come in
-# ...but some arrive in player_points (opening-day check pull, 2026-10-20): read both.
-UNDERDOG_POINTS_MARKETS = ("player_points", "player_points_alternate")
+# ...but some arrive in player_points (opening-day check pull, 2026-10-20): read both,
+# and likewise both markets of every stat.
+UNDERDOG_POINTS_MARKETS = STAT_MARKETS["Points"]
+UNDERDOG_MARKETS = tuple(k for keys in STAT_MARKETS.values() for k in keys)
+MARKET_STAT = {k: stat for stat, keys in STAT_MARKETS.items() for k in keys}
 
-# OddsAPI cost per event-odds call = markets x region-equivalents; up to 10 named
-# bookmakers count as one region-equivalent.
+# OddsAPI cost per event-odds call = markets returned x region-equivalents; up to 10
+# named bookmakers count as one region-equivalent. Budgeted at the maximum: every
+# requested market returned.
 CREDITS_PER_PULL = len(MARKETS.split(","))
 
 MONTHLY_CREDIT_CAP = int(os.getenv("ODDS_MONTHLY_CREDIT_CAP", "500"))
-OPEN_PULL_ENABLED  = os.getenv("LINE_LOG_OPEN_PULL_ENABLED", "0") == "1"
+OPEN_PULL_ENABLED  = os.getenv("LINE_LOG_OPEN_PULL_ENABLED", "1") == "1"
 OPEN_PULL_HOUR_ET  = int(os.getenv("LINE_LOG_OPEN_HOUR_ET", "10"))
+OPEN_CATCHUP_HOURS = 3   # restart catch-up window for the open pull (= its misfire grace)
 SCHEDULE_HOUR_ET   = int(os.getenv("LINE_LOG_SCHEDULE_HOUR_ET", "6"))  # free pre-tip scheduling job
 EVENTS_RETRY_MINUTES = 20  # retry a FAILED scheduling events call until today's last tip-off
 MAINTENANCE_HOUR_ET  = 7   # backup -> ETL -> resolve (run_morning_maintenance)
@@ -103,7 +120,7 @@ _LINE_SNAPSHOTS_DDL = """
             home_team        TEXT,
             away_team        TEXT,
             player_name      TEXT NOT NULL,
-            market_key       TEXT NOT NULL,   -- player_points / player_points_alternate
+            market_key       TEXT NOT NULL,   -- a STAT_MARKETS key, e.g. player_rebounds_alternate
             bookmaker        TEXT NOT NULL,
             side             TEXT NOT NULL,   -- 'Over' / 'Under'
             point            REAL,
@@ -354,37 +371,39 @@ def check_unscheduled_spend(cost: int, all_events: list[dict] | None) -> tuple[b
 
 def todays_underdog_lines(game_date: str) -> dict:
     """
-    Latest logged Underdog Points line per player for game_date (ET), in the
+    Latest logged Underdog line per player and stat for game_date (ET), in the
     shape data_fetcher.get_todays_lines() returns. Read-only; no API call.
-    Underdog's Points lines are stored under player_points_alternate and
-    player_points (UNDERDOG_POINTS_MARKETS); both are read and returned under
-    "player_points", the key the slip path looks up. A player with more than one
-    distinct Underdog point across the two markets in his latest pull is left out
-    rather than guessed.
+    Each stat's Underdog lines are stored under its main and _alternate market
+    (STAT_MARKETS); both are read and returned under the main key
+    (player_points, player_rebounds, player_assists, player_threes), the keys the
+    slip path looks up. A player/stat with more than one distinct Underdog point
+    across the two markets in its latest pull is left out rather than guessed.
     """
+    qs = ", ".join("?" * len(UNDERDOG_MARKETS))
     conn = get_db()
-    rows = conn.execute("""
-        SELECT s.player_name, s.point, s.game_id, s.home_team, s.away_team
-        FROM line_snapshots s
-        JOIN (SELECT player_name, MAX(captured_at) AS cap
-              FROM line_snapshots
-              WHERE game_date = ? AND bookmaker = 'underdog' AND market_key IN (?, ?)
-              GROUP BY player_name) m
-          ON s.player_name = m.player_name AND s.captured_at = m.cap
-        WHERE s.game_date = ? AND s.bookmaker = 'underdog' AND s.market_key IN (?, ?)
-    """, (game_date, *UNDERDOG_POINTS_MARKETS, game_date, *UNDERDOG_POINTS_MARKETS)).fetchall()
+    rows = conn.execute(f"""
+        SELECT player_name, market_key, point, captured_at, game_id, home_team, away_team
+        FROM line_snapshots
+        WHERE game_date = ? AND bookmaker = 'underdog' AND market_key IN ({qs})
+    """, (game_date, *UNDERDOG_MARKETS)).fetchall()
     conn.close()
-    points: dict = {}
+    latest: dict = {}  # (player, stat) -> (captured_at, rows of that pull)
     for r in rows:
-        points.setdefault(r["player_name"], {"rows": r, "pts": set()})["pts"].add(r["point"])
+        key = (r["player_name"], MARKET_STAT[r["market_key"]])
+        cap, group = latest.get(key, (None, []))
+        if cap is None or r["captured_at"] > cap:
+            latest[key] = (r["captured_at"], [r])
+        elif r["captured_at"] == cap:
+            group.append(r)
     lines: dict = {}
-    for player, v in points.items():
-        if len(v["pts"]) != 1:
+    for (player, stat), (_, group) in sorted(latest.items()):
+        pts = {r["point"] for r in group}
+        if len(pts) != 1:
             continue
-        r = v["rows"]
-        lines[player] = {"game_id": r["game_id"], "home_team": r["home_team"],
-                         "away_team": r["away_team"],
-                         "player_points": {"value": next(iter(v["pts"])), "source": "underdog"}}
+        r = group[0]
+        entry = lines.setdefault(player, {"game_id": r["game_id"], "home_team": r["home_team"],
+                                          "away_team": r["away_team"]})
+        entry[STAT_MARKETS[stat][0]] = {"value": next(iter(pts)), "source": "underdog"}
     return lines
 
 
@@ -478,7 +497,7 @@ def parse_event_odds(event: dict, data: dict, captured_at: str, phase: str) -> l
 def pull_event(event: dict, phase: str, remaining_before: int | None,
                note: str | None = None) -> tuple[int, int | None]:
     """
-    One OddsAPI call for one event: Points (main + alternate), all three books.
+    One OddsAPI call for one event: MARKETS (4 stats, main + alternate), BOOKMAKERS.
     Stores every outcome. Returns (rows_inserted, x-requests-remaining after the call).
     Enforces the hard monthly credit cap before calling; the reserve rule for
     unscheduled pulls is applied by the caller (try_event_pull).
@@ -488,7 +507,7 @@ def pull_event(event: dict, phase: str, remaining_before: int | None,
     game_date = commence.astimezone(EASTERN).date().isoformat()
 
     used = credits_used_this_month()
-    # Expected cost is CREDITS_PER_PULL (2 markets x 1 region-equivalent); refuse if
+    # Maximum cost is CREDITS_PER_PULL (8 markets x 1 region-equivalent); refuse if
     # that would breach the cap.
     if used + CREDITS_PER_PULL > MONTHLY_CREDIT_CAP:
         log_skip(endpoint="event_odds", phase=phase, game_id=game_id, game_date=game_date,
@@ -539,20 +558,23 @@ def pull_event(event: dict, phase: str, remaining_before: int | None,
     conn.close()
 
     books = ",".join(sorted(b["key"] for b in data.get("bookmakers", [])))
-    ud_rows = sum(1 for r in rows if r[7] == "underdog" and r[6] in UNDERDOG_POINTS_MARKETS)
-    if ud_rows == 0:
-        print(f"[line_logger] {game_id}: no Underdog Points rows ({', '.join(UNDERDOG_POINTS_MARKETS)}) "
-              f"in this pull")
+    ud_stats = {MARKET_STAT[r[6]] for r in rows if r[7] == "underdog" and r[6] in MARKET_STAT}
+    missing = [stat for stat in STAT_MARKETS if stat not in ud_stats]
+    if missing:
+        print(f"[line_logger] {game_id}: no Underdog rows for {', '.join(missing)} in this pull")
     credits, remaining_after = record_call(
         resp, endpoint="event_odds", phase=phase, remaining_before=remaining_before,
         game_id=game_id, game_date=game_date, rows=inserted, books=books, note=note,
         expected_cost=CREDITS_PER_PULL)
+    # OddsAPI bills only the markets returned, so a cost below CREDITS_PER_PULL is
+    # normal (e.g. no alternate ladder posted yet). Only a HIGHER cost breaks the budget.
     last = _int_header(resp, "x-requests-last")
-    if last != CREDITS_PER_PULL:
+    if last is not None and last > CREDITS_PER_PULL:
         print("!" * 78)
-        print(f"[line_logger] WARNING {game_id}: x-requests-last={last}, expected "
-              f"{CREDITS_PER_PULL} for markets={MARKETS} with {len(BOOKMAKERS.split(','))} "
-              f"named books. Credit projection and reserve assume {CREDITS_PER_PULL}/pull.")
+        print(f"[line_logger] WARNING {game_id}: x-requests-last={last}, above the expected "
+              f"maximum {CREDITS_PER_PULL} for {CREDITS_PER_PULL} markets with "
+              f"{len(BOOKMAKERS.split(','))} named books. Credit projection and reserve "
+              f"assume at most {CREDITS_PER_PULL}/pull.")
         print("!" * 78)
     print(f"[line_logger] {phase} {event.get('away_team')} @ {event.get('home_team')}: "
           f"{inserted} rows, books=[{books}], credits={credits}, "
@@ -565,7 +587,11 @@ def pull_event(event: dict, phase: str, remaining_before: int | None,
 # ---------------------------------------------------------------------------
 
 def run_open_pull(phase: str = "open", scheduler=None) -> int:
-    """Pull every not-yet-started game on today's slate once; schedule pre-tip pulls."""
+    """
+    Pull every not-yet-started game on today's slate once. Also (re)schedules each
+    game's pre-tip pull; schedule_todays_pretips does that too, independently, so
+    pre-tip pulls never depend on this job succeeding.
+    """
     init_tables()
     events, remaining = fetch_todays_events()
     now = dt.datetime.now(dt.timezone.utc)
@@ -575,12 +601,12 @@ def run_open_pull(phase: str = "open", scheduler=None) -> int:
         game_date = commence.astimezone(EASTERN).date().isoformat()
         if commence <= now:
             continue  # started — lines are live/pulled, no longer pre-game
+        if scheduler is not None:
+            _schedule_pretip(scheduler, event)  # same job id: idempotent
         if phase == "open" and _already_pulled(event["id"], "open", game_date):
             continue
         n, remaining = pull_event(event, phase, remaining)
         total += n
-        if scheduler is not None:
-            _schedule_pretip(scheduler, event)
     if not events:
         print("[line_logger] no NBA events on today's ET slate")
     return total
@@ -629,7 +655,7 @@ def _retry_scheduling(scheduler, now: dt.datetime) -> None:
 
 def schedule_todays_pretips(scheduler=None) -> int:
     """
-    Free (events-only) daily job used when the open pull is off: schedule a
+    Free (events-only) daily job, run whether or not the open pull is on: schedule a
     pre-tip pull for every not-yet-started game on today's ET slate. Spends no
     credits. Returns the number of games scheduled, or -1 if the events call
     failed (logged in odds_pull_log by fetch_events; retried every
@@ -869,6 +895,8 @@ def run_morning_maintenance(scheduler=None) -> dict:
     """
     Daily at MAINTENANCE_HOUR_ET:
       1. back up predictions.db (abort the whole job if that fails);
+      1b. refresh ESPN rosters (rosters.refresh_rosters; a failure is logged and the
+         job continues: player teams then fall back to box scores once rows age out);
       2. run database.run_etl(), unless a pre-tip pull is scheduled within
          ETL_PRETIP_GUARD_MINUTES (the ETL replaces player_stats/players/schedule
          in place, and a pre-tip paper prediction would read the partial tables).
@@ -887,6 +915,14 @@ def run_morning_maintenance(scheduler=None) -> dict:
         out["backup"] = f"FAILED: {exc!r}"
         print(f"[maintenance] 1/3 backup FAILED: {exc!r}. Aborting: no ETL, no resolve.")
         return out
+
+    try:
+        import rosters
+        out["rosters"] = rosters.refresh_rosters()
+        print(f"[maintenance] rosters refreshed: {out['rosters']}")
+    except Exception as exc:
+        out["rosters"] = f"FAILED: {exc!r}"
+        print(f"[maintenance] rosters refresh FAILED: {exc!r} (continuing)")
 
     due = _pretips_due_within(scheduler, ETL_PRETIP_GUARD_MINUTES)
     if due:
@@ -945,30 +981,30 @@ def start_scheduler():
     from apscheduler.schedulers.background import BackgroundScheduler
 
     sched = BackgroundScheduler(timezone=EASTERN)
+    # Pre-tip pulls are always scheduled by a free daily events call, independent of
+    # the open pull (which also schedules them, under the same job ids).
+    sched.add_job(
+        schedule_todays_pretips, "cron", hour=SCHEDULE_HOUR_ET, minute=0,
+        kwargs={"scheduler": sched},
+        id="line_pretip_scheduler", replace_existing=True, misfire_grace_time=3 * 3600,
+        coalesce=True,
+    )
+    # Restart catch-up, any hour: today's pre-tip jobs live only in memory.
+    # run_pretip_pull skips games already pulled, so this never double-spends.
+    sched.add_job(schedule_todays_pretips, kwargs={"scheduler": sched},
+                  id="line_pretip_scheduler_catchup", replace_existing=True)
     if OPEN_PULL_ENABLED:
         sched.add_job(
             run_open_pull, "cron", hour=OPEN_PULL_HOUR_ET, minute=0,
             kwargs={"phase": "open", "scheduler": sched},
-            id="line_open_pull", replace_existing=True, misfire_grace_time=3 * 3600,
-            coalesce=True,
+            id="line_open_pull", replace_existing=True,
+            misfire_grace_time=OPEN_CATCHUP_HOURS * 3600, coalesce=True,
         )
-        # Restart catch-up: if we're past the open time today, run now. The pull log
-        # makes this a no-op for games already pulled.
-        if dt.datetime.now(EASTERN).hour >= OPEN_PULL_HOUR_ET:
+        # Restart catch-up, only within the misfire window: a later "open" pull would
+        # not be a morning snapshot. The pull log makes this a no-op for games pulled.
+        if OPEN_PULL_HOUR_ET <= dt.datetime.now(EASTERN).hour < OPEN_PULL_HOUR_ET + OPEN_CATCHUP_HOURS:
             sched.add_job(run_open_pull, kwargs={"phase": "open", "scheduler": sched},
                           id="line_open_catchup", replace_existing=True)
-    else:
-        # No open pull: a free daily events call schedules the pre-tip pulls.
-        sched.add_job(
-            schedule_todays_pretips, "cron", hour=SCHEDULE_HOUR_ET, minute=0,
-            kwargs={"scheduler": sched},
-            id="line_pretip_scheduler", replace_existing=True, misfire_grace_time=3 * 3600,
-            coalesce=True,
-        )
-        # Restart catch-up, any hour: today's pre-tip jobs live only in memory.
-        # run_pretip_pull skips games already pulled, so this never double-spends.
-        sched.add_job(schedule_todays_pretips, kwargs={"scheduler": sched},
-                      id="line_pretip_scheduler_catchup", replace_existing=True)
     # Morning maintenance (backup -> ETL unless a pre-tip pull is near -> resolve).
     sched.add_job(
         run_morning_maintenance, "cron", hour=MAINTENANCE_HOUR_ET, minute=0,
@@ -978,10 +1014,46 @@ def start_scheduler():
     )
     sched.start()
     _scheduler = sched
-    print(f"[line_logger] scheduler started: open pull {'ON ' + str(OPEN_PULL_HOUR_ET) + ':00 ET' if OPEN_PULL_ENABLED else 'OFF; pre-tip scheduling ' + str(SCHEDULE_HOUR_ET) + ':00 ET'}, "
-          f"pretip T-{PRETIP_MINUTES}m, markets={MARKETS} ({CREDITS_PER_PULL} credits/pull), "
+    print(f"[line_logger] scheduler started: open pull {'ON ' + str(OPEN_PULL_HOUR_ET) + ':00 ET' if OPEN_PULL_ENABLED else 'OFF'}, "
+          f"pre-tip scheduling {SCHEDULE_HOUR_ET}:00 ET, "
+          f"pretip T-{PRETIP_MINUTES}m, markets={MARKETS} (max {CREDITS_PER_PULL} credits/pull), "
           f"cap {MONTHLY_CREDIT_CAP}/month, maintenance {MAINTENANCE_HOUR_ET}:00 ET")
+    _warn_if_cap_too_low()
     return sched
+
+
+def monthly_projection() -> dict:
+    """
+    Scheduled credits per month at the maximum cost, from the `schedule` table
+    (games per month, same game types as _last_season_daily_rate). No API call.
+    {"YYYY-MM": (games, credits)}
+    """
+    conn = get_db()
+    try:
+        rows = conn.execute("""
+            SELECT substr(gameDateTimeEst,1,7), COUNT(*) FROM schedule
+            WHERE substr(printf('%010d', gameId), 3, 1) IN ('2','4','5','6')
+            GROUP BY 1 ORDER BY 1""").fetchall()
+    except sqlite3.Error:
+        rows = []
+    finally:
+        conn.close()
+    per_game = SCHEDULED_PULLS_PER_GAME * CREDITS_PER_PULL
+    return {m: (n, n * per_game) for m, n in rows}
+
+
+def _warn_if_cap_too_low() -> None:
+    proj = monthly_projection()
+    if not proj:
+        return
+    month, (games, credits) = max(proj.items(), key=lambda kv: kv[1][1])
+    if credits > MONTHLY_CREDIT_CAP:
+        print("!" * 78)
+        print(f"[line_logger] WARNING: peak month {month} projects {credits} credits "
+              f"({games} games x {SCHEDULED_PULLS_PER_GAME} pulls x {CREDITS_PER_PULL}) "
+              f"but ODDS_MONTHLY_CREDIT_CAP is {MONTHLY_CREDIT_CAP}. Pulls will be refused "
+              f"once the cap is reached; set ODDS_MONTHLY_CREDIT_CAP in .env.")
+        print("!" * 78)
 
 
 def stop_scheduler() -> None:
@@ -1016,6 +1088,9 @@ def _status() -> None:
     print(f"reserve: {snap['reserve']} credits for {snap['total_pulls']:.1f} remaining scheduled "
           f"pulls (+{RESERVE_BUFFER:.0%}); available {snap['available']}; "
           f"spendable on unscheduled pulls: {snap['spendable']}")
+    print(f"projection ({SCHEDULED_PULLS_PER_GAME} pulls/game x max {CREDITS_PER_PULL} credits):")
+    for m, (games, credits) in monthly_projection().items():
+        print(f"  {m}: {games} games -> {credits} credits")
 
 
 if __name__ == "__main__":

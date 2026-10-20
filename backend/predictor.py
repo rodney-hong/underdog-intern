@@ -285,6 +285,11 @@ def _compute_ml_features(
     # returned as a directional signal (+ve favours the current venue).
     home_away_split = _get_home_away_split(player_name, stat_type, is_home)
 
+    # Not model inputs (FEATURE_COLS selects the 14): the explanation text reads these
+    # so it describes the same games the features were computed from.
+    last10 = stat_values.head(10)
+    line_hits_last10 = int((last10 > stat_line).sum())
+
     return {
         "avg_pts_last5":        avg5,
         "avg_pts_last10":       avg10,
@@ -301,6 +306,8 @@ def _compute_ml_features(
         "fatigue_score":        fatigue_score,
         "home_away_split":      home_away_split,
         "opp_game_count":       opp_game_count,
+        "line_hits_last10":     line_hits_last10,
+        "games_last10":         len(last10),
     }
 
 
@@ -330,6 +337,7 @@ def compute_features(
     avg10 = float(last10.mean()) if len(last10) > 0 else 0.0
 
     # Hit rate: % of all games in the window where stat exceeded the prop line
+    # (heuristic score input; the explanation uses line_hits_last10 instead)
     hit_rate = float((stat_values > stat_line).mean()) if len(stat_values) > 0 else 0.5
 
     trend = avg5 - avg10
@@ -363,6 +371,8 @@ def compute_features(
         "injury_note":   injury_note,
         "stat_line":     stat_line,
         "games_played":  len(df),
+        "line_hits_last10": int((last10 > stat_line).sum()),
+        "games_last10":     len(last10),
     }
 
 
@@ -371,6 +381,7 @@ def _empty_features(stat_line: float) -> dict:
         "avg5": 0.0, "avg10": 0.0, "hit_rate": 0.5, "trend": 0.0,
         "is_home": False, "avg_vs_opp": 0.0, "opp_sample": 0,
         "b2b": False, "injury_note": "", "stat_line": stat_line, "games_played": 0,
+        "line_hits_last10": 0, "games_last10": 0,
     }
 
 
@@ -438,9 +449,9 @@ def build_explanation(
         f"and {features['avg10']:.1f} over the last 10 games."
     )
 
-    hit_pct = int(features["hit_rate"] * 10)
     parts.append(
-        f"{first_name} has exceeded the {stat_line} line in {hit_pct} of the last 10 games."
+        f"{first_name} has exceeded the {stat_line} line in {features['line_hits_last10']} "
+        f"of the last {features['games_last10']} games."
     )
 
     if features.get("opp_game_count", 0) > 0:
@@ -520,6 +531,16 @@ def predict(
             p_over = float(proba[1])
             outcome    = "OVER" if p_over > 0.5 else "UNDER"
             confidence = round(float(max(proba)), 4)
+            # Explanation numbers come from the model's own features (same games,
+            # same vs-opponent definition), not from compute_features.
+            features = {**features,
+                        "avg5":             ml_feats["avg_pts_last5"],
+                        "avg10":            ml_feats["avg_pts_last10"],
+                        "trend":            ml_feats["trend"],
+                        "avg_vs_opp":       ml_feats["vs_opponent_avg"],
+                        "opp_game_count":   ml_feats["opp_game_count"],
+                        "line_hits_last10": ml_feats["line_hits_last10"],
+                        "games_last10":     ml_feats["games_last10"]}
         else:
             use_ml = False  # not enough games — fall through to heuristic
 
@@ -688,6 +709,8 @@ def compute_wnba_features(
         "injury_note":    injury_note,
         "stat_line":      stat_line,
         "games_played":   len(df),
+        "line_hits_last10": int((last10 > stat_line).sum()),
+        "games_last10":     len(last10),
     }
 
 

@@ -61,6 +61,10 @@ def startup_event():
     # block on writers (ETL, scheduler, news poller, API). Persistent once set.
     _startup_step("database.enable_wal", database.enable_wal)
 
+    # Current rosters (ESPN, free) before anything schedules a paper prediction:
+    # player teams come from them, falling back to box scores.
+    _startup_step("rosters.refresh", importlib.import_module("rosters").refresh_rosters)
+
     # Collection first, each guarded separately so one can't block the other.
     # Paper-mode line logging (Points, UD/FD/DK); it never touches predictions.
     _startup_step("line_logger.start_scheduler", line_logger.start_scheduler)

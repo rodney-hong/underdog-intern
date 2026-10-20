@@ -481,3 +481,105 @@ No 2026-10-20 result had been seen when this entry was written.
 - If the same point appears in both markets with different prices for a side, that side's Underdog price is recorded as NULL.
 
 Recorded before any 2026-10-20 result was seen: paper_predictions had 0 rows.
+
+---
+
+## Entry: four-stat logging and the 10:00 pull restored (drafted 2026-10-20)
+
+Four-stat logging began with the 10:00 ET open pulls, caught up at 11:25 ET on 2026-10-20, before this entry was committed and before any 2026-27 result existed. paper_predictions had 0 rows when four-stat logging began. Earlier sections are unchanged.
+
+### Scope change
+
+- The OddsAPI plan is now 20,000 credits per month. ODDS_MONTHLY_CREDIT_CAP = 18000.
+- line_logger requests 8 markets in its one call per event, with the same 10 named bookmakers: player_points, player_rebounds, player_assists, player_threes and the _alternate version of each.
+  - Keys confirmed by one event-markets call (experiments/market_keys_probe.py, 2026-10-20T15:26Z, game 26b036ff107f3c658258eaf4a6f26228, Boston Celtics @ Detroit Pistons; raw response experiments/probe_markets_20261020T152625Z.json):
+    - underdog listed all 8 keys except player_assists: its Assists lines are only in player_assists_alternate.
+    - fanduel and draftkings listed all 8 keys.
+  - OddsAPI bills only the markets returned, so a pull costs at most 8 credits. A pull whose x-requests-last is above 8 prints a warning.
+- Projection at the maximum cost, 2 pulls per game x 8 credits = 16 credits per game:
+  - peak month January 2027: 236 games, 3,776 credits;
+  - the 1,200 regular-season games in `schedule`: 19,200 credits over the season.
+- paper_predictions logs one row per Underdog line per stat (Points, Rebounds, Assists, 3PM), each with that stat's frozen model from "Frozen 2026-27 NBA model". Each row records the model file's SHA-256 and whether it matches the hash recorded there.
+- Each stat uses the same line rules as Points:
+  - the Underdog line comes from the stat's main and _alternate markets;
+  - more than one distinct Underdog point in a pull means the row gets no line and no prediction;
+  - a side priced differently in the two markets gets a NULL price;
+  - fd_* and dk_* use the stat's main market.
+- Rows are resolved against the stat's own box-score column (points, reboundsTotal, assists, threePointersMade) in a new column, actual_value. actual_points is still filled for Points rows.
+- The paper_predictions unique key was (game_id, player_name, captured_at). Under that key, every stat after the first for a player in a pull would have been silently dropped. The key is now (game_id, player_name, stat_type, captured_at).
+  - The table was copied to a new table in one transaction, and row counts were checked before commit. It held 0 rows at the time.
+  - The old table is kept as paper_predictions_pre_stat_key.
+- The slip fallback serves logged Underdog lines for all four stats. This does not affect any test.
+
+### H1 and H2 are unchanged and Points-only
+
+- H1 and H2 stay as written in "Amendment: December and season-end criteria" and the H2 clarification. They keep the same family (alpha 0.05 one-sided, Bonferroni 0.025 each), timing, power and grading.
+- Their population is paper_predictions rows with stat_type = 'Points'. This only states what was already true, since no row of any other stat existed before this entry. Rows for other stats never enter H1 or H2.
+- Section 5 (feature ablation) stays Points-only.
+
+### 10:00 pull restored
+
+- From 2026-10-20, a 10:00 ET open pull runs for every game on the slate, in addition to the T-30 pre-tip pull. Pre-tip pulls are scheduled independently of the open pull. Event-triggered pulls stay off.
+- After a restart, the open pull is caught up only before 13:00 ET. Each snapshot's actual time is in captured_at. On 2026-10-20 the open snapshots were taken at 11:25 ET.
+- The three section 4 analyses dropped in the 2026-10-19 entry return, as exploratory only:
+  - Closing line: share of H1 picks, recomputed at the 10:00 Underdog line, where the pre-tip line moved toward the pick.
+  - Test A at the 10:00 snapshot, alongside the pre-tip snapshot.
+  - News timing: Underdog line movement between the 10:00 and pre-tip snapshots after a teammate's play/no-play change. Movement before 10:00 or between pulls is not observed.
+- Games with no open snapshot (a missed or refused pull) are excluded from these three analyses, and their count is reported.
+
+### Other stats are exploratory
+
+- Rebounds, Assists and 3PM rows are reported but never decide anything. No edge is declared from them, and they are not in H1/H2's family. The only exception is H3 below.
+- They are reported with the same statistics as section 4 (slice hit rate, always-Under on the same rows), labelled exploratory.
+
+### H3 — 3PM model
+
+- H3 mirrors H1 on 3PM:
+  - Population: as section 2, with stat_type = '3PM'. That means app_path = 'model', Underdog line present, result OVER or UNDER, and regular-season games only, matched the same way.
+  - Side = Over if P(over) > 0.5, else Under. Confidence = max(P, 1 - P).
+  - Slice = top 20% of population rows by confidence. The cutoff is computed from P alone.
+- H3 is its own family, separate from H1/H2: one-sided alpha 0.05, with no correction against H1/H2.
+- An edge is declared only if the game-clustered bootstrap one-sided 95% lower bound clears break-even.
+- H3 is graded exactly as H1 is graded under the payout-mapping entry.
+- Timing is the same as H1. The interim (first check on or after 2026-12-15) is futility only (two-sided 95% upper bound below break-even), and only the final can declare an edge.
+- Why 3PM: it is the only stat whose frozen model was clearly above chance on held-out data before this season (validation AUC 0.568, test AUC 0.556 [0.536, 0.577]; "Frozen 2026-27 NBA model"). The choice was made before any 2026-27 3PM result existed.
+- Sample size is unknown until Underdog's 3PM line count is seen. An inconclusive result is reported as inconclusive, not as "no edge".
+- If Underdog posts no 3PM lines (Test C recorded that Underdog did not carry 3PM), H3 is withdrawn by a dated entry before any 3PM result is joined.
+
+Recorded before any 2026-10-20 result was joined. paper_predictions had 0 rows when four-stat logging began.
+
+---
+
+## Entry: current rosters and 0-minute games in paper-prediction inputs (drafted 2026-10-20)
+
+Recorded on 2026-10-20 at about 12:45 ET, before any 2026-27 result existed: the first game (Boston Celtics @ Detroit Pistons) tips at 15:00 ET, player_stats holds no box score after 2026-10-16, and paper_predictions had 0 rows. Earlier sections are unchanged.
+
+### What changes
+
+1. Player team from current rosters.
+   - A new table, rosters, holds ESPN's public team rosters for all 30 teams (site.api.espn.com .../nba/teams/{id}/roster; no OddsAPI credits). It is refreshed at backend startup and in the 07:00 ET maintenance job.
+   - A player's current team is his roster team, matched by name (case, accents, punctuation and Jr./II-style suffixes ignored). It falls back to the team of his latest box score when he is on no roster, the name matches more than one team, or the roster rows are older than 48 hours.
+   - paper_predictions records which source was used in a new column, team_source ('roster' / 'box_score').
+   - The opponent and home/away still come from the OddsAPI event, by matching the player's team to its home or away team.
+2. get_game_logs drops 0-minute games (numMinutes > 0), as ml_trainer's training rows do.
+   - This changes, for players with a 0-minute counted game in their last 40, the features read from that log: avg_pts_last5, avg_pts_last10, trend, line_diff, consistency, games_played_last15, minutes_trend, avg_minutes_last5 and fatigue_score, and counted_games / app_path.
+   - Since 2025-10-01 three players have such a game (Kelly Olynyk, Tony Bradley, Nick Richards).
+
+### When
+
+- Changes 1 and 2 apply to paper predictions with game_date 2026-10-21 or later.
+- Rows with game_date 2026-10-20 stay as logged by the code running that day: player team from the latest box score, 0-minute games included.
+
+### Effect on H1, H2 and H3
+
+- Rows previously logged as "team mismatch" (the box-score team is neither event team, e.g. a player traded since his last box score) are now predicted. This changes H1's population: it gains those rows.
+  - In a dry run on the 2026-10-20 10:00 pulls, one player changed: Anfernee Simons (box score Chicago Bulls, roster Philadelphia 76ers), 2 rows that were "team mismatch" are now predicted. Every other row's P(over) was identical with rosters on or off.
+- A player whose stale box-score team is the other team in the same game would previously have been assigned the wrong opponent and home/away (vs_opponent_avg, opp_def_rating_last5, home_away_split). That is corrected from 2026-10-21. None occurred on 2026-10-20.
+- Everything else in H1, H2 and H3 is unchanged.
+
+### Recorded for completeness (no effect on the 14 features)
+
+- The next-game lookup compared UTC time against ET schedule times, so from 4 hours before tip it returned the team's following game. Fixed. For paper predictions this only changes the is_back_to_back column, which is not a model input; rows with game_date 2026-10-20 describe the following game in that column.
+- features_json gains two keys that are not model inputs: line_hits_last10 and games_last10 (used for the app's explanation text).
+- A player whose latest box score has no team id, and who is on no roster, is recorded as "no team context" instead of an error.
+- Not changed: home_away_split and opp_def_rating_last5 at inference still read 0-minute rows, which training excludes. Both are among the six features listed as not verified identical in "Frozen 2026-27 NBA model".

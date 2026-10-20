@@ -17,6 +17,8 @@ backend/feature_importance*.png
 
 # Databases, models, credentials, raw API responses, images, logs (anywhere)
 *.db
+*.db-wal
+*.db-shm
 *.sqlite
 *.pkl
 kaggle.json

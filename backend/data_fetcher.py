@@ -22,6 +22,7 @@ load_dotenv()
 from database import DB_PATH
 import line_logger
 import game_types
+import rosters
 
 
 # ---------------------------------------------------------------------------
@@ -238,7 +239,8 @@ def get_game_logs(
 ) -> pd.DataFrame:
     """
     Return a DataFrame of the player's last `last_n` COUNTED games (game_types.py:
-    no preseason, All-Star or Cup final), matching what ml_trainer trains on.
+    no preseason, All-Star or Cup final) that he played (numMinutes > 0), matching
+    the rows ml_trainer trains on.
 
     Columns are renamed to match predictor.py's expectations:
       GAME_DATE, MATCHUP, PTS, REB, AST, FG3M, MIN, PLUS_MINUS, WL
@@ -269,6 +271,7 @@ def get_game_logs(
         SELECT {cols_sql}
         FROM player_stats
         WHERE personId = ? AND gameType IN ({game_types.COUNTED_SQL})
+          AND numMinutes IS NOT NULL AND numMinutes > 0
         ORDER BY gameDateTimeEst DESC
         LIMIT ?
         """,
@@ -414,11 +417,15 @@ def get_team_def_rating_last5(team_name: str) -> float:
 # Player context  (team + next game + back-to-back)
 # ---------------------------------------------------------------------------
 
+NEXT_GAME_GRACE_HOURS = 3   # a game stays the player's "next game" until 3 h after tip
+
 def get_player_context(player_name: str) -> dict | None:
     """
     Returns team context for the selected player:
-      player_team_full / abbrev, next_opponent_full / abbrev,
-      is_home, is_back_to_back
+      player_team_full / abbrev, team_source, next_opponent_full / abbrev,
+      is_home, is_back_to_back, next_game_date
+    Current team: today's ESPN roster (rosters.current_team), else the team of the
+    player's most recent box score (team_source 'roster' / 'box_score').
     Returns None if the player cannot be found or has no game log data.
     """
     player_id = get_player_id(player_name)
@@ -427,7 +434,8 @@ def get_player_context(player_name: str) -> dict | None:
 
     conn = get_db()
 
-    # Current team from most recent game in player_stats
+    # Most recent game in player_stats: the player must have one; its team is the
+    # fallback when no current roster row matches.
     team_row = conn.execute(
         """
         SELECT playerteamId, playerteamName, playerteamCity
@@ -443,16 +451,25 @@ def get_player_context(player_name: str) -> dict | None:
         conn.close()
         return None
 
-    team_id     = int(team_row["playerteamId"])
-    team_full   = f"{team_row['playerteamCity']} {team_row['playerteamName']}"
+    roster = rosters.current_team(player_name, player_id)
+    if roster is not None:
+        team_id, team_full, team_source = roster["team_id"], roster["team_full"], "roster"
+    elif team_row["playerteamId"] is None:
+        # e.g. an unsigned veteran whose last row is a preseason game with no team id
+        conn.close()
+        return None
+    else:
+        team_id     = int(team_row["playerteamId"])
+        team_full   = f"{team_row['playerteamCity']} {team_row['playerteamName']}"
+        team_source = "box_score"
     team_abbrev = full_to_abbrev(team_full)
 
-    # Next scheduled game after right now (UTC).
-    # Use strftime to produce 'YYYY-MM-DD HH:MM:SS' — the same format SQLite stores
-    # datetimes in — so the string comparison is reliable.  .isoformat() produces
-    # 'YYYY-MM-DDTHH:MM:SS+00:00' where the 'T' and '+00:00' suffix break ordering
-    # against space-separated stored values (space < 'T' in ASCII).
-    now = dt.datetime.now(dt.timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
+    # Next scheduled game. schedule.gameDateTimeEst is ET wall-clock text
+    # ('YYYY-MM-DD HH:MM:SS'), so compare against the current ET time in that same
+    # format. Today's game stays selectable until NEXT_GAME_GRACE_HOURS after tip;
+    # a game from an earlier ET date never does.
+    now_et = dt.datetime.now(ZoneInfo("America/New_York"))
+    cutoff = (now_et - dt.timedelta(hours=NEXT_GAME_GRACE_HOURS)).strftime('%Y-%m-%d %H:%M:%S')
     game_row = conn.execute(
         """
         SELECT gameDateTimeEst, homeTeamId,
@@ -462,11 +479,12 @@ def get_player_context(player_name: str) -> dict | None:
         WHERE (CAST(homeTeamId AS INTEGER) = CAST(? AS INTEGER)
                OR CAST(awayTeamId AS INTEGER) = CAST(? AS INTEGER))
           AND gameDateTimeEst > ?
+          AND substr(gameDateTimeEst, 1, 10) >= ?
           AND homeTeamId != 0
         ORDER BY gameDateTimeEst ASC
         LIMIT 1
         """,
-        (team_id, team_id, now),
+        (team_id, team_id, cutoff, now_et.date().isoformat()),
     ).fetchone()
 
     if not game_row:
@@ -474,6 +492,7 @@ def get_player_context(player_name: str) -> dict | None:
         return {
             "player_team_full":     team_full,
             "player_team_abbrev":   team_abbrev,
+            "team_source":          team_source,
             "next_opponent_full":   None,
             "next_opponent_abbrev": None,
             "is_home":              False,
@@ -508,6 +527,7 @@ def get_player_context(player_name: str) -> dict | None:
     return {
         "player_team_full":     team_full,
         "player_team_abbrev":   team_abbrev,
+        "team_source":          team_source,
         "next_opponent_full":   opp_full,
         "next_opponent_abbrev": opp_abbrev,
         "is_home":              is_home,
@@ -649,6 +669,9 @@ _STAT_TYPE_MAP   = {
     "RA":       "player_rebounds_assists",
     "PRA":      "player_points_rebounds_assists",
 }
+# NBA lookups add 3PM: its lines come only from line_snapshots (line_logger logs
+# player_threes), never from the WNBA props call above.
+_NBA_STAT_TYPE_MAP = {**_STAT_TYPE_MAP, "3PM": "player_threes"}
 _CACHE_TTL = 45 * 60  # 45 minutes — DFS lines move with user selections
 
 _lines_cache: dict = {}
@@ -700,7 +723,7 @@ def get_todays_lines() -> dict:
     Makes NO OddsAPI calls (the NBA slip path spends no credits; line_logger's
     scheduled pre-tip pull is the only NBA OddsAPI consumer). Fallback order:
       1. today's logged Underdog lines (line_snapshots via
-         line_logger.todays_underdog_lines; Points only);
+         line_logger.todays_underdog_lines; Points, Rebounds, Assists, 3PM);
       2. today's cached lines (in-memory, then the SQLite odds_cache row), stale is fine;
       3. {} -> the slip form falls back to manual line entry.
     """
@@ -746,11 +769,12 @@ def get_player_line(player_name: str, stat_type: str) -> tuple[float | None, str
     Uses fuzzy name matching (cutoff 0.85) to handle minor OddsAPI name differences.
 
     Lines come from get_todays_lines(), which makes no OddsAPI calls: today's
-    logged Underdog lines (Points only, from line_logger) or today's cache. Other
-    stat types usually return (None, None), i.e. manual entry. Stat types not in
-    _STAT_TYPE_MAP (3PM, Steals, Blocks, Blocks+Steals) always return (None, None).
+    logged Underdog lines (Points, Rebounds, Assists, 3PM, from line_logger) or
+    today's cache. Other stat types usually return (None, None), i.e. manual entry.
+    Stat types not in _NBA_STAT_TYPE_MAP (Steals, Blocks, Blocks+Steals) always
+    return (None, None).
     """
-    market_key = _STAT_TYPE_MAP.get(stat_type)
+    market_key = _NBA_STAT_TYPE_MAP.get(stat_type)
     if not market_key:
         return None, None
 
