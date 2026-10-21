@@ -36,18 +36,25 @@ def find_schedule_csv(dataset_path: str) -> str:
     LeagueSchedule26_27.csv. The dataset renames it each season, so pick the
     LeagueSchedule<YY>_<YY>.csv with the latest season rather than hardcoding it.
     """
-    import glob
-    import re
-    files = glob.glob(os.path.join(dataset_path, "LeagueSchedule*.csv"))
-    if not files:
-        present = sorted(os.listdir(dataset_path))
+    present = sorted(os.listdir(dataset_path))
+    name = latest_schedule_name(present)
+    if name is None:
         raise FileNotFoundError(f"No LeagueSchedule*.csv in {dataset_path}; files present: {present}")
+    return os.path.join(dataset_path, name)
+
+
+def latest_schedule_name(names) -> str | None:
+    """The LeagueSchedule<YY>_<YY>.csv with the latest season among file names, or None."""
+    import re
+    files = [n for n in names if n.startswith("LeagueSchedule") and n.endswith(".csv")]
+    if not files:
+        return None
 
     def season(f: str) -> tuple:
-        m = re.search(r"LeagueSchedule(\d{2})_(\d{2})", os.path.basename(f))
+        m = re.search(r"LeagueSchedule(\d{2})_(\d{2})", f)
         return (int(m.group(1)), int(m.group(2))) if m else (-1, -1)
 
-    return max(files, key=lambda f: (season(f), os.path.basename(f)))
+    return max(files, key=lambda f: (season(f), f))
 
 
 def read_schedule_csv(schedule_path: str) -> pd.DataFrame:
@@ -410,18 +417,71 @@ def resolve_pending_predictions() -> int:
     return resolved
 
 
+KAGGLE_DATASET = "eoinamoore/historical-nba-data-and-player-box-scores"
+
+
+class KaggleVersionUnavailable(Exception):
+    """The newest Kaggle version is listed but one of its files returns 404."""
+
+
+def _kaggle_dataset_request(request_cls, version: int | None = None):
+    owner, slug = KAGGLE_DATASET.split("/")
+    r = request_cls()
+    r.owner_slug, r.dataset_slug = owner, slug
+    if version is not None:
+        r.dataset_version_number = version
+    return r
+
+
 def get_latest_kaggle_version() -> int:
+    """Ask Kaggle for the dataset's current version number (metadata only, no download)."""
+    from kagglehub.clients import build_kaggle_client
+    from kagglesdk.datasets.types.dataset_api_service import ApiGetDatasetRequest
+    with build_kaggle_client() as c:
+        d = c.datasets.dataset_api_client.get_dataset(_kaggle_dataset_request(ApiGetDatasetRequest))
+    return int(d.current_version_number)
+
+
+def download_kaggle_files(version: int) -> dict:
     """
-    Ask kagglehub for the latest dataset version and return it as an integer.
-    Parses the version from the last numeric path component (e.g. …/versions/469 → 469).
-    Downloads the dataset first if a newer version is available on Kaggle.
+    Download, one file at a time, only the files run_etl loads from `version`:
+    PlayerStatisticsExtended.csv, Players.csv and the latest LeagueSchedule*.csv.
+    Per-file downloads work when the whole-dataset archive does not (v521 on
+    2026-10-21: archive 404, every file 200). Returns {"stats", "players",
+    "schedule"} -> local path. Raises KaggleVersionUnavailable on a 404.
     """
     import kagglehub
-    path = kagglehub.dataset_download("eoinamoore/historical-nba-data-and-player-box-scores")
-    for part in reversed(path.replace("\\", "/").rstrip("/").split("/")):
-        if part.isdigit():
-            return int(part)
-    raise ValueError(f"Could not parse version number from Kaggle path: {path}")
+    import requests
+    from kagglehub.clients import build_kaggle_client
+    from kagglesdk.datasets.types.dataset_api_service import ApiListDatasetFilesRequest
+
+    def is_404(exc: Exception) -> bool:
+        resp = getattr(exc, "response", None)
+        return isinstance(exc, requests.HTTPError) and resp is not None and resp.status_code == 404
+
+    try:
+        r = _kaggle_dataset_request(ApiListDatasetFilesRequest, version)
+        r.page_size = 200
+        with build_kaggle_client() as c:
+            names = [f.name for f in c.datasets.dataset_api_client.list_dataset_files(r).dataset_files or []]
+    except Exception as exc:
+        if is_404(exc):
+            raise KaggleVersionUnavailable(f"v{version}: file list returned 404") from exc
+        raise
+    schedule = latest_schedule_name(names)
+    if schedule is None:
+        raise FileNotFoundError(f"No LeagueSchedule*.csv in Kaggle v{version}; files listed: {names}")
+
+    wanted = {"stats": "PlayerStatisticsExtended.csv", "players": "Players.csv", "schedule": schedule}
+    out = {}
+    for key, name in wanted.items():
+        try:
+            out[key] = kagglehub.dataset_download(f"{KAGGLE_DATASET}/versions/{version}", path=name)
+        except Exception as exc:
+            if is_404(exc):
+                raise KaggleVersionUnavailable(f"v{version}: {name} returned 404") from exc
+            raise
+    return out
 
 
 def backup_predictions_to_csv() -> str:
@@ -526,11 +586,11 @@ def run_etl() -> bool:
     Skips if the stored dataset version already matches the latest Kaggle version.
     Drops and recreates player_stats, players, and schedule when a new version is found.
     The predictions and kaggle_version tables are never touched.
+    Every file is downloaded before any table is replaced, so a KaggleVersionUnavailable
+    (404 on the newest version) leaves all tables as they were.
     Returns True if ETL ran, False if skipped.
     """
     backup_predictions_to_csv()
-
-    import kagglehub
 
     # --- Version check ---
     latest_version = get_latest_kaggle_version()
@@ -549,13 +609,13 @@ def run_etl() -> bool:
         resolve_pending_predictions()
         return False
 
-    # --- Download ---
-    print("Downloading Kaggle dataset (eoinamoore/historical-nba-data-and-player-box-scores)...")
-    path = kagglehub.dataset_download("eoinamoore/historical-nba-data-and-player-box-scores")
-    print(f"Dataset path: {path}")
+    # --- Download (all files before touching any table) ---
+    print(f"Downloading Kaggle dataset ({KAGGLE_DATASET}) v{latest_version}, file by file...")
+    files = download_kaggle_files(latest_version)
+    print(f"Dataset files: {files}")
 
     # --- PlayerStatisticsExtended.csv → player_stats ---
-    stats_path = os.path.join(path, "PlayerStatisticsExtended.csv")
+    stats_path = files["stats"]
     print("Loading PlayerStatisticsExtended.csv in chunks...")
     total_rows = 0
     conn = sqlite3.connect(DB_PATH, timeout=30)
@@ -574,7 +634,7 @@ def run_etl() -> bool:
     print(f"  Done — {total_rows:,} rows total")
 
     # --- Players.csv → players ---
-    players_path = os.path.join(path, "Players.csv")
+    players_path = files["players"]
     print("Loading Players.csv...")
     players_df = pd.read_csv(
         players_path, usecols=["personId", "firstName", "lastName"]
@@ -585,7 +645,7 @@ def run_etl() -> bool:
     print(f"  Done — {len(players_df):,} players")
 
     # --- LeagueSchedule<current season>.csv → schedule ---
-    schedule_path = find_schedule_csv(path)
+    schedule_path = files["schedule"]
     print(f"Loading {os.path.basename(schedule_path)}...")
     schedule_df = read_schedule_csv(schedule_path)
     schedule_df = schedule_df[schedule_df["homeTeamId"] != 0]

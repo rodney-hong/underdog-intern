@@ -87,6 +87,7 @@ SCHEDULE_HOUR_ET   = int(os.getenv("LINE_LOG_SCHEDULE_HOUR_ET", "6"))  # free pr
 EVENTS_RETRY_MINUTES = 20  # retry a FAILED scheduling events call until today's last tip-off
 MAINTENANCE_HOUR_ET  = 7   # backup -> ETL -> resolve (run_morning_maintenance)
 ETL_PRETIP_GUARD_MINUTES = 60  # skip the ETL if a pre-tip pull is due this soon
+ETL_TIPOFF_GUARD_MINUTES = 90  # skip the ETL if a scheduled game tips this soon (works without a scheduler)
 BACKUP_DIR  = os.path.join(os.path.dirname(os.path.abspath(DB_PATH)), "backups")
 BACKUP_KEEP = 3
 PRETIP_MINUTES     = int(os.getenv("LINE_LOG_PRETIP_MINUTES", "30"))
@@ -891,6 +892,27 @@ def _pretips_due_within(scheduler, minutes: int) -> list[str]:
             and j.next_run_time is not None and j.next_run_time <= horizon]
 
 
+def _tipoffs_within(minutes: int, now: dt.datetime | None = None) -> list[str]:
+    """
+    Games in the schedule table tipping off between now and now + `minutes`.
+    gameDateTimeEst is ET wall time 'YYYY-MM-DD HH:MM:SS', so strings compare in order.
+    No schedule table yet (first run) means nothing to protect: [].
+    """
+    now = (now or dt.datetime.now(EASTERN)).astimezone(EASTERN)
+    lo = now.strftime("%Y-%m-%d %H:%M:%S")
+    hi = (now + dt.timedelta(minutes=minutes)).strftime("%Y-%m-%d %H:%M:%S")
+    conn = sqlite3.connect(DB_PATH, timeout=30)
+    try:
+        rows = conn.execute(
+            "SELECT gameId, gameDateTimeEst FROM schedule WHERE gameDateTimeEst BETWEEN ? AND ? "
+            "ORDER BY gameDateTimeEst", (lo, hi)).fetchall()
+    except sqlite3.OperationalError:
+        return []
+    finally:
+        conn.close()
+    return [f"{gid} @ {tip[11:16]} ET" for gid, tip in rows]
+
+
 def run_morning_maintenance(scheduler=None) -> dict:
     """
     Daily at MAINTENANCE_HOUR_ET:
@@ -898,10 +920,14 @@ def run_morning_maintenance(scheduler=None) -> dict:
       1b. refresh ESPN rosters (rosters.refresh_rosters; a failure is logged and the
          job continues: player teams then fall back to box scores once rows age out);
       2. run database.run_etl(), unless a pre-tip pull is scheduled within
-         ETL_PRETIP_GUARD_MINUTES (the ETL replaces player_stats/players/schedule
+         ETL_PRETIP_GUARD_MINUTES or a game in the schedule table tips within
+         ETL_TIPOFF_GUARD_MINUTES (the ETL replaces player_stats/players/schedule
          in place, and a pre-tip paper prediction would read the partial tables).
-         If it raises, ETL_TABLES are restored from the step-1 backup (nothing else);
-         if that restore fails too, the job stops before step 3;
+         The tip-off check needs no scheduler, so it also guards manual runs.
+         If the newest Kaggle version 404s (KaggleVersionUnavailable), the ETL is
+         skipped with no table changed and no restore; the next run retries.
+         If it raises anything else, ETL_TABLES are restored from the step-1 backup
+         (nothing else); if that restore fails too, the job stops before step 3;
       3. run paper_predictions.resolve_paper_predictions().
     Each step's outcome is printed. Returns them as a dict.
     """
@@ -925,16 +951,25 @@ def run_morning_maintenance(scheduler=None) -> dict:
         print(f"[maintenance] rosters refresh FAILED: {exc!r} (continuing)")
 
     due = _pretips_due_within(scheduler, ETL_PRETIP_GUARD_MINUTES)
+    tips = _tipoffs_within(ETL_TIPOFF_GUARD_MINUTES)
     if due:
         out["etl"] = f"skipped: pre-tip pull(s) within {ETL_PRETIP_GUARD_MINUTES} min: {due}"
         print(f"[maintenance] 2/3 ETL SKIPPED: pre-tip pull(s) within "
               f"{ETL_PRETIP_GUARD_MINUTES} min: {due}")
+    elif tips:
+        out["etl"] = f"skipped: game(s) tip within {ETL_TIPOFF_GUARD_MINUTES} min: {tips}"
+        print(f"[maintenance] 2/3 ETL SKIPPED: game(s) tip within "
+              f"{ETL_TIPOFF_GUARD_MINUTES} min: {tips}")
     else:
+        import database
         try:
-            import database
             ran = database.run_etl()
             out["etl"] = "ran" if ran else "up to date"
             print(f"[maintenance] 2/3 ETL OK: {'new Kaggle version loaded' if ran else 'dataset already up to date'}")
+        except database.KaggleVersionUnavailable as exc:
+            out["etl"] = f"skipped: newest Kaggle version not downloadable: {exc}"
+            print(f"[maintenance] 2/3 ETL SKIPPED: newest Kaggle version not downloadable ({exc}); "
+                  f"tables untouched, retrying at the next maintenance")
         except Exception as exc:
             out["etl"] = f"FAILED: {exc!r}"
             print(f"[maintenance] 2/3 ETL FAILED: {exc!r}")
