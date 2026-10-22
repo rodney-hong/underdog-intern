@@ -49,8 +49,11 @@ Checked before every paid call, each stopping the run:
   - live guard: no live pre-tip pull due within LIVE_GUARD_MINUTES (from `schedule`).
 The first remaining value comes from the live events endpoint, which costs 0 credits.
 
-Resumable: a game with an 'ok' or 'empty' event_odds row in backfill_log is skipped.
-Each game's snapshot rows and its log row are committed together.
+Resumable per (game, market): a market already requested in an 'ok' or 'empty'
+event_odds call for a game is not requested again; a game is called only for its missing
+markets, and its budget and floor checks use that smaller cost. The same T-30 date
+parameter returns the same snapshot, so markets added later line up with earlier ones.
+Each call's snapshot rows and its log row are committed together.
 """
 
 import argparse
@@ -215,10 +218,24 @@ def planned_games(conn, seasons=DEFAULT_SEASONS, game_ids=None, now=None) -> lis
     return out
 
 
-def done_game_ids(conn) -> set:
-    return {r[0] for r in conn.execute(
-        "SELECT DISTINCT kaggle_game_id FROM backfill_log WHERE endpoint = 'event_odds' "
-        "AND status IN ('ok', 'empty') AND kaggle_game_id IS NOT NULL")}
+def done_markets(conn) -> dict[int, set]:
+    """{kaggle_game_id: markets already requested in an 'ok' or 'empty' event_odds call}."""
+    done: dict[int, set] = {}
+    for gid, requested in conn.execute(
+            "SELECT kaggle_game_id, markets_requested FROM backfill_log WHERE endpoint = 'event_odds' "
+            "AND status IN ('ok', 'empty') AND kaggle_game_id IS NOT NULL"):
+        done.setdefault(gid, set()).update(m for m in (requested or "").split(",") if m)
+    return done
+
+
+def with_missing_markets(games: list[dict], markets: list[str], done: dict[int, set]) -> list[dict]:
+    """Games that still lack some of `markets`, each with game["markets"] = the missing ones."""
+    out = []
+    for g in games:
+        missing = [m for m in markets if m not in done.get(g["kaggle_game_id"], set())]
+        if missing:
+            out.append({**g, "markets": missing})
+    return out
 
 
 def cached_events(conn, game_date: str) -> list[dict] | None:
@@ -424,11 +441,12 @@ class Run:
         return events
 
     def pull_game(self, game: dict, event: dict) -> None:
-        cost = max_odds_cost(self.markets)
+        """One call for the game's missing markets (game["markets"])."""
+        cost = max_odds_cost(game["markets"])
         self.guard(cost)
         requested = snapshot_time(event["commence_time"])
         params = {"apiKey": API_KEY, "date": requested, "bookmakers": BOOKMAKERS,
-                  "markets": ",".join(self.markets), "oddsFormat": "american",
+                  "markets": ",".join(game["markets"]), "oddsFormat": "american",
                   "includeMultipliers": "true"}
         captured_at = dt.datetime.now(dt.timezone.utc).isoformat()
         resp = self.client.get(HIST_EVENT_ODDS_URL.format(event_id=event["id"]), params=params)
@@ -467,17 +485,17 @@ class Run:
 # ---------------------------------------------------------------------------
 
 def dry_run(seasons=DEFAULT_SEASONS, game_ids=None, markets=None, max_credits=0,
-            show: int = 20, now=None) -> dict:
+            show: int = 20, now=None, exclude=frozenset()) -> dict:
     """Planned games and the maximum credit cost. No API call and no write."""
     markets = markets or DEFAULT_MARKETS.split(",")
     src = get_source_db()
     hist = (sqlite3.connect(f"file:{HIST_DB_PATH}?mode=ro", uri=True)
             if os.path.exists(HIST_DB_PATH) else None)    # never created by a dry run
     try:
-        games = planned_games(src, seasons, game_ids, now)
+        games = [g for g in planned_games(src, seasons, game_ids, now)
+                 if g["kaggle_game_id"] not in exclude]
         logged = hist is not None and _table_exists(hist, "backfill_log")
-        done = done_game_ids(hist) if logged else set()
-        todo = [g for g in games if g["kaggle_game_id"] not in done]
+        todo = with_missing_markets(games, markets, done_markets(hist) if logged else {})
         dates = sorted({g["game_date"] for g in todo}, reverse=True)
         uncached = [d for d in dates if not (logged and cached_events(hist, d) is not None)]
         fl = credit_floor(src, now)
@@ -486,28 +504,29 @@ def dry_run(seasons=DEFAULT_SEASONS, game_ids=None, markets=None, max_credits=0,
         if hist is not None:
             hist.close()
     per_game = max_odds_cost(markets)
-    est = len(todo) * per_game + len(uncached) * EVENTS_CALL_COST
+    est = sum(max_odds_cost(g["markets"]) for g in todo) + len(uncached) * EVENTS_CALL_COST
     by_season: dict = {}
     for g in todo:
         by_season[g["season"]] = by_season.get(g["season"], 0) + 1
-    print(f"[backfill] DRY RUN: {len(todo)} games to pull ({len(games) - len(todo)} already done), "
-          f"{len(markets)} markets, up to {per_game} credits/game; "
+    print(f"[backfill] DRY RUN: {len(todo)} games to pull ({len(games) - len(todo)} already have "
+          f"every market), {len(markets)} markets, up to {per_game} credits/game; "
           f"{len(uncached)} events calls x {EVENTS_CALL_COST}")
     for s, n in by_season.items():
         print(f"  {s}: {n} games")
     for g in todo[:show]:
-        print(f"  {g['tip_et']} ET  {g['away']} @ {g['home']}  ({g['kaggle_game_id']})")
+        print(f"  {g['tip_et']} ET  {g['away']} @ {g['home']}  ({g['kaggle_game_id']})"
+              + ("" if len(g["markets"]) == len(markets) else f"  missing {','.join(g['markets'])}"))
     if len(todo) > show:
         print(f"  ... {len(todo) - show} more")
     print(f"[backfill] estimated maximum cost {est} credits; --max-credits {max_credits} "
-          f"covers about {max(0, max_credits - len(uncached) * EVENTS_CALL_COST) // per_game} games")
+          f"covers about {max(0, max_credits - len(uncached) * EVENTS_CALL_COST) // per_game} full games")
     print(f"[backfill] floor {fl['floor']} = {fl['live_games']} live games to {fl['reset']} "
           f"x {LIVE_CREDITS_PER_GAME} + {FLOOR_BUFFER}")
     return {"games": todo, "estimated_credits": est, "events_calls": len(uncached), **fl}
 
 
 def run(seasons=DEFAULT_SEASONS, game_ids=None, markets=None, max_credits=0,
-        client: httpx.Client | None = None, now_fn=None) -> dict:
+        client: httpx.Client | None = None, now_fn=None, exclude=frozenset()) -> dict:
     """Pull planned games until done or a guard stops the run. Returns a summary."""
     if not API_KEY:
         raise SystemExit("ODDS_API_KEY not set")
@@ -526,8 +545,9 @@ def run(seasons=DEFAULT_SEASONS, game_ids=None, markets=None, max_credits=0,
         near = live_pretips_near(src, now_fn())
         if near:
             raise StopBackfill(f"live pre-tip pull due within {LIVE_GUARD_MINUTES} min: {near}")
-        done = done_game_ids(conn)
-        games = [g for g in planned_games(src, seasons, game_ids, now_fn()) if g["kaggle_game_id"] not in done]
+        games = [g for g in planned_games(src, seasons, game_ids, now_fn())
+                 if g["kaggle_game_id"] not in exclude]
+        games = with_missing_markets(games, markets, done_markets(conn))
         print(f"[backfill] {len(games)} games to pull, newest first; --max-credits {max_credits}")
         r.read_remaining()
         events_by_date: dict = {}
@@ -567,17 +587,19 @@ def main() -> None:
     ap.add_argument("--max-credits", type=int, required=True, help="hard budget for this run")
     ap.add_argument("--seasons", default=",".join(DEFAULT_SEASONS))
     ap.add_argument("--game-ids", help="comma-separated Kaggle gameIds (overrides --seasons)")
+    ap.add_argument("--exclude-game-ids", default="", help="comma-separated Kaggle gameIds to skip")
     ap.add_argument("--markets", default=DEFAULT_MARKETS)
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--show", type=int, default=20, help="dry run: games to list")
     a = ap.parse_args()
     seasons = tuple(s.strip() for s in a.seasons.split(",") if s.strip())
     game_ids = {int(x) for x in a.game_ids.split(",")} if a.game_ids else None
+    exclude = frozenset(int(x) for x in a.exclude_game_ids.split(",") if x.strip())
     markets = [m.strip() for m in a.markets.split(",") if m.strip()]
     if a.dry_run:
-        dry_run(seasons, game_ids, markets, a.max_credits, a.show)
+        dry_run(seasons, game_ids, markets, a.max_credits, a.show, exclude=exclude)
     else:
-        run(seasons, game_ids, markets, a.max_credits)
+        run(seasons, game_ids, markets, a.max_credits, exclude=exclude)
 
 
 if __name__ == "__main__":

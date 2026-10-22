@@ -93,8 +93,9 @@ def odds_body(event_id, requested, books=("underdog", "fanduel", "draftkings")):
 class FakeOddsAPI:
     """Routes the three endpoints; tracks x-requests-remaining; records every request."""
 
-    def __init__(self, remaining=19775, odds_cost=20, status=200):
+    def __init__(self, remaining=19775, odds_cost=20, status=200, per_market=False):
         self.remaining, self.odds_cost, self.status = remaining, odds_cost, status
+        self.per_market = per_market          # bill 10 x markets requested instead of odds_cost
         self.requests: list[httpx.Request] = []
 
     def handler(self, request: httpx.Request) -> httpx.Response:
@@ -109,7 +110,8 @@ class FakeOddsAPI:
             if self.status != 200:
                 return httpx.Response(self.status, text="nope",
                                       headers={"x-requests-remaining": str(self.remaining), "x-requests-last": "0"})
-            cost, body = self.odds_cost, odds_body(path.split("/")[-2], q["date"])
+            cost = 10 * len(q["markets"].split(",")) if self.per_market else self.odds_cost
+            body = odds_body(path.split("/")[-2], q["date"])
         else:
             return httpx.Response(404)
         self.remaining -= cost
@@ -296,3 +298,35 @@ def test_two_games_on_one_date_match_their_own_events_with_one_events_call(db):
     assert len([p for p in api.paths() if "/historical/" in p and p.endswith("/events")]) == 1
     assert hist("SELECT kaggle_game_id, event_id FROM backfill_log WHERE endpoint = 'event_odds' "
                 "ORDER BY kaggle_game_id") == [(22500580, "ev_mia"), (22500584, "ev_gsw")]
+
+
+def test_resume_is_per_market_and_requests_and_bills_only_new_markets(db):
+    first = ["player_points", "player_rebounds"]
+    out1 = go(db, FakeOddsAPI(per_market=True), game_ids={22300571}, markets=first)
+    assert out1["spent"] == 1 + 20
+    api = FakeOddsAPI(per_market=True)
+    out2 = go(db, api, game_ids={22300571}, markets=first + ["player_assists", "player_threes"])
+    odds = [r for r in api.requests if r.url.path.endswith("/odds")]
+    assert len(odds) == 1
+    assert odds[0].url.params["markets"] == "player_assists,player_threes"
+    assert out2["spent"] == 20                                      # 2 new markets, cached events
+    assert hist("SELECT markets_requested, credits_used FROM backfill_log WHERE endpoint = 'event_odds' "
+                "ORDER BY id") == [("player_points,player_rebounds", 20), ("player_assists,player_threes", 20)]
+    # a third run with the same four markets has nothing left to request
+    api3 = FakeOddsAPI(per_market=True)
+    out3 = go(db, api3, game_ids={22300571}, markets=first + ["player_assists", "player_threes"])
+    assert out3["pulled"] == 0 and not [r for r in api3.requests if "/historical/" in r.url.path]
+
+
+def test_dry_run_counts_only_missing_markets(db):
+    go(db, FakeOddsAPI(per_market=True), game_ids={22300571}, markets=["player_points"])
+    out = backfill.dry_run(game_ids={22300571}, markets=["player_points", "player_assists"], now=NOW)
+    assert [g["markets"] for g in out["games"]] == [["player_assists"]]
+    assert out["estimated_credits"] == 10                          # events already cached
+
+
+def test_excluded_game_is_never_pulled(db):
+    api = FakeOddsAPI()
+    out = go(db, api, game_ids={22500580, 22500584}, exclude=frozenset({22500580}))
+    assert out["pulled"] == 1
+    assert [p.split("/")[-2] for p in api.paths() if p.endswith("/odds")] == ["ev_gsw"]
