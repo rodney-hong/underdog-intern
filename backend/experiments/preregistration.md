@@ -666,3 +666,8 @@ FanDuel/DraftKings P(over) at the pre-tip snapshot. Fixed here:
   in this entry.
 
 No backfilled line had been downloaded when this entry was written.
+
+## Entry: backfill probe exclusion and Test A timing (2026-10-22)
+
+- Probe game 22400562 (Boston Celtics @ Toronto Raptors, 2025-01-15) was pulled on 2026-10-22 (player_points only) to check whether OddsAPI carries Underdog in 2024-25. It is excluded from Test A, like the two Stage 3 probes.
+- Test A is computed once, after the full backfill planned for the November 2026 billing cycle is complete and its game list is recorded in a dated entry. No Test A result is computed on partial backfills, including the 183 games pulled in October 2026 (backend/experiments/backfill_games_2026-10.md).
