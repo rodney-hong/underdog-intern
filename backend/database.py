@@ -299,21 +299,211 @@ _RESOLVE_STAT_COLS = {
     "3PA":                  ["threePointersAttempted"],
 }
 
+RESOLVE_BATCH_SIZE = 50  # pending rows per commit, so the write lock is never held for long
 
-def resolve_pending_predictions() -> int:
+
+def _pending_predictions() -> list:
+    """App predictions with no result whose ET game date is before today."""
     from zoneinfo import ZoneInfo
     today_et = datetime.now(ZoneInfo("America/New_York")).date().isoformat()
     conn = get_connection()
-    pending = conn.execute(
-        "SELECT id, timestamp, player_name, stat_type, stat_line, opponent_team, game_date "
-        "FROM predictions WHERE actual_result IS NULL"
-        "  AND (game_date IS NULL OR game_date < ?)",
-        (today_et,),
-    ).fetchall()
-    conn.close()
+    try:
+        return conn.execute(
+            "SELECT id, timestamp, player_name, stat_type, stat_line, opponent_team, game_date "
+            "FROM predictions WHERE actual_result IS NULL"
+            "  AND (game_date IS NULL OR game_date < ?)",
+            (today_et,),
+        ).fetchall()
+    finally:
+        conn.close()
 
+
+def _nba_season(d: date) -> str:
+    """NBA season label for a date, as ESPN writes it: 2026-10-21 -> '2026-27'."""
+    start = d.year if d.month >= 7 else d.year - 1
+    return f"{start}-{(start + 1) % 100:02d}"
+
+
+def _roster_season(conn) -> str | None:
+    """The rosters table's season, or None if there is no table or it mixes seasons."""
+    try:
+        seasons = [r[0] for r in conn.execute("SELECT DISTINCT season FROM rosters")]
+    except sqlite3.OperationalError:
+        return None
+    return seasons[0] if len(seasons) == 1 else None
+
+
+def _resolve_decision(conn, row, known_players: set, available_cols: set) -> dict | None:
+    """
+    What the resolver does with one pending prediction (writes nothing).
+    Returns None for rows it can't evaluate (unmapped stat type, bad date), else a
+    dict with "result" (OVER / UNDER / DNP, or None to leave pending), "kind",
+    "matched" (the player_stats row used, or the matchup checked for a DNP) and
+    "warning" (why a row the resolver could see is left pending).
+    """
+    from zoneinfo import ZoneInfo
+    stat_cols = _RESOLVE_STAT_COLS.get(row["stat_type"])
+    if not stat_cols:
+        return None
+
+    # Full-name match: splitting at the last space breaks suffixes
+    # ("Jaren Jackson Jr." is firstName 'Jaren', lastName 'Jackson Jr.').
+    player_name = row["player_name"].strip()
+    opp = row["opponent_team"]
+    opp_nickname = "Trail Blazers" if "Blazers" in opp else opp.strip().split()[-1]
+
+    game_date_val = row["game_date"]
+    if not game_date_val:
+        try:   # timestamp is naive UTC; the game date is the ET date
+            game_date_val = (datetime.fromisoformat(row["timestamp"])
+                             .replace(tzinfo=ZoneInfo("UTC"))
+                             .astimezone(ZoneInfo("America/New_York")).date().isoformat())
+        except ValueError:
+            return None
+    try:
+        gd = date.fromisoformat(game_date_val)
+    except ValueError:
+        return None
+    # gameDateTimeEst is ET wall time 'YYYY-MM-DD HH:MM:SS': [game_date, next day)
+    # is the ET date, as an index range.
+    day = (game_date_val, (gd + timedelta(days=1)).isoformat())
+
+    out = {"id": row["id"], "player": player_name, "stat": row["stat_type"],
+           "game_date": game_date_val, "opponent": opp,
+           "result": None, "kind": "pending", "matched": None, "warning": None}
+
+    select_cols = [c for c in stat_cols + ["gameDateTimeEst", "numMinutes"]
+                   if c in available_cols]
+    day_rows = conn.execute(
+        f"SELECT {', '.join(select_cols)}, playerteamName, opponentteamName "
+        "FROM player_stats WHERE gameDateTimeEst >= ? AND gameDateTimeEst < ? "
+        "  AND ascii_norm(firstName || ' ' || lastName) = ascii_norm(?)",
+        (*day, player_name),
+    ).fetchall()
+
+    game = next((g for g in day_rows if g["opponentteamName"] == opp_nickname), None)
+    if game:
+        minutes_val = game["numMinutes"] if "numMinutes" in select_cols else None
+        out["matched"] = {"date": game["gameDateTimeEst"], "team": game["playerteamName"],
+                          "opponent": game["opponentteamName"], "minutes": minutes_val}
+        if minutes_val is None or float(minutes_val or 0) == 0:
+            out["result"], out["kind"] = "DNP", "dnp_zero_min"
+        else:
+            actual_value = sum(float(game[c] or 0) for c in stat_cols if c in select_cols)
+            out["result"] = "OVER" if actual_value > row["stat_line"] else "UNDER"
+            out["kind"] = "graded"
+        return out
+
+    if day_rows:
+        # Played that day, but not against the stored opponent: never grade it.
+        g = day_rows[0]
+        out["matched"] = {"date": g["gameDateTimeEst"], "team": g["playerteamName"],
+                          "opponent": g["opponentteamName"], "minutes": g["numMinutes"]}
+        out["warning"] = (f"played for the {g['playerteamName']} vs the {g['opponentteamName']} "
+                          f"on {game_date_val}, stored opponent {opp}")
+        return out
+
+    # No row that day. DNP only for a known player whose team played the stored
+    # opponent that day.
+    if _ascii_normalize(player_name) not in known_players:
+        out["warning"] = "name matches no player_stats row (check the name)"
+        return out
+    last = conn.execute(
+        "SELECT playerteamName, personId FROM player_stats WHERE gameDateTimeEst < ? "
+        "  AND ascii_norm(firstName || ' ' || lastName) = ascii_norm(?) "
+        "ORDER BY gameDateTimeEst DESC LIMIT 1",
+        (game_date_val, player_name),
+    ).fetchone()
+    # His team mirrors the predictor (data_fetcher.get_player_context): the ESPN
+    # roster team from rosters.current_team(), else his latest box-score team. The
+    # roster is a current snapshot, so it is used only when game_date falls in the
+    # roster's season.
+    import rosters
+    team, team_source = None, None
+    if _nba_season(gd) == _roster_season(conn):
+        roster = rosters.current_team(player_name, last["personId"] if last else None)
+        if roster:
+            team, team_source = roster["team_name"], "roster"
+    if team is None and last:
+        team, team_source = last["playerteamName"], "box score"
+    if team is None:
+        out["warning"] = f"no roster team and no box score before {game_date_val}: team unknown"
+        return out
+    out["matched"] = {"date": game_date_val, "team": team, "team_source": team_source,
+                      "opponent": opp_nickname, "minutes": None}
+    matchup = conn.execute(
+        "SELECT 1 FROM player_stats WHERE gameDateTimeEst >= ? AND gameDateTimeEst < ? "
+        "  AND playerteamName = ? AND opponentteamName = ? LIMIT 1",
+        (*day, team, opp_nickname),
+    ).fetchone()
+    if matchup:
+        out["result"], out["kind"] = "DNP", "dnp_absent"
+        return out
+    loaded = conn.execute(
+        "SELECT 1 FROM player_stats WHERE gameDateTimeEst >= ? AND gameDateTimeEst < ? LIMIT 1",
+        day,
+    ).fetchone()
+    if loaded:
+        out["warning"] = (f"the {opp_nickname} did not play the {team} (his {team_source} team) "
+                          f"on {game_date_val}")
+    # else: no box scores for that date are loaded yet: quietly pending
+    return out
+
+
+def _resolve_decisions(conn, pending):
+    """Yield (row, decision) for each pending row, printing warnings and DNP-by-absence rows."""
+    available_cols = {
+        r[1] for r in conn.execute("PRAGMA table_info(player_stats)").fetchall()
+    }
+    # Normalized full names in player_stats, read before any write lock is taken.
+    known_players = {
+        _ascii_normalize(f"{f} {l}")
+        for f, l in conn.execute(
+            "SELECT DISTINCT firstName, lastName FROM player_stats "
+            "WHERE firstName IS NOT NULL AND lastName IS NOT NULL")
+    }
+    for row in pending:
+        d = _resolve_decision(conn, row, known_players, available_cols)
+        if d and d["warning"]:
+            print(f"  WARNING: id {d['id']} {d['player']} ({d['game_date']} vs {d['opponent']}): "
+                  f"{d['warning']}; left pending", flush=True)
+        elif d and d["kind"] == "dnp_absent":
+            print(f"  DNP (absent from box score): id {d['id']} {d['player']}, "
+                  f"{d['game_date']}, {d['matched']['team']} vs {d['opponent']}", flush=True)
+        yield row, d
+
+
+def dry_run_pending_predictions() -> list[dict]:
+    """resolve_pending_predictions() without writing: the decision for every pending row."""
+    pending = _pending_predictions()
+    print(f"Dry run: {len(pending)} pending app prediction(s), nothing written.", flush=True)
+    conn = get_connection()
+    conn.create_function("ascii_norm", 1, _ascii_normalize)
+    try:
+        return [d for _, d in _resolve_decisions(conn, pending) if d]
+    finally:
+        conn.close()
+
+
+def resolve_pending_predictions() -> int:
+    """
+    Fill predictions.actual_result (OVER / UNDER / DNP) from player_stats.
+    A prediction is graded only against the player's row on game_date (ET) whose
+    opponent is the stored opponent. If he has a row that day against another
+    team, or has none and the stored opponent didn't play his team that day, the
+    row is left pending with a warning: never graded, never marked DNP.
+    No row while that matchup is loaded means DNP (absent from box score), for a
+    name that matches some player_stats row; his team is the ESPN roster team when
+    game_date is in the roster's season, else his latest box-score team (as the
+    predictor does). Each such row is printed. Nothing loaded for that date means
+    the box score isn't in yet: pending.
+    Commits every RESOLVE_BATCH_SIZE rows. dry_run_pending_predictions() shows
+    the same decisions without writing.
+    """
+    pending = _pending_predictions()
     if not pending:
         return 0
+    print(f"Resolving {len(pending)} pending app prediction(s)...", flush=True)
 
     resolved      = 0
     dnp_zero_min  = 0
@@ -321,86 +511,18 @@ def resolve_pending_predictions() -> int:
     conn = get_connection()
     conn.create_function("ascii_norm", 1, _ascii_normalize)
     try:
-        for row in pending:
-            stat_cols = _RESOLVE_STAT_COLS.get(row["stat_type"])
-            if not stat_cols:
+        for i, (row, d) in enumerate(_resolve_decisions(conn, pending)):
+            if i and i % RESOLVE_BATCH_SIZE == 0:
+                conn.commit()
+            if not d or d["result"] is None:
                 continue
-
-            parts = row["player_name"].strip().rsplit(" ", 1)
-            if len(parts) < 2:
-                continue
-            first_name, last_name = parts
-
-            opp = row["opponent_team"]
-            opp_nickname = "Trail Blazers" if "Blazers" in opp else opp.strip().split()[-1]
-
-            try:
-                pred_ts = datetime.fromisoformat(row["timestamp"])
-            except ValueError:
-                continue
-
-            available_cols = {
-                r[1] for r in conn.execute("PRAGMA table_info(player_stats)").fetchall()
-            }
-            needed = stat_cols + ["gameDateTimeEst", "numMinutes"]
-            select_cols = [c for c in needed if c in available_cols]
-            cols_sql = ", ".join(select_cols)
-            game = conn.execute(
-                f"SELECT {cols_sql} FROM player_stats "
-                "WHERE ascii_norm(firstName) = ascii_norm(?) "
-                "  AND ascii_norm(lastName)  = ascii_norm(?) "
-                "  AND opponentteamName = ? "
-                "ORDER BY ABS(julianday(gameDateTimeEst) - julianday(?)) LIMIT 1",
-                (first_name, last_name, opp_nickname, pred_ts.isoformat()),
-            ).fetchone()
-
-            if not game:
-                # DNP-by-absence: if the game was loaded but the player has no row,
-                # mark as DNP.  If no rows at all exist for that date/matchup, the
-                # game hasn't been loaded yet — leave pending.
-                game_date_val = (
-                    row["game_date"]
-                    if row["game_date"]
-                    else pred_ts.date().isoformat()
-                )
-                game_played = conn.execute(
-                    "SELECT COUNT(*) FROM player_stats "
-                    "WHERE DATE(gameDateTimeEst) = ? "
-                    "  AND (opponentteamName = ? OR playerteamName = ?)",
-                    (game_date_val, opp_nickname, opp_nickname),
-                ).fetchone()[0]
-                if game_played > 0:
-                    conn.execute(
-                        "UPDATE predictions SET actual_result = 'DNP' WHERE id = ?",
-                        (row["id"],),
-                    )
-                    dnp_absence += 1
-                    resolved += 1
-                continue
-
-            try:
-                game_dt = datetime.fromisoformat(
-                    str(game["gameDateTimeEst"]).replace("Z", "").replace("+00:00", "")
-                )
-            except ValueError:
-                continue
-
-            if abs((game_dt - pred_ts).total_seconds()) > 86400:
-                continue
-
-            minutes_val = game["numMinutes"] if "numMinutes" in select_cols else None
-            if minutes_val is None or float(minutes_val or 0) == 0:
-                actual_result = "DNP"
-                dnp_zero_min += 1
-            else:
-                actual_value = sum(float(game[c] or 0) for c in stat_cols if c in select_cols)
-                actual_result = "OVER" if actual_value > row["stat_line"] else "UNDER"
-
             conn.execute(
                 "UPDATE predictions SET actual_result = ? WHERE id = ?",
-                (actual_result, row["id"]),
+                (d["result"], row["id"]),
             )
             resolved += 1
+            dnp_zero_min += d["kind"] == "dnp_zero_min"
+            dnp_absence  += d["kind"] == "dnp_absent"
 
         conn.commit()
     finally:
@@ -412,7 +534,8 @@ def resolve_pending_predictions() -> int:
             f"Resolved {resolved} pending prediction(s) — "
             f"{normal} OVER/UNDER, "
             f"{dnp_zero_min} DNP (zero minutes), "
-            f"{dnp_absence} DNP (absent from box score)."
+            f"{dnp_absence} DNP (absent from box score).",
+            flush=True,
         )
     return resolved
 
