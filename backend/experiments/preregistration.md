@@ -583,3 +583,86 @@ Recorded on 2026-10-20 at about 12:45 ET, before any 2026-27 result existed: the
 - features_json gains two keys that are not model inputs: line_hits_last10 and games_last10 (used for the app's explanation text).
 - A player whose latest box score has no team id, and who is on no roster, is recorded as "no team context" instead of an error.
 - Not changed: home_away_split and opp_def_rating_last5 at inference still read 0-minute rows, which training excludes. Both are among the six features listed as not verified identical in "Frozen 2026-27 NBA model".
+
+## Entry: Test A on backfilled historical lines (2026-10-22)
+
+Recorded before any backfilled line is downloaded: historical_snapshots does not exist and
+no historical price has been seen. Earlier sections are unchanged.
+
+### Scope
+
+- Only Test A is run on backfilled data.
+- Tests B (cross-book disagreement) and D (market-baseline residual) are named in Step 0
+  and logging_plan.md but have no hypothesis, metric, threshold or n anywhere in the repo.
+  They remain undefined. Each gets its own dated entry before any backfilled line is
+  joined to a result for it.
+- The frozen 2026-27 models are not evaluated on backfilled games. Seasons 2023-24,
+  2024-25 and 2025-26 are in their training data. No backfilled row enters H1, H2, H3,
+  the section 5 feature ablation, or the December check. No backfilled row is used to
+  fit or tune any model. Evaluating any model on backfilled lines (including the planned
+  challenger's one-shot historical test) requires its own dated entry before any of its
+  results are computed.
+- Test A stays exploratory, as in section 4 of "Amendment: December and season-end
+  criteria": reported, never decisive. No edge is declared from it. Within Test A, the
+  Points analysis is primary (reported first and in full); Rebounds, Assists and 3PM are
+  secondary.
+
+### Data
+
+- Source: OddsAPI historical event odds (backend/backfill.py), one snapshot per game at
+  T-30 minutes before the event's commence_time (the closest snapshot at or before that
+  time), stored in historical_snapshots with phase = 'backfill'. The same 10 named
+  bookmakers as the live logger, includeMultipliers=true.
+- Each row records its snapshot time. Rows whose snapshot is more than 60 minutes before
+  T-30 are excluded and counted.
+- Seasons: 2025-26, 2024-25, 2023-24, newest first, as far as the credit budget reaches.
+  The games actually pulled are listed by game id in a dated entry before any result is
+  joined. If the budget stops partway through a season, that season is reported as partial.
+- Game types: as game_types.py (Regular Season, NBA Emirates Cup 2023 group/QF/SF,
+  Playoffs, Play-in). Preseason, All-Star and the Cup final are excluded.
+- Excluded: the two stage 3 probe games, chosen before any historical line was seen:
+  Kaggle gameId 22500580 (Boston Celtics @ Miami Heat, 2026-01-15 19:30 ET) and
+  gameId 22300571 (San Antonio Spurs @ Boston Celtics, 2024-01-17 19:30 ET).
+- Results: the box score's own stat column (points, reboundsTotal, assists,
+  threePointersMade), matched as real_lines.py matches props to games.
+- Unmatched prop rows are counted and reported by reason. The matching code may be fixed
+  before any result is joined; the commit used is recorded in the dated entry that lists
+  the games pulled.
+
+### Definition
+
+Section 4 defines Test A as calibration (Brier, reliability bins) of Shin-devigged
+FanDuel/DraftKings P(over) at the pre-tip snapshot. Fixed here:
+
+- Primary: Points, main market (player_points). Secondary, exploratory: Rebounds,
+  Assists and 3PM, main markets (player_rebounds, player_assists, player_threes).
+  Alternate ladders are not used.
+- Line: both sides priced at the same point in the book's main market. A book posting
+  more than one main point for a player in the snapshot is excluded for that player
+  and counted.
+- Devig: Shin's method per book, with z solved by bisection, as in the H2 clarification.
+  If the implied probabilities sum to 1 or less, z = 0 and they are normalized
+  proportionally; such rows are flagged and counted.
+- Unit: one row per (game, player, stat, book). FanDuel and DraftKings are scored
+  separately; they are never averaged or pooled.
+- Outcome: Over hits iff actual > line. DNP (0 or NULL minutes) and pushes are dropped
+  and counted. Players with no box-score row for the game are dropped and counted
+  separately.
+- Metrics, per stat and per book:
+  - Brier score of fair P(over) against the outcome;
+  - reliability table over 10 equal-width bins of fair P(over) on [0, 1] (the last bin
+    includes 1.0), with each bin's mean fair P, observed over rate, row count and
+    game count;
+  - reference: the Brier score of the constant base rate on the same rows.
+- Uncertainty: game-clustered bootstrap over game ids, 2,000 resamples, seed 20261022,
+  percentile 95% intervals for the Brier score and each bin's observed over rate.
+- No pass threshold. The result describes how well the devigged market is calibrated
+  and is labelled "FanDuel/DraftKings historical lines".
+
+### Underdog in backfilled data
+
+- Whether OddsAPI's historical feed carries Underdog lines in each season is unknown
+  until the stage 3 pull. Underdog rows from the backfill are stored but enter no test
+  in this entry.
+
+No backfilled line had been downloaded when this entry was written.
