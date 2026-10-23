@@ -36,3 +36,6 @@ frontend/dist/
 # OS/editor noise
 .DS_Store
 Thumbs.db
+
+# Cross-process lock files (backend/proc_lock.py)
+*.lock

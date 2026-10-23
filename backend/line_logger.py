@@ -940,7 +940,29 @@ def _tipoffs_within(minutes: int, now: dt.datetime | None = None) -> list[str]:
     return [f"{gid} @ {tip[11:16]} ET" for gid, tip in rows]
 
 
+MAINTENANCE_LOCK_WAIT_MINUTES = 30  # wait this long for another ETL/maintenance, then skip
+
+
 def run_morning_maintenance(scheduler=None) -> dict:
+    """
+    _run_morning_maintenance under proc_lock.ETL_LOCK (cross-process), so it never
+    overlaps another maintenance, ETL or Kaggle retry, in this process or another
+    (e.g. a manual `python -c "...run_morning_maintenance()"`). Waits up to
+    MAINTENANCE_LOCK_WAIT_MINUTES, then skips the whole job with a log line.
+    """
+    import proc_lock
+    if not proc_lock.ETL_LOCK.acquire(timeout=MAINTENANCE_LOCK_WAIT_MINUTES * 60,
+                                      who="morning maintenance"):
+        print(f"[maintenance] SKIPPED: another ETL or maintenance still held the lock after "
+              f"{MAINTENANCE_LOCK_WAIT_MINUTES} min")
+        return {"skipped": "etl lock held"}
+    try:
+        return _run_morning_maintenance(scheduler)
+    finally:
+        proc_lock.ETL_LOCK.release()
+
+
+def _run_morning_maintenance(scheduler=None) -> dict:
     """
     Daily at MAINTENANCE_HOUR_ET:
       1. back up predictions.db (abort the whole job if that fails);
@@ -948,8 +970,8 @@ def run_morning_maintenance(scheduler=None) -> dict:
          job continues: player teams then fall back to box scores once rows age out);
       2. run database.run_etl(), unless a pre-tip pull is scheduled within
          ETL_PRETIP_GUARD_MINUTES or a game in the schedule table tips within
-         ETL_TIPOFF_GUARD_MINUTES (the ETL replaces player_stats/players/schedule
-         in place, and a pre-tip paper prediction would read the partial tables).
+         ETL_TIPOFF_GUARD_MINUTES (the load is swapped in atomically, but it runs for
+         minutes and its swap holds the write lock that pre-tip pulls need).
          The tip-off check needs no scheduler, so it also guards manual runs.
          If the newest Kaggle version 404s (KaggleVersionUnavailable), the ETL is
          skipped with no table changed and no restore; the next run retries.
@@ -1100,6 +1122,24 @@ def _schedule_kaggle_retry(scheduler, backup_path: str, baseline: int | None, da
 
 def run_kaggle_version_retry(scheduler=None, backup_path: str = "", baseline: int | None = None,
                              day: str = "", attempt: int = 1) -> str:
+    """
+    _run_kaggle_version_retry under proc_lock.ETL_LOCK. If another ETL or maintenance
+    holds it, this check is skipped (one log line) and the next one is scheduled.
+    """
+    import proc_lock
+    if not proc_lock.ETL_LOCK.acquire(timeout=0, who=f"kaggle-retry check {attempt}"):
+        print(f"[kaggle-retry] check {attempt}: another ETL or maintenance is running; "
+              f"next check in {KAGGLE_RETRY_MINUTES} min")
+        _schedule_kaggle_retry(scheduler, backup_path, baseline, day, attempt + 1)
+        return "deferred: etl lock"
+    try:
+        return _run_kaggle_version_retry(scheduler, backup_path, baseline, day, attempt)
+    finally:
+        proc_lock.ETL_LOCK.release()
+
+
+def _run_kaggle_version_retry(scheduler=None, backup_path: str = "", baseline: int | None = None,
+                              day: str = "", attempt: int = 1) -> str:
     """
     One cheap version check (metadata only). If Kaggle has a newer version than
     `baseline` (the version loaded when maintenance found nothing new), run

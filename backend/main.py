@@ -56,6 +56,19 @@ def _startup_step(name: str, fn, *args, **kwargs):
 def startup_event():
     import os
     import importlib
+    import proc_lock
+
+    # Single instance, before anything else: uvicorn runs this hook BEFORE binding the
+    # port, so a second `uvicorn main:app` would otherwise start a second scheduler
+    # (duplicate pulls, overlapping ETLs) until its bind fails. Held for the process's
+    # life; the OS drops it when the process exits, even on a crash.
+    if not proc_lock.INSTANCE_LOCK.acquire(timeout=0, who="startup"):
+        msg = (f"another backend instance holds {proc_lock.lock_path('instance')}: this one "
+               f"starts no scheduler, ETL or poller and exits")
+        print("!" * 78, flush=True)
+        print(f"[startup] REFUSED: {msg}", flush=True)
+        print("!" * 78, flush=True)
+        raise RuntimeError(msg)
 
     # WAL first, before any scheduler thread opens a connection: readers no longer
     # block on writers (ETL, scheduler, news poller, API). Persistent once set.
@@ -116,8 +129,11 @@ def startup_event():
 
 @app.on_event("shutdown")
 def shutdown_event():
+    import proc_lock
     line_logger.stop_scheduler()
     news_ingest.stop_scheduler()
+    if proc_lock.INSTANCE_LOCK.held:
+        proc_lock.INSTANCE_LOCK.release()
 
 
 # ---------------------------------------------------------------------------

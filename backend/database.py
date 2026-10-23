@@ -1,5 +1,6 @@
 import sqlite3
 import os
+import time
 import unicodedata
 import pandas as pd
 from datetime import datetime, date, timedelta
@@ -783,9 +784,10 @@ def _snapshot_minutes(conn) -> bool:
     return True
 
 
-def _guard_null_minutes(conn) -> dict:
+def _guard_null_minutes(conn, table: str = "player_stats") -> dict:
     """
-    After a new version is loaded: where numMinutes is NULL but the previous version
+    After a new version is loaded into `table` (the staging table, while the old
+    player_stats is still live): where numMinutes is NULL but the previous version
     had a value for the same (gameId, personId), keep the previous value (Kaggle v523
     blanked all 27 rows of 22600088). Also warn about games new in this version with
     NULL minutes and counting stats present. Prints one warning per case; returns
@@ -794,17 +796,17 @@ def _guard_null_minutes(conn) -> dict:
     prev = ("SELECT p.numMinutes FROM temp.prev_minutes p WHERE p.gameId = s.gameId "
             "AND p.personId = s.personId AND p.numMinutes IS NOT NULL")
     restored = dict(conn.execute(
-        f"SELECT gameId, COUNT(*) FROM main.player_stats s WHERE numMinutes IS NULL "
+        f'SELECT gameId, COUNT(*) FROM main."{table}" s WHERE numMinutes IS NULL '
         f"AND EXISTS ({prev}) GROUP BY gameId").fetchall())
     if restored:
-        conn.execute(f"UPDATE main.player_stats AS s SET numMinutes = ({prev} LIMIT 1) "
+        conn.execute(f'UPDATE main."{table}" AS s SET numMinutes = ({prev} LIMIT 1) '
                      f"WHERE numMinutes IS NULL AND EXISTS ({prev})")
         print(f"  WARNING: new Kaggle version has NULL numMinutes where the previous one had a "
               f"value: kept the previous value for {sum(restored.values())} row(s) in "
               f"{len(restored)} game(s): {restored}", flush=True)
     has_stats = " OR ".join(f"s.{c} > 0" for c in DNP_COUNTING_COLS)
     new_null = dict(conn.execute(
-        f"SELECT gameId, COUNT(*) FROM main.player_stats s WHERE numMinutes IS NULL "
+        f'SELECT gameId, COUNT(*) FROM main."{table}" s WHERE numMinutes IS NULL '
         f"AND ({has_stats}) AND NOT EXISTS "
         f"(SELECT 1 FROM temp.prev_minutes p WHERE p.gameId = s.gameId) GROUP BY gameId").fetchall())
     if new_null:
@@ -815,13 +817,65 @@ def _guard_null_minutes(conn) -> dict:
     return {"restored": restored, "new_null_games": new_null}
 
 
+ETL_SWAP_TABLES = ("player_stats", "players", "schedule")
+STAGING_SUFFIX = "__new"
+
+
 def run_etl() -> bool:
+    """
+    _run_etl under proc_lock.ETL_LOCK (cross-process). A second caller waits, then
+    finds the version already loaded and skips: two loads never run in parallel.
+    Re-entrant, so morning maintenance (which holds the lock) can call it.
+    """
+    import proc_lock
+    proc_lock.ETL_LOCK.acquire(who="run_etl")
+    try:
+        return _run_etl()
+    finally:
+        proc_lock.ETL_LOCK.release()
+
+
+def _swap_in(conn, version: int) -> None:
+    """
+    In ONE transaction: replace player_stats, players and schedule with their staging
+    tables (which already carry their indexes) and record `version`. Readers (WAL)
+    see the old tables until COMMIT and the new ones after, never a partial load.
+    """
+    conn.commit()
+    conn.isolation_level = None
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            for t in ETL_SWAP_TABLES:
+                conn.execute(f'DROP TABLE IF EXISTS main."{t}"')
+                conn.execute(f'ALTER TABLE main."{t}{STAGING_SUFFIX}" RENAME TO "{t}"')
+            conn.execute("CREATE TABLE IF NOT EXISTS kaggle_version (version INTEGER)")
+            conn.execute("DELETE FROM kaggle_version")
+            conn.execute("INSERT INTO kaggle_version (version) VALUES (?)", (version,))
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+    finally:
+        conn.isolation_level = ""
+
+
+def _drop_staging(conn) -> None:
+    for t in ETL_SWAP_TABLES:
+        conn.execute(f'DROP TABLE IF EXISTS main."{t}{STAGING_SUFFIX}"')
+    conn.commit()
+
+
+def _run_etl() -> bool:
     """
     Download the Kaggle NBA dataset and load it into SQLite.
     Skips if the stored dataset version already matches the latest Kaggle version.
-    Drops and recreates player_stats, players, and schedule when a new version is found.
-    The predictions and kaggle_version tables are never touched.
-    Every file is downloaded before any table is replaced, so a KaggleVersionUnavailable
+    A new version is loaded into staging tables (player_stats__new, players__new,
+    schedule__new), indexed, NULL-minutes-guarded against the live player_stats, then
+    swapped in with kaggle_version in one transaction (_swap_in). Live tables are never
+    partial; a failure before the swap drops the staging tables and changes nothing.
+    The predictions table is never touched.
+    Every file is downloaded before any table is written, so a KaggleVersionUnavailable
     (404 on the newest version) leaves all tables as they were.
     Returns True if ETL ran, False if skipped.
     """
@@ -849,65 +903,68 @@ def run_etl() -> bool:
     files = download_kaggle_files(latest_version)
     print(f"Dataset files: {files}")
 
-    # --- PlayerStatisticsExtended.csv → player_stats ---
-    stats_path = files["stats"]
-    print("Loading PlayerStatisticsExtended.csv in chunks...")
-    total_rows = 0
+    stats_new, players_new, schedule_new = (f"{t}{STAGING_SUFFIX}" for t in ETL_SWAP_TABLES)
     conn = sqlite3.connect(DB_PATH, timeout=30)
-    had_previous = _snapshot_minutes(conn)
-    for i, chunk in enumerate(
-        pd.read_csv(stats_path, usecols=_STATS_COLS, chunksize=10_000)
-    ):
-        chunk.to_sql(
-            "player_stats", conn,
-            if_exists="replace" if i == 0 else "append",
-            index=False,
+    try:
+        _drop_staging(conn)                       # leftovers from a failed run
+
+        # --- PlayerStatisticsExtended.csv → player_stats__new ---
+        stats_path = files["stats"]
+        print("Loading PlayerStatisticsExtended.csv in chunks (staging)...")
+        total_rows = 0
+        had_previous = _snapshot_minutes(conn)    # from the live player_stats
+        for i, chunk in enumerate(
+            pd.read_csv(stats_path, usecols=_STATS_COLS, chunksize=10_000)
+        ):
+            chunk.to_sql(
+                stats_new, conn,
+                if_exists="replace" if i == 0 else "append",
+                index=False,
+            )
+            total_rows += len(chunk)
+            if (i + 1) % 10 == 0:
+                print(f"  ...{total_rows:,} rows loaded")
+        if had_previous:
+            _guard_null_minutes(conn, stats_new)
+        print(f"  Done — {total_rows:,} rows total")
+
+        # --- Players.csv → players__new ---
+        players_path = files["players"]
+        print("Loading Players.csv (staging)...")
+        players_df = pd.read_csv(
+            players_path, usecols=["personId", "firstName", "lastName"]
         )
-        total_rows += len(chunk)
-        if (i + 1) % 10 == 0:
-            print(f"  ...{total_rows:,} rows loaded")
-    if had_previous:
-        _guard_null_minutes(conn)
-    conn.close()
-    print(f"  Done — {total_rows:,} rows total")
+        players_df.to_sql(players_new, conn, if_exists="replace", index=False)
+        print(f"  Done — {len(players_df):,} players")
 
-    # --- Players.csv → players ---
-    players_path = files["players"]
-    print("Loading Players.csv...")
-    players_df = pd.read_csv(
-        players_path, usecols=["personId", "firstName", "lastName"]
-    )
-    conn = sqlite3.connect(DB_PATH, timeout=30)
-    players_df.to_sql("players", conn, if_exists="replace", index=False)
-    conn.close()
-    print(f"  Done — {len(players_df):,} players")
+        # --- LeagueSchedule<current season>.csv → schedule__new ---
+        schedule_path = files["schedule"]
+        print(f"Loading {os.path.basename(schedule_path)} (staging)...")
+        schedule_df = read_schedule_csv(schedule_path)
+        schedule_df = schedule_df[schedule_df["homeTeamId"] != 0]
+        schedule_df.to_sql(schedule_new, conn, if_exists="replace", index=False)
+        print(f"  Done — {len(schedule_df):,} games")
 
-    # --- LeagueSchedule<current season>.csv → schedule ---
-    schedule_path = files["schedule"]
-    print(f"Loading {os.path.basename(schedule_path)}...")
-    schedule_df = read_schedule_csv(schedule_path)
-    schedule_df = schedule_df[schedule_df["homeTeamId"] != 0]
-    conn = sqlite3.connect(DB_PATH, timeout=30)
-    schedule_df.to_sql("schedule", conn, if_exists="replace", index=False)
-    conn.close()
-    print(f"  Done — {len(schedule_df):,} games")
+        # --- Indexes, on the staging tables (index names must be unique per DB; they
+        # move with their table on rename, and drop with the old table) ---
+        print("Creating indexes...")
+        sfx = f"{time.time_ns()}"
+        conn.execute(f"CREATE INDEX idx_stats_person_{sfx} ON {stats_new}(personId)")
+        conn.execute(f"CREATE INDEX idx_stats_date_{sfx}   ON {stats_new}(gameDateTimeEst)")
+        conn.execute(f"CREATE INDEX idx_schedule_home_{sfx} ON {schedule_new}(homeTeamId)")
+        conn.execute(f"CREATE INDEX idx_schedule_away_{sfx} ON {schedule_new}(awayTeamId)")
+        conn.commit()
 
-    # --- Indexes ---
-    print("Creating indexes...")
-    conn = sqlite3.connect(DB_PATH, timeout=30)
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_stats_person ON player_stats(personId)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_stats_date   ON player_stats(gameDateTimeEst)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_schedule_home ON schedule(homeTeamId)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_schedule_away ON schedule(awayTeamId)")
-    conn.commit()
-    conn.close()
-
-    # --- Store the version we just loaded ---
-    conn = sqlite3.connect(DB_PATH, timeout=30)
-    conn.execute("DELETE FROM kaggle_version")
-    conn.execute("INSERT INTO kaggle_version (version) VALUES (?)", (latest_version,))
-    conn.commit()
-    conn.close()
+        # --- Swap in, with the version we just loaded, in one transaction ---
+        _swap_in(conn, latest_version)
+    except BaseException:
+        try:
+            _drop_staging(conn)
+        except sqlite3.Error:
+            pass
+        raise
+    finally:
+        conn.close()
 
     print("ETL complete.")
     resolve_pending_predictions()
