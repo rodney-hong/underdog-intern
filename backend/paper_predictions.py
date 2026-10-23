@@ -33,7 +33,7 @@ import joblib
 import numpy as np
 import pandas as pd
 
-from database import DB_PATH
+from database import DB_PATH, DNP_COUNTING_COLS, played
 from line_logger import STAT_MARKETS
 
 # Per stat: frozen model file, its SHA-256 as recorded in experiments/preregistration.md
@@ -389,9 +389,12 @@ def resolve_paper_predictions(conn=None) -> int:
         if not team_played:
             continue                                   # box score not loaded yet
         row = conn.execute(
-            f"SELECT {column} AS value, numMinutes FROM player_stats WHERE personId = ? "
-            f"AND substr(gameDateTimeEst,1,10) = ?", (r["person_id"], r["game_date"])).fetchone()
-        if row is None or not row["numMinutes"]:
+            f"SELECT {column} AS value, numMinutes, {', '.join(DNP_COUNTING_COLS)} FROM player_stats "
+            f"WHERE personId = ? AND substr(gameDateTimeEst,1,10) = ?",
+            (r["person_id"], r["game_date"])).fetchone()
+        # DNP only if minutes and every counting stat are 0/NULL (database.played;
+        # pre-registered 2026-10-23, Kaggle NULL-minutes entry).
+        if row is None or not played(row["numMinutes"], [row[c] for c in DNP_COUNTING_COLS]):
             actual, result = None, "DNP"
         else:
             actual = float(row["value"])

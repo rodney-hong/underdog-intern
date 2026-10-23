@@ -130,6 +130,37 @@ def test_unknown_name_stays_pending(db):
     assert d["result"] is None and "matches no" in d["warning"]
 
 
+def test_null_minutes_with_stats_is_graded_as_played(db):
+    # Kaggle v523: numMinutes NULL, every other column present.
+    _stats(db, (1630581, "Josh", "Giddey", f"{GAME_DAY} 19:30:00", "Bulls", "Raptors",
+                None, 18, 9, 2))
+    pid = _predict(db, "Josh Giddey", "Points", 16.5, "Toronto Raptors")
+    d = _decisions()[pid]
+    assert (d["result"], d["kind"]) == ("OVER", "graded")
+
+
+def test_null_minutes_without_stats_is_dnp(db):
+    _stats(db, (1630581, "Josh", "Giddey", f"{GAME_DAY} 19:30:00", "Bulls", "Raptors",
+                None, 0, None, 0))
+    pid = _predict(db, "Josh Giddey", "Points", 16.5, "Toronto Raptors")
+    d = _decisions()[pid]
+    assert (d["result"], d["kind"]) == ("DNP", "dnp_zero_min")
+
+
+def test_zero_minutes_without_stats_is_dnp(db):
+    _stats(db, (1630581, "Josh", "Giddey", f"{GAME_DAY} 19:30:00", "Bulls", "Raptors",
+                0, 0, 0, 0))
+    pid = _predict(db, "Josh Giddey", "Rebounds", 7.5, "Toronto Raptors")
+    assert _decisions()[pid]["result"] == "DNP"
+
+
+def test_played_rule():
+    assert database.played(24.6, [7, 4, 1])
+    assert database.played(None, [0, None, 2])
+    assert not database.played(None, [0, None, 0])
+    assert not database.played(0, [])
+
+
 def test_resolve_writes_graded_result_for_renamed_player(db):
     _stats(db, (1626171, "Bobby", "Portis Jr.", f"{GAME_DAY} 19:30:00", "Heat", "Timberwolves",
                 24.58, 7, 4, 1))

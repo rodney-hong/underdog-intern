@@ -301,6 +301,20 @@ _RESOLVE_STAT_COLS = {
 
 RESOLVE_BATCH_SIZE = 50  # pending rows per commit, so the write lock is never held for long
 
+# Counting stats that show a player was on the floor even when numMinutes is missing.
+DNP_COUNTING_COLS = ("points", "reboundsTotal", "assists", "threePointersMade",
+                     "blocks", "steals", "turnovers")
+
+
+def played(minutes, counting) -> bool:
+    """
+    False (DNP) only if minutes are 0/NULL and every counting stat is 0/NULL. NULL
+    minutes with any counting stat means he played: Kaggle v523 blanked numMinutes
+    for all 27 rows of 22600088 (2026-10-21) and kept every other column.
+    Shared by the app resolver and paper_predictions.resolve_paper_predictions.
+    """
+    return bool(minutes) or any(bool(v) for v in counting)
+
 
 def _pending_predictions() -> list:
     """App predictions with no result whose ET game date is before today."""
@@ -425,7 +439,8 @@ def _resolve_decision(conn, row, index: tuple[dict, dict], available_cols: set) 
     if person_id is None:
         return out
 
-    select_cols = [c for c in stat_cols + ["gameDateTimeEst", "numMinutes"]
+    select_cols = [c for c in dict.fromkeys(stat_cols + ["gameDateTimeEst", "numMinutes",
+                                                         *DNP_COUNTING_COLS])
                    if c in available_cols]
     day_rows = conn.execute(
         f"SELECT {', '.join(select_cols)}, playerteamName, opponentteamName "
@@ -438,7 +453,7 @@ def _resolve_decision(conn, row, index: tuple[dict, dict], available_cols: set) 
         minutes_val = game["numMinutes"] if "numMinutes" in select_cols else None
         out["matched"] = {"date": game["gameDateTimeEst"], "team": game["playerteamName"],
                           "opponent": game["opponentteamName"], "minutes": minutes_val}
-        if minutes_val is None or float(minutes_val or 0) == 0:
+        if not played(minutes_val, [game[c] for c in DNP_COUNTING_COLS if c in select_cols]):
             out["result"], out["kind"] = "DNP", "dnp_zero_min"
         else:
             actual_value = sum(float(game[c] or 0) for c in stat_cols if c in select_cols)
@@ -753,6 +768,53 @@ def restore_predictions_from_csv() -> int:
     return inserted
 
 
+def _snapshot_minutes(conn) -> bool:
+    """
+    Copy (gameId, personId, numMinutes) of the loaded player_stats into TEMP
+    prev_minutes before run_etl replaces it. False if there is no player_stats yet.
+    """
+    conn.execute("DROP TABLE IF EXISTS temp.prev_minutes")
+    try:
+        conn.execute("CREATE TEMP TABLE prev_minutes AS "
+                     "SELECT gameId, personId, numMinutes FROM main.player_stats")
+    except sqlite3.OperationalError:
+        return False
+    conn.execute("CREATE INDEX temp.idx_prev_minutes ON prev_minutes(gameId, personId)")
+    return True
+
+
+def _guard_null_minutes(conn) -> dict:
+    """
+    After a new version is loaded: where numMinutes is NULL but the previous version
+    had a value for the same (gameId, personId), keep the previous value (Kaggle v523
+    blanked all 27 rows of 22600088). Also warn about games new in this version with
+    NULL minutes and counting stats present. Prints one warning per case; returns
+    {"restored": {gameId: rows}, "new_null_games": {gameId: rows}}.
+    """
+    prev = ("SELECT p.numMinutes FROM temp.prev_minutes p WHERE p.gameId = s.gameId "
+            "AND p.personId = s.personId AND p.numMinutes IS NOT NULL")
+    restored = dict(conn.execute(
+        f"SELECT gameId, COUNT(*) FROM main.player_stats s WHERE numMinutes IS NULL "
+        f"AND EXISTS ({prev}) GROUP BY gameId").fetchall())
+    if restored:
+        conn.execute(f"UPDATE main.player_stats AS s SET numMinutes = ({prev} LIMIT 1) "
+                     f"WHERE numMinutes IS NULL AND EXISTS ({prev})")
+        print(f"  WARNING: new Kaggle version has NULL numMinutes where the previous one had a "
+              f"value: kept the previous value for {sum(restored.values())} row(s) in "
+              f"{len(restored)} game(s): {restored}", flush=True)
+    has_stats = " OR ".join(f"s.{c} > 0" for c in DNP_COUNTING_COLS)
+    new_null = dict(conn.execute(
+        f"SELECT gameId, COUNT(*) FROM main.player_stats s WHERE numMinutes IS NULL "
+        f"AND ({has_stats}) AND NOT EXISTS "
+        f"(SELECT 1 FROM temp.prev_minutes p WHERE p.gameId = s.gameId) GROUP BY gameId").fetchall())
+    if new_null:
+        print(f"  WARNING: {sum(new_null.values())} row(s) in {len(new_null)} game(s) new in this "
+              f"version have NULL numMinutes with counting stats present: {new_null}", flush=True)
+    conn.commit()
+    conn.execute("DROP TABLE temp.prev_minutes")
+    return {"restored": restored, "new_null_games": new_null}
+
+
 def run_etl() -> bool:
     """
     Download the Kaggle NBA dataset and load it into SQLite.
@@ -792,6 +854,7 @@ def run_etl() -> bool:
     print("Loading PlayerStatisticsExtended.csv in chunks...")
     total_rows = 0
     conn = sqlite3.connect(DB_PATH, timeout=30)
+    had_previous = _snapshot_minutes(conn)
     for i, chunk in enumerate(
         pd.read_csv(stats_path, usecols=_STATS_COLS, chunksize=10_000)
     ):
@@ -803,6 +866,8 @@ def run_etl() -> bool:
         total_rows += len(chunk)
         if (i + 1) % 10 == 0:
             print(f"  ...{total_rows:,} rows loaded")
+    if had_previous:
+        _guard_null_minutes(conn)
     conn.close()
     print(f"  Done — {total_rows:,} rows total")
 
