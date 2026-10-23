@@ -88,6 +88,10 @@ EVENTS_RETRY_MINUTES = 20  # retry a FAILED scheduling events call until today's
 MAINTENANCE_HOUR_ET  = 7   # backup -> ETL -> resolve (run_morning_maintenance)
 ETL_PRETIP_GUARD_MINUTES = 60  # skip the ETL if a pre-tip pull is due this soon
 ETL_TIPOFF_GUARD_MINUTES = 90  # skip the ETL if a scheduled game tips this soon (works without a scheduler)
+KAGGLE_RETRY_MINUTES = 60      # re-check for a new Kaggle version this often after an "up to date" maintenance
+PULL_WINDOW_MINUTES  = 15      # no retry ETL this close to a scheduled pull: ETL holds the write lock ~20 s,
+                               # pullers time out after 30 s
+PULL_JOB_PREFIXES = ("line_open_pull", "line_open_catchup", "pretip:", "pretip-retry:")
 BACKUP_DIR  = os.path.join(os.path.dirname(os.path.abspath(DB_PATH)), "backups")
 BACKUP_KEEP = 3
 PRETIP_MINUTES     = int(os.getenv("LINE_LOG_PRETIP_MINUTES", "30"))
@@ -966,10 +970,18 @@ def run_morning_maintenance(scheduler=None) -> dict:
             ran = database.run_etl()
             out["etl"] = "ran" if ran else "up to date"
             print(f"[maintenance] 2/3 ETL OK: {'new Kaggle version loaded' if ran else 'dataset already up to date'}")
+            if not ran:
+                # Kaggle usually publishes mid-morning ET: keep checking hourly today.
+                out["kaggle_retry"] = _schedule_kaggle_retry(
+                    scheduler, path, _stored_kaggle_version(),
+                    dt.datetime.now(EASTERN).date().isoformat(), attempt=1)
         except database.KaggleVersionUnavailable as exc:
             out["etl"] = f"skipped: newest Kaggle version not downloadable: {exc}"
             print(f"[maintenance] 2/3 ETL SKIPPED: newest Kaggle version not downloadable ({exc}); "
-                  f"tables untouched, retrying at the next maintenance")
+                  f"tables untouched, retrying hourly")
+            out["kaggle_retry"] = _schedule_kaggle_retry(
+                scheduler, path, _stored_kaggle_version(),
+                dt.datetime.now(EASTERN).date().isoformat(), attempt=1)
         except Exception as exc:
             out["etl"] = f"FAILED: {exc!r}"
             print(f"[maintenance] 2/3 ETL FAILED: {exc!r}")
@@ -994,6 +1006,171 @@ def run_morning_maintenance(scheduler=None) -> dict:
         print(f"[maintenance] 3/3 resolve FAILED: {exc!r}")
     print("[maintenance] done")
     return out
+
+
+# ---------------------------------------------------------------------------
+# Kaggle version retry: hourly after an "up to date" maintenance, same guards
+# ---------------------------------------------------------------------------
+
+def _stored_kaggle_version() -> int | None:
+    """The Kaggle version run_etl last loaded, or None if there is no kaggle_version table."""
+    conn = sqlite3.connect(DB_PATH, timeout=30)
+    try:
+        row = conn.execute("SELECT version FROM kaggle_version LIMIT 1").fetchone()
+    except sqlite3.OperationalError:
+        return None
+    finally:
+        conn.close()
+    return row[0] if row else None
+
+
+def _scheduled_pull_times(scheduler, day: dt.datetime) -> list[dt.datetime]:
+    """
+    Run times of scheduled pulls: pending open / pre-tip jobs, plus `day`'s open-pull
+    time, since once the open-pull cron fires its next_run_time is already tomorrow.
+    """
+    times = []
+    if OPEN_PULL_ENABLED:
+        times.append(day.astimezone(EASTERN).replace(hour=OPEN_PULL_HOUR_ET, minute=0,
+                                                     second=0, microsecond=0))
+    if scheduler is not None:
+        times += [j.next_run_time for j in scheduler.get_jobs()
+                  if j.id.startswith(PULL_JOB_PREFIXES) and j.next_run_time is not None]
+    return times
+
+
+def _clear_of_pulls(scheduler, t: dt.datetime) -> dt.datetime:
+    """Earliest time >= t that is not within PULL_WINDOW_MINUTES of a scheduled pull."""
+    w = dt.timedelta(minutes=PULL_WINDOW_MINUTES)
+    pulls = _scheduled_pull_times(scheduler, t)
+    moved = True
+    while moved:                                  # windows can chain (pulls < 30 min apart)
+        moved = False
+        for p in pulls:
+            if p - w <= t < p + w:
+                t, moved = (p + w).astimezone(EASTERN), True
+    return t
+
+
+def _schedule_kaggle_retry(scheduler, backup_path: str, baseline: int | None, day: str,
+                           attempt: int, run_at: dt.datetime | None = None) -> str:
+    """
+    Schedule check `attempt` at run_at (default KAGGLE_RETRY_MINUTES from now), pushed
+    to the end of any scheduled pull's window; nothing if that falls past `day` (ET).
+    """
+    if scheduler is None:
+        return "no scheduler, no retry"
+    run_at = _clear_of_pulls(scheduler, run_at or dt.datetime.now(EASTERN)
+                             + dt.timedelta(minutes=KAGGLE_RETRY_MINUTES))
+    if run_at.date().isoformat() != day:
+        print(f"[kaggle-retry] next check would fall after {day}; stopping for today")
+        return "stopped: day over"
+    scheduler.add_job(
+        run_kaggle_version_retry, "date", run_date=run_at,
+        kwargs={"scheduler": scheduler, "backup_path": backup_path, "baseline": baseline,
+                "day": day, "attempt": attempt},
+        id="kaggle_version_retry", replace_existing=True, max_instances=1,
+        misfire_grace_time=30 * 60,
+    )
+    return f"check {attempt} at {run_at:%H:%M} ET"
+
+
+def run_kaggle_version_retry(scheduler=None, backup_path: str = "", baseline: int | None = None,
+                             day: str = "", attempt: int = 1) -> str:
+    """
+    One cheap version check (metadata only). If Kaggle has a newer version than
+    `baseline` (the version loaded when maintenance found nothing new), run
+    database.run_etl() then resolve paper predictions, under the maintenance guards.
+    Stops (schedules nothing more) when: the guards close (a pre-tip pull within
+    ETL_PRETIP_GUARD_MINUTES or a tip within ETL_TIPOFF_GUARD_MINUTES; the slate then
+    runs into the night), a version newer than
+    `baseline` is already loaded (by this job or anything else), the ETL fails, or the
+    next check would fall past `day`. A check within PULL_WINDOW_MINUTES of a scheduled
+    pull (open or pre-tip) is moved to the end of that window, not dropped.
+    An ETL failure restores ETL_TABLES from the morning backup at `backup_path`, which
+    still matches them because the morning ETL changed nothing. Each check logs one line.
+    """
+    now = dt.datetime.now(EASTERN)
+    tag = f"[kaggle-retry] check {attempt} @ {now:%H:%M} ET:"
+    due = _pretips_due_within(scheduler, ETL_PRETIP_GUARD_MINUTES)
+    tips = _tipoffs_within(ETL_TIPOFF_GUARD_MINUTES, now)
+    if due or tips:
+        print(f"{tag} guard closed ({'pre-tip pull(s) ' + str(due) if due else 'tip-off(s) ' + str(tips)}); "
+              f"stopping for today")
+        return "stopped: guard"
+    stored = _stored_kaggle_version()
+    if stored != baseline:
+        print(f"{tag} v{stored} already loaded (was v{baseline}); stopping")
+        return "stopped: already loaded"
+    clear = _clear_of_pulls(scheduler, now)
+    if clear > now:
+        print(f"{tag} within {PULL_WINDOW_MINUTES} min of a scheduled pull; moved to {clear:%H:%M} ET")
+        _schedule_kaggle_retry(scheduler, backup_path, baseline, day, attempt, run_at=clear)
+        return "deferred: pull window"
+
+    import database
+    try:
+        latest = database.get_latest_kaggle_version()
+    except Exception as exc:
+        print(f"{tag} version check FAILED ({exc!r}); next check in {KAGGLE_RETRY_MINUTES} min")
+        _schedule_kaggle_retry(scheduler, backup_path, baseline, day, attempt + 1)
+        return "check failed"
+    if stored is not None and latest <= stored:
+        print(f"{tag} Kaggle v{latest}, loaded v{stored}: nothing new; next check in {KAGGLE_RETRY_MINUTES} min")
+        _schedule_kaggle_retry(scheduler, backup_path, baseline, day, attempt + 1)
+        return "up to date"
+
+    print(f"{tag} Kaggle v{latest} > loaded v{stored}; running ETL + resolve")
+    try:
+        database.run_etl()
+    except database.KaggleVersionUnavailable as exc:
+        print(f"[kaggle-retry] v{latest} not downloadable yet ({exc}); tables untouched, "
+              f"next check in {KAGGLE_RETRY_MINUTES} min")
+        _schedule_kaggle_retry(scheduler, backup_path, baseline, day, attempt + 1)
+        return "unavailable"
+    except Exception as exc:
+        print(f"[kaggle-retry] ETL FAILED: {exc!r}; no more checks today")
+        try:
+            restore_etl_tables(backup_path)
+            print(f"[kaggle-retry] tables restored from {backup_path}")
+        except Exception as rexc:
+            print(f"[kaggle-retry] table restore FAILED: {rexc!r}. "
+                  f"player_stats/players/schedule may be partial; restore them from {backup_path}.")
+        return "etl failed"
+
+    try:
+        import paper_predictions
+        n = paper_predictions.resolve_paper_predictions()
+        print(f"[kaggle-retry] v{latest} loaded; paper predictions resolved: {n}")
+    except Exception as exc:
+        print(f"[kaggle-retry] v{latest} loaded; resolve FAILED: {exc!r}")
+    return "loaded"
+
+
+def resume_kaggle_retry(scheduler=None) -> str:
+    """
+    Startup: the retry job lives only in memory, so a restart after today's maintenance
+    would otherwise wait for tomorrow. If today's maintenance ran (its backup exists) and
+    nothing newer has been loaded since (kaggle_version still matches the backup's), run
+    one retry check now: it applies the guards and pull windows, loads a newer Ready
+    version if Kaggle has one, and otherwise continues hourly.
+    """
+    today = dt.datetime.now(EASTERN).date().isoformat()
+    backup = os.path.join(BACKUP_DIR, f"predictions_{today}.db")
+    if not os.path.exists(backup):
+        return "no maintenance today"
+    conn = sqlite3.connect(f"file:{backup}?mode=ro", uri=True, timeout=30)
+    try:
+        row = conn.execute("SELECT version FROM kaggle_version LIMIT 1").fetchone()
+    except sqlite3.OperationalError:
+        row = None
+    finally:
+        conn.close()
+    morning, stored = (row[0] if row else None), _stored_kaggle_version()
+    if stored != morning:
+        print(f"[kaggle-retry] startup: v{stored} loaded since maintenance (was v{morning}); not resuming")
+        return "already loaded today"
+    return run_kaggle_version_retry(scheduler, backup, morning, today, attempt=1)
 
 
 # ---------------------------------------------------------------------------
@@ -1047,6 +1224,12 @@ def start_scheduler():
         id="morning_maintenance", replace_existing=True, misfire_grace_time=2 * 3600,
         coalesce=True, max_instances=1,
     )
+    # Restart after today's maintenance: resume the in-memory Kaggle version retry, one
+    # pull window after startup so the open / pre-tip catch-up jobs above go first.
+    sched.add_job(resume_kaggle_retry, "date",
+                  run_date=dt.datetime.now(EASTERN) + dt.timedelta(minutes=PULL_WINDOW_MINUTES),
+                  kwargs={"scheduler": sched}, id="kaggle_retry_resume", replace_existing=True,
+                  misfire_grace_time=30 * 60)
     sched.start()
     _scheduler = sched
     print(f"[line_logger] scheduler started: open pull {'ON ' + str(OPEN_PULL_HOUR_ET) + ':00 ET' if OPEN_PULL_ENABLED else 'OFF'}, "

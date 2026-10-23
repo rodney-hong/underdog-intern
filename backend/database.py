@@ -557,12 +557,18 @@ def _kaggle_dataset_request(request_cls, version: int | None = None):
 
 
 def get_latest_kaggle_version() -> int:
-    """Ask Kaggle for the dataset's current version number (metadata only, no download)."""
+    """
+    Ask Kaggle for the dataset's newest Ready version number (metadata only, no download).
+    current_version_number lags the versions list: on 2026-10-23 at 09:46 ET it still
+    said 522 while v523 (created 09:34 ET) was listed as Ready. So take the newest Ready
+    entry in `versions`, never lower than current_version_number.
+    """
     from kagglehub.clients import build_kaggle_client
     from kagglesdk.datasets.types.dataset_api_service import ApiGetDatasetRequest
     with build_kaggle_client() as c:
         d = c.datasets.dataset_api_client.get_dataset(_kaggle_dataset_request(ApiGetDatasetRequest))
-    return int(d.current_version_number)
+    ready = [int(v.version_number) for v in d.versions or [] if v.status == "Ready"]
+    return max([int(d.current_version_number), *ready])
 
 
 def download_kaggle_files(version: int) -> dict:
