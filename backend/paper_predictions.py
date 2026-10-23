@@ -395,14 +395,13 @@ def _predict_one(player, g, stat, line, model, cache, data_fetcher, predictor, F
             # mirrors predictor.predict(): 0 games -> fixed "insufficient data" answer,
             # 1-9 -> heuristic scorer, >= 10 -> model
             "app_path": "model" if counted >= 10 else ("heuristic" if counted else "insufficient_data")}
-    # v2 (logged as p_over) and, as a shadow, v1: preregistration entry of 2026-10-23.
+    # Preregistration entry of 2026-10-23: from game_date V2_EFFECTIVE_DATE (ET), p_over
+    # is v2 with v1 kept as a shadow; earlier game dates are logged with v1 exactly as
+    # before (no v2, shadow columns NULL).
     feats_v1 = predictor._compute_ml_features_v1(player, opp, stat, line, bool(is_home),
                                                  bool(b2b), min_games=1)
     if feats_v1 is None:
         return {**base, "status": "no counted games"}
-    # = predictor._compute_ml_features(..., cutoff=...) without computing v1 twice
-    feats = {**feats_v1, **predictor._v2_features(player, opp, stat, bool(is_home), _cutoff(g),
-                                                  team_cache=cache.setdefault("_teams", {}))}
 
     def score(f):
         X = pd.DataFrame([f])[FEATURE_COLS]
@@ -413,6 +412,14 @@ def _predict_one(player, g, stat, line, model, cache, data_fetcher, predictor, F
     def as_json(f):
         return json.dumps({k: (None if pd.isna(v) else v) for k, v in f.items()}, default=float)
 
+    if not predictor.v2_in_effect(g["game_date"]):
+        p_over, nan_cols = score(feats_v1)
+        return {**base, "p_over": p_over, "nan_features": ",".join(nan_cols) or None,
+                "features_json": as_json(feats_v1), "feature_def": "v1", "status": "ok"}
+
+    # = predictor._compute_ml_features(..., cutoff=...) without computing v1 twice
+    feats = {**feats_v1, **predictor._v2_features(player, opp, stat, bool(is_home), _cutoff(g),
+                                                  team_cache=cache.setdefault("_teams", {}))}
     p_over, nan_cols = score(feats)
     return {**base, "p_over": p_over, "nan_features": ",".join(nan_cols) or None,
             "features_json": as_json(feats), "feature_def": predictor.FEATURE_DEF,

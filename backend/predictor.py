@@ -204,6 +204,12 @@ def _compute_stat(df: pd.DataFrame, stat_type: str) -> pd.Series:
 V2_FEATURES = ("games_played_last15", "fatigue_score", "home_away_split", "opp_def_rating_last5")
 FEATURE_DEF = "v2"
 TRAIN_DEF_FILL = 105.56   # the frozen fit's fill for a missing opp_def_rating_last5
+V2_EFFECTIVE_DATE = "2026-10-24"   # ET game date; earlier games keep v1 exactly as before
+
+
+def v2_in_effect(game_date: str) -> bool:
+    """True when a game's ET date ('YYYY-MM-DD') is on or after V2_EFFECTIVE_DATE."""
+    return str(game_date)[:10] >= V2_EFFECTIVE_DATE
 
 
 def _game_cutoff(player_name: str, opponent_team: str) -> pd.Timestamp:
@@ -268,7 +274,8 @@ def _compute_ml_features(
     """
     v2: _compute_ml_features_v1 with V2_FEATURES recomputed exactly as in training,
     relative to `cutoff`, the target game's scheduled tip (gameDateTimeEst, ET);
-    default: the player's next scheduled game against opponent_team.
+    default: the player's next scheduled game against opponent_team. A game dated
+    before V2_EFFECTIVE_DATE gets v1 unchanged.
     """
     feats = _compute_ml_features_v1(player_name, opponent_team, stat_type, stat_line,
                                     is_home, is_back_to_back, min_games)
@@ -276,6 +283,8 @@ def _compute_ml_features(
         return None
     if cutoff is None:
         cutoff = _game_cutoff(player_name, opponent_team)
+    if not v2_in_effect(cutoff.strftime("%Y-%m-%d")):
+        return feats
     feats.update(_v2_features(player_name, opponent_team, stat_type, is_home, cutoff))
     return feats
 

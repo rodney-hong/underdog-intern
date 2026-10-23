@@ -184,7 +184,13 @@ def _paper_rows(path):
         conn.close()
 
 
-def test_paper_rows_log_v2_with_v1_shadow(season, stub_models):
+@pytest.fixture
+def v2_from_synthetic_season(monkeypatch):
+    """The synthetic season is dated 2025-26: move the v2 switch before it."""
+    monkeypatch.setattr(predictor, "V2_EFFECTIVE_DATE", "2025-01-01")
+
+
+def test_paper_rows_log_v2_with_v1_shadow(season, stub_models, v2_from_synthetic_season):
     tip, captured = _upcoming_game(season)
     res = paper_predictions.log_for_pull("evt1", captured)
     assert res["logged"] == 3
@@ -223,7 +229,8 @@ def test_data_freshness_cases(season):
     conn.close()
 
 
-def test_paper_insert_does_not_hold_the_write_lock_during_feature_work(season, stub_models, monkeypatch):
+def test_paper_insert_does_not_hold_the_write_lock_during_feature_work(season, stub_models, monkeypatch,
+                                                                         v2_from_synthetic_season):
     """Rows are written in one short transaction after all features are computed."""
     _, captured = _upcoming_game(season)
     in_txn = []
@@ -275,3 +282,58 @@ def test_startup_no_catchup_when_maintenance_ran_or_too_early(tmp_path, monkeypa
     assert line_logger._schedule_maintenance_catchup(
         s, dt.datetime(2026, 10, 24, 9, 30, tzinfo=line_logger.EASTERN)) is False
     assert s.added == []
+
+
+# --- v2 effective-date switch (V2_EFFECTIVE_DATE, ET game date) -----------------------
+
+def test_v2_in_effect_boundary():
+    assert predictor.V2_EFFECTIVE_DATE == "2026-10-24"
+    assert not predictor.v2_in_effect("2026-10-23")
+    assert predictor.v2_in_effect("2026-10-24")
+    assert predictor.v2_in_effect("2026-10-25")
+    assert not predictor.v2_in_effect("2026-10-23 23:59:59")   # ET wall time, date part only
+
+
+def test_paper_rows_before_effective_date_are_v1_exactly_as_before(season, stub_models, monkeypatch):
+    """Game date before the switch: p_over/features_json are the v1 ones, no v2 work,
+    shadow columns NULL. (The synthetic game is dated 2025-26, before 2026-10-24.)"""
+    _, captured = _upcoming_game(season)
+    called = []
+    monkeypatch.setattr(predictor, "_v2_features", lambda *a, **k: called.append(1) or {})
+    assert paper_predictions.log_for_pull("evt1", captured)["logged"] == 3
+    conn = sqlite3.connect(season)
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute("SELECT player_name, home_team, away_team, game_date, p_over, features_json, "
+                        "feature_def, p_over_v1, features_v1_json FROM paper_predictions").fetchall()
+    conn.close()
+    assert called == []
+    for r in rows:
+        assert r["feature_def"] == "v1" and r["p_over_v1"] is None and r["features_v1_json"] is None
+        pid = int(r["player_name"][1:5])
+        home = pid < 1010
+        opp = "Miami Heat" if home else "Boston Celtics"
+        want = predictor._compute_ml_features_v1(r["player_name"], opp, "Points", 12.5, home,
+                                                  False, min_games=1)
+        assert json.loads(r["features_json"]) == json.loads(json.dumps(
+            {k: (None if pd.isna(v) else v) for k, v in want.items()}, default=float))
+        X = pd.DataFrame([want])[ml_trainer.FEATURE_COLS].fillna(0).astype(float)
+        assert r["p_over"] == float(_StubModel().predict_proba(X)[0][1])
+
+
+def test_paper_rows_on_effective_date_are_v2(season, stub_models, monkeypatch):
+    tip, captured = _upcoming_game(season)
+    monkeypatch.setattr(predictor, "V2_EFFECTIVE_DATE", tip.strftime("%Y-%m-%d"))   # the game's own date
+    paper_predictions.log_for_pull("evt1", captured)
+    assert {r["feature_def"] for r in _paper_rows(season)} == {"v2"}
+
+
+def test_app_features_switch_on_game_date(season, monkeypatch):
+    tip = pd.Timestamp(LAST_GAME + dt.timedelta(days=2))
+    args = ("P1000 Test", "Miami Heat", "Points", 12.5, True, False)
+    v1 = predictor._compute_ml_features_v1(*args)
+    monkeypatch.setattr(predictor, "V2_EFFECTIVE_DATE", (tip + pd.Timedelta(days=1)).strftime("%Y-%m-%d"))
+    assert predictor._compute_ml_features(*args, cutoff=tip) == v1                     # before: v1
+    monkeypatch.setattr(predictor, "V2_EFFECTIVE_DATE", tip.strftime("%Y-%m-%d"))
+    v2 = predictor._compute_ml_features(*args, cutoff=tip)                               # on: v2
+    assert v2 != v1 and v2["games_played_last15"] == predictor._v2_features(
+        "P1000 Test", "Miami Heat", "Points", True, tip)["games_played_last15"]
