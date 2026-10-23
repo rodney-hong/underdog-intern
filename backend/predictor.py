@@ -23,6 +23,7 @@ from data_fetcher import (
     get_game_logs, get_injury_context, full_to_abbrev,
     get_team_def_rating_last5, get_player_id, is_playoff_matchup,
     get_player_history, team_id_for,
+    get_player_history_v2, get_team_rows_v2, scheduled_tip, get_player_context,
     get_wnba_game_logs, get_wnba_injury_status,
 )
 from database import DB_PATH
@@ -197,7 +198,89 @@ def _compute_stat(df: pd.DataFrame, stat_type: str) -> pd.Series:
 # ML feature computation  (training-consistent, season-avg proxy for hit_rate)
 # ---------------------------------------------------------------------------
 
+# v2 (preregistration entry "inference parity...", 2026-10-23): these features are
+# computed exactly as ml_trainer does, from the target game's scheduled tip. A feature
+# that fails experiments/feature_parity.py is removed here and stays on v1.
+V2_FEATURES = ("games_played_last15", "fatigue_score", "home_away_split", "opp_def_rating_last5")
+FEATURE_DEF = "v2"
+TRAIN_DEF_FILL = 105.56   # the frozen fit's fill for a missing opp_def_rating_last5
+
+
+def _game_cutoff(player_name: str, opponent_team: str) -> pd.Timestamp:
+    """The scheduled tip (ET) of the player's next game against opponent_team, else now (ET)."""
+    from zoneinfo import ZoneInfo
+    now_et = datetime.now(ZoneInfo("America/New_York")).replace(tzinfo=None)
+    ctx = get_player_context(player_name)
+    if ctx and ctx.get("player_team_full"):
+        grace = (now_et - pd.Timedelta(hours=3)).strftime("%Y-%m-%d %H:%M:%S")
+        tip = scheduled_tip(ctx["player_team_full"], opponent_team, grace)
+        if tip is not None:
+            return tip
+    return pd.Timestamp(now_et)
+
+
+def _v2_features(player_name: str, opponent_team: str, stat_type: str, is_home: bool,
+                 cutoff: pd.Timestamp, team_cache: dict | None = None) -> dict:
+    """
+    The V2_FEATURES as the model saw them in training (fills included: 105.56 / 0).
+    team_cache: optional dict shared across one pull (never longer, so an ETL between
+    pulls can't leave it stale): the player's history is read once for all his stats,
+    and the opponent's def rating, which reads the team's whole history, once per team.
+    """
+    from data_fetcher import _HISTORY_STAT_EXPR
+    pid = get_player_id(player_name)
+    if team_cache is not None and ("player", pid) in team_cache:
+        hist = team_cache[("player", pid)]
+    else:
+        hist = get_player_history_v2(pid)
+        if team_cache is not None:
+            team_cache[("player", pid)] = hist
+    hist = hist[hist["gameDateTimeEst"] < cutoff].reset_index(drop=True)
+    hist["_stat"] = _HISTORY_STAT_EXPR[stat_type](hist)
+    out = feature_defs.next_game_window_features(hist, cutoff)
+    out["home_away_split"] = feature_defs.next_game_home_away_split(hist, "_stat", is_home)
+    opp_id = team_id_for(opponent_team)
+    key = (opp_id, cutoff)
+    if team_cache is not None and key in team_cache:
+        odr = team_cache[key]
+    else:
+        odr = (feature_defs.opp_def_rating_before(get_team_rows_v2(opp_id, cutoff), cutoff)
+               if opp_id is not None else np.nan)
+        if team_cache is not None:
+            team_cache[key] = odr
+    out["opp_def_rating_last5"] = odr
+    out = {k: (0.0 if pd.isna(v) else float(v)) for k, v in out.items()}       # training fillna(0)
+    if pd.isna(odr):
+        out["opp_def_rating_last5"] = TRAIN_DEF_FILL                           # fill_def_rating
+    return {k: v for k, v in out.items() if k in V2_FEATURES}
+
+
 def _compute_ml_features(
+    player_name: str,
+    opponent_team: str,
+    stat_type: str,
+    stat_line: float,
+    is_home: bool,
+    is_back_to_back: bool,
+    min_games: int = 10,
+    cutoff: pd.Timestamp | None = None,
+) -> dict | None:
+    """
+    v2: _compute_ml_features_v1 with V2_FEATURES recomputed exactly as in training,
+    relative to `cutoff`, the target game's scheduled tip (gameDateTimeEst, ET);
+    default: the player's next scheduled game against opponent_team.
+    """
+    feats = _compute_ml_features_v1(player_name, opponent_team, stat_type, stat_line,
+                                    is_home, is_back_to_back, min_games)
+    if feats is None:
+        return None
+    if cutoff is None:
+        cutoff = _game_cutoff(player_name, opponent_team)
+    feats.update(_v2_features(player_name, opponent_team, stat_type, is_home, cutoff))
+    return feats
+
+
+def _compute_ml_features_v1(
     player_name: str,
     opponent_team: str,
     stat_type: str,
@@ -207,6 +290,7 @@ def _compute_ml_features(
     min_games: int = 10,
 ) -> dict | None:
     """
+    v1 (logged until 2026-10-23; kept for paper_predictions' shadow columns).
     Compute the 14 model features (ml_trainer.FEATURE_COLS) for the player's next game.
     hit_rate_last10 and vs_opponent_avg use feature_defs, shared with training.
     Returns None if the player has fewer than `min_games` counted games (the app uses

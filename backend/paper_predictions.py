@@ -95,9 +95,14 @@ _PAPER_DDL = """
             dk_under_price      REAL,
             counted_games       INTEGER,         -- in the 40-game log the app reads
             app_path            TEXT,            -- 'model' / 'heuristic' / 'insufficient_data' / NULL
-            p_over              REAL,            -- frozen model, every line
+            p_over              REAL,            -- frozen model, every line (feature_def's features)
             nan_features        TEXT,            -- features that were NaN and filled with 0
             features_json       TEXT,
+            feature_def         TEXT,            -- 'v2' from 2026-10-24; NULL = v1 (older rows)
+            p_over_v1           REAL,            -- shadow: P(over) from the v1 features
+            features_v1_json    TEXT,            -- shadow: the v1 features
+            data_as_of          TEXT,            -- newest counted-game date in player_stats
+            data_stale          INTEGER,         -- 1 if data_as_of < the previous slate date
             model_file          TEXT,
             model_sha256        TEXT,
             model_sha_ok        INTEGER,         -- 1 if it matches the recorded frozen hash
@@ -171,7 +176,9 @@ def init_tables(conn) -> None:
         CREATE INDEX IF NOT EXISTS idx_paper_pred_date ON paper_predictions (game_date);
     """)
     cols = {r[1] for r in conn.execute("PRAGMA table_info(paper_predictions)")}
-    for col, typ in (("ud_market", "TEXT"), ("actual_value", "REAL"), ("team_source", "TEXT")):
+    for col, typ in (("ud_market", "TEXT"), ("actual_value", "REAL"), ("team_source", "TEXT"),
+                     ("feature_def", "TEXT"), ("p_over_v1", "REAL"), ("features_v1_json", "TEXT"),
+                     ("data_as_of", "TEXT"), ("data_stale", "INTEGER")):
         if col not in cols:
             conn.execute(f"ALTER TABLE paper_predictions ADD COLUMN {col} {typ}")
     conn.commit()
@@ -254,6 +261,9 @@ def log_for_pull(game_id: str, captured_at: str | None = None, conn=None) -> dic
     now = dt.datetime.now(dt.timezone.utc).isoformat()
     player_cache: dict = {}          # player -> context shared by every stat
     by_stat: dict = {}
+    freshness = data_freshness(conn, snap[0]["game_date"]) if snap else {}
+    pending: list[dict] = []         # every row of this pull, inserted at the end in one
+                                     # short transaction (feature work never holds the lock)
     for stat in STATS:
         main_key, alt_key = STAT_MARKETS[stat]
         stat_rows = [r for r in snap if
@@ -286,7 +296,7 @@ def log_for_pull(game_id: str, captured_at: str | None = None, conn=None) -> dic
                 "fd_line": fd[0], "fd_over_price": fd[1], "fd_under_price": fd[2],
                 "dk_line": dk[0], "dk_over_price": dk[1], "dk_under_price": dk[2],
                 "model_file": STATS[stat]["model_file"], "model_sha256": sha,
-                "model_sha_ok": int(sha_ok),
+                "model_sha_ok": int(sha_ok), **freshness,
             }
             if ud["multiple"]:
                 # No rule picks among several Underdog points (across both markets): the
@@ -298,11 +308,15 @@ def log_for_pull(game_id: str, captured_at: str | None = None, conn=None) -> dic
                                             data_fetcher, predictor, FEATURE_COLS))
                 except Exception as exc:                   # one bad row never stops the rest
                     rec["status"] = f"error: {exc!r}"[:300]
-            cols = ", ".join(rec)
-            cur = conn.execute(f"INSERT OR IGNORE INTO paper_predictions ({cols}) "
-                               f"VALUES ({', '.join('?' * len(rec))})", tuple(rec.values()))
-            logged += cur.rowcount
-        by_stat[stat] = {"logged": logged, "lines": len(ud_players), "model_sha_ok": sha_ok}
+            pending.append(rec)
+        by_stat[stat] = {"lines": len(ud_players), "model_sha_ok": sha_ok}
+    for stat in by_stat:
+        by_stat[stat].setdefault("logged", 0)
+    for rec in pending:
+        cols = ", ".join(rec)
+        cur = conn.execute(f"INSERT OR IGNORE INTO paper_predictions ({cols}) "
+                           f"VALUES ({', '.join('?' * len(rec))})", tuple(rec.values()))
+        by_stat[rec["stat_type"]]["logged"] += cur.rowcount
     conn.commit()
     if own:
         conn.close()
@@ -312,6 +326,38 @@ def log_for_pull(game_id: str, captured_at: str | None = None, conn=None) -> dic
             "model_sha_ok": all(v.get("model_sha_ok", True) and "error" not in v
                                 for v in by_stat.values()),
             "by_stat": by_stat}
+
+
+# Regular season, play-in, playoffs, cup final: the gameId type digit (as line_logger).
+_SCHEDULE_COUNTED = "substr(printf('%010d', gameId), 3, 1) IN ('2','4','5','6')"
+
+
+def data_freshness(conn, game_date: str) -> dict:
+    """
+    data_as_of: the newest counted-game date in player_stats now. data_stale: 1 if that
+    is before the previous slate (the latest counted schedule date before game_date),
+    i.e. last night's box scores are not loaded; 0 if they are or there is no previous
+    slate (season opener). Preregistration entry of 2026-10-23, section 2.
+    """
+    import game_types
+    as_of = conn.execute(f"SELECT MAX(substr(gameDateTimeEst, 1, 10)) FROM player_stats "
+                         f"WHERE gameType IN ({game_types.COUNTED_SQL})").fetchone()[0]
+    prev = conn.execute(f"SELECT MAX(substr(gameDateTimeEst, 1, 10)) FROM schedule "
+                        f"WHERE substr(gameDateTimeEst, 1, 10) < ? AND {_SCHEDULE_COUNTED}",
+                        (game_date,)).fetchone()[0]
+    stale = int(prev is not None and (as_of is None or as_of < prev))
+    return {"data_as_of": as_of, "data_stale": stale}
+
+
+def _cutoff(g) -> pd.Timestamp:
+    """The game's scheduled tip (schedule.gameDateTimeEst, ET), else commence_time in ET."""
+    import data_fetcher
+    tip = data_fetcher.scheduled_tip(g["home_team"], g["away_team"], g["game_date"])
+    if tip is not None and tip.strftime("%Y-%m-%d") == g["game_date"]:
+        return tip
+    from zoneinfo import ZoneInfo
+    ct = dt.datetime.fromisoformat(g["commence_time"].replace("Z", "+00:00"))
+    return pd.Timestamp(ct.astimezone(ZoneInfo("America/New_York")).replace(tzinfo=None))
 
 
 def _player_context(player, data_fetcher, cache) -> dict:
@@ -349,17 +395,28 @@ def _predict_one(player, g, stat, line, model, cache, data_fetcher, predictor, F
             # mirrors predictor.predict(): 0 games -> fixed "insufficient data" answer,
             # 1-9 -> heuristic scorer, >= 10 -> model
             "app_path": "model" if counted >= 10 else ("heuristic" if counted else "insufficient_data")}
-    feats = predictor._compute_ml_features(player, opp, stat, line, bool(is_home),
-                                           bool(b2b), min_games=1)
-    if feats is None:
+    # v2 (logged as p_over) and, as a shadow, v1: preregistration entry of 2026-10-23.
+    feats_v1 = predictor._compute_ml_features_v1(player, opp, stat, line, bool(is_home),
+                                                 bool(b2b), min_games=1)
+    if feats_v1 is None:
         return {**base, "status": "no counted games"}
-    X = pd.DataFrame([feats])[FEATURE_COLS]
-    nan_cols = [c for c in FEATURE_COLS if pd.isna(X.at[0, c])]
-    X = X.fillna(0).astype(float)                      # training convention (ml_trainer)
-    p_over = float(model.predict_proba(X)[0][1])
+    # = predictor._compute_ml_features(..., cutoff=...) without computing v1 twice
+    feats = {**feats_v1, **predictor._v2_features(player, opp, stat, bool(is_home), _cutoff(g),
+                                                  team_cache=cache.setdefault("_teams", {}))}
+
+    def score(f):
+        X = pd.DataFrame([f])[FEATURE_COLS]
+        nan_cols = [c for c in FEATURE_COLS if pd.isna(X.at[0, c])]
+        X = X.fillna(0).astype(float)                  # training convention (ml_trainer)
+        return float(model.predict_proba(X)[0][1]), nan_cols
+
+    def as_json(f):
+        return json.dumps({k: (None if pd.isna(v) else v) for k, v in f.items()}, default=float)
+
+    p_over, nan_cols = score(feats)
     return {**base, "p_over": p_over, "nan_features": ",".join(nan_cols) or None,
-            "features_json": json.dumps({k: (None if pd.isna(v) else v) for k, v in feats.items()},
-                                        default=float),
+            "features_json": as_json(feats), "feature_def": predictor.FEATURE_DEF,
+            "p_over_v1": score(feats_v1)[0], "features_v1_json": as_json(feats_v1),
             "status": "ok"}
 
 

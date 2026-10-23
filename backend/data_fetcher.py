@@ -357,6 +357,63 @@ def get_player_history(player_name: str, stat_type: str) -> pd.DataFrame:
     return h[["gameDateTimeEst", "opponentteamId", "_stat"]]
 
 
+def get_player_history_v2(person_id: int) -> pd.DataFrame:
+    """
+    The rows ml_trainer.build_training_data keeps for one player (counted game types,
+    numMinutes > 0, valid date), in gameDateTimeEst order, with the columns the v2
+    feature_defs helpers read: gameDateTimeEst, home, numMinutes and the four stats.
+    """
+    conn = sqlite3.connect(DB_PATH, timeout=30)
+    h = pd.read_sql_query(
+        f"SELECT gameDateTimeEst, home, numMinutes, points, reboundsTotal, assists, threePointersMade "
+        f"FROM player_stats WHERE personId = ? AND numMinutes IS NOT NULL AND numMinutes > 0 "
+        f"AND gameType IN ({game_types.COUNTED_SQL})",
+        conn, params=(int(person_id),))
+    conn.close()
+    h["gameDateTimeEst"] = pd.to_datetime(h["gameDateTimeEst"], errors="coerce")
+    return h.dropna(subset=["gameDateTimeEst"]).sort_values("gameDateTimeEst").reset_index(drop=True)
+
+
+def get_team_rows_v2(team_id: int, before: pd.Timestamp) -> pd.DataFrame:
+    """
+    One team's player rows before `before` with training's filters, in training's
+    row order (personId, gameDateTimeEst), so per-game means sum in the same order.
+    No team id (a few historical rows lack opponentteamId): no rows, as training's
+    groupby drops missing team ids, so the feature is NaN there too.
+    """
+    if team_id is None or pd.isna(team_id):
+        return pd.DataFrame({"personId": pd.Series(dtype="int64"),
+                             "gameDateTimeEst": pd.Series(dtype="datetime64[ns]"),
+                             "defensiveRating": pd.Series(dtype="float64")})
+    conn = sqlite3.connect(DB_PATH, timeout=30)
+    t = pd.read_sql_query(
+        f"SELECT personId, gameDateTimeEst, defensiveRating FROM player_stats "
+        f"WHERE playerteamId = ? AND numMinutes IS NOT NULL AND numMinutes > 0 "
+        f"AND gameType IN ({game_types.COUNTED_SQL}) AND gameDateTimeEst < ?",
+        conn, params=(int(team_id), before.strftime("%Y-%m-%d %H:%M:%S")))
+    conn.close()
+    t["gameDateTimeEst"] = pd.to_datetime(t["gameDateTimeEst"], errors="coerce")
+    return t.dropna(subset=["gameDateTimeEst"]).sort_values(
+        ["personId", "gameDateTimeEst"]).reset_index(drop=True)
+
+
+def scheduled_tip(team_a: str, team_b: str, on_or_after: str) -> pd.Timestamp | None:
+    """
+    gameDateTimeEst (ET, the time training anchors its windows to) of the first
+    scheduled game between the two teams on or after `on_or_after` ('YYYY-MM-DD HH:MM:SS'
+    or a date), or None. OddsAPI's commence_time is usually ~10 min later.
+    """
+    nick = lambda t: "Trail Blazers" if "Blazers" in t else t.split()[-1]
+    a, b = nick(team_a), nick(team_b)
+    conn = get_db()
+    row = conn.execute(
+        "SELECT gameDateTimeEst FROM schedule WHERE gameDateTimeEst >= ? "
+        "AND ((homeTeamName = ? AND awayTeamName = ?) OR (homeTeamName = ? AND awayTeamName = ?)) "
+        "ORDER BY gameDateTimeEst LIMIT 1", (on_or_after, a, b, b, a)).fetchone()
+    conn.close()
+    return pd.Timestamp(row[0]) if row else None
+
+
 def team_id_for(team_name: str):
     """NBA team id for a full team name, from the schedule table (None if unknown)."""
     nickname = "Trail Blazers" if "Blazers" in team_name else team_name.split()[-1]

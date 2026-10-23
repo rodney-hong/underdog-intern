@@ -322,22 +322,40 @@ def test_retry_new_version_runs_etl_and_resolve_then_stops(retry):
     assert sched.added == []  # no further checks once loaded
 
 
-def test_retry_tipoff_guard_closes_window(retry, db):
+def test_retry_tipoff_guard_skips_check_and_keeps_retrying(retry, db):
     soon = dt.datetime.now(ET) + dt.timedelta(minutes=45)
     _add_games(db, (22600085, soon.strftime("%Y-%m-%d %H:%M:%S")))
     retry["latest"] = 521
     sched = _FakeScheduler()
-    assert line_logger.run_kaggle_version_retry(sched, "/b.db", 520, _today()) == "stopped: guard"
-    assert retry["checks"] == 0 and retry["etl"] == 0 and sched.added == []
+    assert line_logger.run_kaggle_version_retry(sched, "/b.db", 520, _today(), attempt=2) == "skipped: guard"
+    assert retry["checks"] == 0 and retry["etl"] == 0
+    [job] = sched.added                      # not stopped for the day: next check scheduled
+    assert job["id"] == "kaggle_version_retry" and job["kwargs"]["attempt"] == 3
 
 
-def test_retry_pretip_guard_closes_window(retry):
+def test_retry_pretip_guard_skips_check_and_keeps_retrying(retry):
     job = types.SimpleNamespace(id="pretip:abc", next_run_time=dt.datetime.now(dt.timezone.utc)
                                 + dt.timedelta(minutes=30))
     retry["latest"] = 521
     sched = _FakeScheduler([job])
-    assert line_logger.run_kaggle_version_retry(sched, "/b.db", 520, _today()) == "stopped: guard"
-    assert retry["checks"] == 0 and retry["etl"] == 0 and sched.added == []
+    assert line_logger.run_kaggle_version_retry(sched, "/b.db", 520, _today()) == "skipped: guard"
+    assert retry["checks"] == 0 and retry["etl"] == 0
+    assert [j["id"] for j in sched.added] == ["kaggle_version_retry"]
+
+
+def test_retry_after_closed_window_loads_new_version(retry, db):
+    """Guard closed at check 1, open at check 2: the new version is loaded at check 2."""
+    retry["latest"] = 521
+    sched = _FakeScheduler()
+    soon = dt.datetime.now(ET) + dt.timedelta(minutes=45)
+    _add_games(db, (22600085, soon.strftime("%Y-%m-%d %H:%M:%S")))
+    assert line_logger.run_kaggle_version_retry(sched, "/b.db", 520, _today()) == "skipped: guard"
+    conn = sqlite3.connect(db)
+    conn.execute("DELETE FROM schedule")              # that game has tipped and gone
+    conn.commit()
+    conn.close()
+    assert line_logger.run_kaggle_version_retry(sched, "/b.db", 520, _today(), attempt=2) == "loaded"
+    assert retry["etl"] == 1 and retry["resolve"] == 1
 
 
 def test_retry_no_duplicate_etl_once_loaded(retry):
@@ -443,7 +461,7 @@ def test_startup_resume_loads_newer_ready_version(retry, todays_backup):
 def test_startup_resume_respects_guards(retry, todays_backup, db):
     _add_games(db, (22600085, (dt.datetime.now(ET) + dt.timedelta(minutes=45)).strftime("%Y-%m-%d %H:%M:%S")))
     retry["latest"] = 521
-    assert line_logger.resume_kaggle_retry(_FakeScheduler()) == "stopped: guard"
+    assert line_logger.resume_kaggle_retry(_FakeScheduler()) == "skipped: guard"
     assert retry["checks"] == 0 and retry["etl"] == 0
 
 

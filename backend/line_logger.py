@@ -1144,27 +1144,30 @@ def _run_kaggle_version_retry(scheduler=None, backup_path: str = "", baseline: i
     One cheap version check (metadata only). If Kaggle has a newer version than
     `baseline` (the version loaded when maintenance found nothing new), run
     database.run_etl() then resolve paper predictions, under the maintenance guards.
-    Stops (schedules nothing more) when: the guards close (a pre-tip pull within
-    ETL_PRETIP_GUARD_MINUTES or a tip within ETL_TIPOFF_GUARD_MINUTES; the slate then
-    runs into the night), a version newer than
-    `baseline` is already loaded (by this job or anything else), the ETL fails, or the
-    next check would fall past `day`. A check within PULL_WINDOW_MINUTES of a scheduled
-    pull (open or pre-tip) is moved to the end of that window, not dropped.
+    A check while a guard is closed (a pre-tip pull within ETL_PRETIP_GUARD_MINUTES or a
+    tip within ETL_TIPOFF_GUARD_MINUTES) is skipped and the next one scheduled: a gap
+    between games can still load last night's box scores before later games
+    (preregistration entry of 2026-10-23, section 2). Stops (schedules nothing more)
+    only when a version newer than `baseline` is already loaded (by this job or
+    anything else), the ETL fails, or the next check would fall past `day`. A check
+    within PULL_WINDOW_MINUTES of a scheduled pull (open or pre-tip) is moved to the
+    end of that window, not dropped.
     An ETL failure restores ETL_TABLES from the morning backup at `backup_path`, which
     still matches them because the morning ETL changed nothing. Each check logs one line.
     """
     now = dt.datetime.now(EASTERN)
     tag = f"[kaggle-retry] check {attempt} @ {now:%H:%M} ET:"
-    due = _pretips_due_within(scheduler, ETL_PRETIP_GUARD_MINUTES)
-    tips = _tipoffs_within(ETL_TIPOFF_GUARD_MINUTES, now)
-    if due or tips:
-        print(f"{tag} guard closed ({'pre-tip pull(s) ' + str(due) if due else 'tip-off(s) ' + str(tips)}); "
-              f"stopping for today")
-        return "stopped: guard"
     stored = _stored_kaggle_version()
     if stored != baseline:
         print(f"{tag} v{stored} already loaded (was v{baseline}); stopping")
         return "stopped: already loaded"
+    due = _pretips_due_within(scheduler, ETL_PRETIP_GUARD_MINUTES)
+    tips = _tipoffs_within(ETL_TIPOFF_GUARD_MINUTES, now)
+    if due or tips:
+        print(f"{tag} guard closed ({'pre-tip pull(s) ' + str(due) if due else 'tip-off(s) ' + str(tips)}); "
+              f"skipping this check, next in {KAGGLE_RETRY_MINUTES} min")
+        _schedule_kaggle_retry(scheduler, backup_path, baseline, day, attempt + 1)
+        return "skipped: guard"
     clear = _clear_of_pulls(scheduler, now)
     if clear > now:
         print(f"{tag} within {PULL_WINDOW_MINUTES} min of a scheduled pull; moved to {clear:%H:%M} ET")
@@ -1243,6 +1246,25 @@ def resume_kaggle_retry(scheduler=None) -> str:
 _scheduler = None
 
 
+def _schedule_maintenance_catchup(scheduler, now_et: dt.datetime) -> bool:
+    """
+    Startup after MAINTENANCE_HOUR_ET with no backup for today (the backend was down or
+    asleep at 07:00): run today's maintenance one pull window after startup, after the
+    open / pre-tip catch-up jobs. It takes the ETL lock and applies the usual guards.
+    Preregistration entry of 2026-10-23, section 2.
+    """
+    today_backup = os.path.join(BACKUP_DIR, f"predictions_{now_et.date().isoformat()}.db")
+    if now_et.hour < MAINTENANCE_HOUR_ET or os.path.exists(today_backup):
+        return False
+    run_at = now_et + dt.timedelta(minutes=PULL_WINDOW_MINUTES)
+    scheduler.add_job(run_morning_maintenance, "date", run_date=run_at,
+                      kwargs={"scheduler": scheduler}, id="morning_maintenance_catchup",
+                      replace_existing=True, misfire_grace_time=30 * 60, max_instances=1)
+    print(f"[line_logger] no maintenance backup for {now_et.date()}: catch-up maintenance at "
+          f"{run_at:%H:%M} ET")
+    return True
+
+
 def start_scheduler():
     """Start APScheduler in-process. Idempotent. Catches up on startup if past open time."""
     global _scheduler
@@ -1281,12 +1303,14 @@ def start_scheduler():
             sched.add_job(run_open_pull, kwargs={"phase": "open", "scheduler": sched},
                           id="line_open_catchup", replace_existing=True)
     # Morning maintenance (backup -> ETL unless a pre-tip pull is near -> resolve).
+    # 12 h grace: a machine asleep at 07:00 still runs it on waking.
     sched.add_job(
         run_morning_maintenance, "cron", hour=MAINTENANCE_HOUR_ET, minute=0,
         kwargs={"scheduler": sched},
-        id="morning_maintenance", replace_existing=True, misfire_grace_time=2 * 3600,
+        id="morning_maintenance", replace_existing=True, misfire_grace_time=12 * 3600,
         coalesce=True, max_instances=1,
     )
+    _schedule_maintenance_catchup(sched, dt.datetime.now(EASTERN))
     # Restart after today's maintenance: resume the in-memory Kaggle version retry, one
     # pull window after startup so the open / pre-tip catch-up jobs above go first.
     sched.add_job(resume_kaggle_retry, "date",
