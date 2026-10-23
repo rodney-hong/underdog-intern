@@ -678,3 +678,51 @@ No backfilled line had been downloaded when this entry was written.
 - Going forward (ETL): when a new Kaggle version has NULL numMinutes where the previously loaded version had a value for the same (gameId, personId), the previous value is kept and a warning is logged.
 - Grading (paper and app): a row is DNP only if minutes are 0/NULL and all counting stats (points, rebounds, assists, 3PM, blocks, steals, turnovers) are 0/NULL. NULL minutes with any counting stat counts as played. No paper row has been graded under the old rule with NULL minutes; all 53 rows for 22600088 were graded under v522.
 - Frozen models, hypotheses and populations are unchanged.
+
+## Entry: inference parity, data freshness and pull timing (2026-10-23)
+
+Recorded on 2026-10-23 at about 13:45 ET. paper_predictions held 664 rows with status 'ok' (game dates 2026-10-20 to 2026-10-22). Nothing in this entry was computed from a result: every number below comes from features_json and p_over, never actual_value or result. Earlier sections are unchanged.
+
+### 1. Inference features made identical to training
+- At inference, four of the 14 features were computed differently from ml_trainer.build_training_data:
+  - games_played_last15: counted games within 15 days of the player's most recent logged game, that game included. Training counts games in the 15 days before the target game (`rolling("15D", closed="left")`).
+  - fatigue_score: minutes within 7 days of the most recent logged game, that game excluded. Training sums minutes in the 7 days before the target game (`rolling("7D", closed="left")`).
+  - home_away_split: career home and away averages that include 0-minute rows, which training excludes.
+  - opp_def_rating_last5: the opponent's last 5 games, 0-minute rows included. Training uses the mean over rows with numMinutes > 0 of the opponent's 5 games before the target game; a missing value is 105.56.
+- From game_date **2026-10-24**, all four are computed at inference exactly as in training, over counted games with numMinutes > 0 that start before the game's commence_time.
+  - If the change is not deployed before the first 2026-10-24 pre-tip pull (17:30 ET), the effective date is the first game_date whose pre-tip pulls all ran on the new code. A dated addendum records it before any of those rows' results are joined.
+- v2 is deployed only after experiments/feature_parity.py shows each of the four features at inference equal to the training frame on historical rows. Any feature that fails stays on its v1 definition; the addendum names it.
+- Each row also keeps the old-definition features and P(over) in shadow columns (features_v1_json, p_over_v1). feature_def records 'v1' or 'v2'.
+- The frozen model files, ml_trainer.py and the training definitions do not change.
+- No result for any game_date had been viewed when this entry was written.
+- **Analysis:**
+  - Primary analyses (H1, H2, H3 and section 4) use every row's p_over as logged: v1 before the effective date, v2 from it. Population rules are unchanged.
+  - Sensitivity: the same analyses restricted to game_date on or after the effective date. Reported next to the primary, with no separate decision rule.
+- **Measured on the 664 'ok' rows (all app_path = 'model'):**
+  - Number of rows whose feature differs: games_played_last15 664, fatigue_score 662, home_away_split 550, opp_def_rating_last5 478.
+  - Re-scored with all four corrected, P(over) changes on every row:
+    - Points: 14 of 193 change side; largest change in P(over) 0.011.
+    - 3PM: 8 of 174; 0.031.
+    - Rebounds: 32 of 180; 0.026.
+    - Assists: 25 of 117; 0.170.
+  - H1 top-20% confidence slice (Points): 5 of 39 rows leave and 5 join.
+  - H3 top-20% confidence slice (3PM): 7 of 35 leave and 7 join.
+  - These slices are computed over app_path = 'model' rows. The result and regular-season filters were not applied, because applying them would mean reading results.
+
+### 2. Data freshness
+- New columns on paper_predictions:
+  - data_as_of: the newest counted-game date in player_stats when the row was computed;
+  - data_stale = 1 when data_as_of is before the previous slate date (the latest schedule date before game_date).
+- Existing rows have data_as_of NULL. From the Kaggle load times (kagglehub cache: v521 at 2026-10-21 15:57 ET, v522 at 2026-10-22 14:20 ET), every existing row was computed after the previous slate's box scores were loaded. The 2026-10-20 rows had no previous regular-season slate.
+- **Analysis:** primary analyses include data_stale rows as logged. A sensitivity analysis excludes them, and their count is reported.
+- **Prevention:**
+  - The Kaggle retry no longer stops for the day when the 90/60-minute guards close. It skips that check and tries again an hour later, and stops only when the new version is loaded, the ETL fails, or the day ends.
+  - A 07:00 maintenance missed while the backend was down or asleep is caught up on startup.
+
+### 3. Pre-tip timing
+- From 2026-10-23, pre-tip jobs run one at a time in the backend. When several games share a tip time, later games' pulls land after T−30: about 30 s per earlier game, about 2 minutes for the fifth game in a group of five.
+- Each row's actual time is in captured_at. A job that reaches a game after its commence_time makes no pull. Rows are not otherwise treated differently.
+
+### 4. Games with no pre-tip pull on 2026-10-20
+- Philadelphia 76ers @ New York Knicks and Oklahoma City Thunder @ San Antonio Spurs have no pre-tip pull and no paper rows, because the backend was not running at their pre-tip times. Both have 10:00 open snapshots.
+- They are absent from H1, H2, H3, section 4, and the open-vs-pre-tip analyses, which need both snapshots.
