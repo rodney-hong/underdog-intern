@@ -671,3 +671,10 @@ No backfilled line had been downloaded when this entry was written.
 
 - Probe game 22400562 (Boston Celtics @ Toronto Raptors, 2025-01-15) was pulled on 2026-10-22 (player_points only) to check whether OddsAPI carries Underdog in 2024-25. It is excluded from Test A, like the two Stage 3 probes.
 - Test A is computed once, after the full backfill planned for the November 2026 billing cycle is complete and its game list is recorded in a dated entry. No Test A result is computed on partial backfills, including the 183 games pulled in October 2026 (backend/experiments/backfill_games_2026-10.md).
+
+## Entry: Kaggle data integrity, NULL minutes (2026-10-23)
+- Kaggle v523 blanked numMinutes for all 27 rows of game 22600088 (Bulls at Raptors, 2026-10-21); v522 had them. The feature path drops games with NULL minutes, so these players' rolling features would silently omit a game they played.
+- One-off: before the first affected pre-tip pull on 2026-10-23, numMinutes for those 27 rows is restored from the v522 backup (backups/predictions_2026-10-23.db). No other column is changed. No paper prediction for these players had been logged since v523 was loaded.
+- Going forward (ETL): when a new Kaggle version has NULL numMinutes where the previously loaded version had a value for the same (gameId, personId), the previous value is kept and a warning is logged.
+- Grading (paper and app): a row is DNP only if minutes are 0/NULL and all counting stats (points, rebounds, assists, 3PM, blocks, steals, turnovers) are 0/NULL. NULL minutes with any counting stat counts as played. No paper row has been graded under the old rule with NULL minutes; all 53 rows for 22600088 were graded under v522.
+- Frozen models, hypotheses and populations are unchanged.
