@@ -39,6 +39,8 @@ CLI:
 import os
 import sqlite3
 import argparse
+import threading
+import time
 import datetime as dt
 from zoneinfo import ZoneInfo
 
@@ -708,7 +710,28 @@ def _log_paper_predictions(game_id: str) -> None:
         print(f"[line_logger] paper predictions FAILED for {game_id}: {exc!r}")
 
 
-def run_pretip_pull(event: dict, attempt: int = 1) -> None:
+# One pre-tip job (pull + paper predictions) at a time in this process. log_for_pull
+# holds a write transaction for ~25-30 s per game; with several games sharing a tip
+# time, concurrent jobs hit the 30 s busy timeout ("database is locked") and lost
+# snapshots or paper rows (audit 2026-10-23: 2 of 5 failed on a DB copy).
+_PRETIP_LOCK = threading.Lock()
+
+
+def run_pretip_pull(event: dict, attempt: int = 1):
+    """_run_pretip_pull under _PRETIP_LOCK; logs how long it waited for another game's job."""
+    label = f"{event.get('away_team')} @ {event.get('home_team')} ({event['id']})"
+    if not _PRETIP_LOCK.acquire(blocking=False):
+        t0 = time.monotonic()
+        print(f"[line_logger] pretip {label}: waiting for another pre-tip job")
+        _PRETIP_LOCK.acquire()
+        print(f"[line_logger] pretip {label}: waited {time.monotonic() - t0:.1f}s")
+    try:
+        return _run_pretip_pull(event, attempt)
+    finally:
+        _PRETIP_LOCK.release()
+
+
+def _run_pretip_pull(event: dict, attempt: int = 1):
     init_tables()
     commence  = _commence(event)
     game_date = commence.astimezone(EASTERN).date().isoformat()
