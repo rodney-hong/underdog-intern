@@ -100,15 +100,21 @@ def get_team_names() -> list[str]:
 # Players
 # ---------------------------------------------------------------------------
 
-def search_players(query: str, limit: int = 10) -> list[str]:
-    """Return up to `limit` full names containing `query` (case-insensitive)."""
+def search_players(query: str, limit: int = 10) -> list[dict]:
+    """
+    Up to `limit` players whose full name contains `query` (case-insensitive), as
+    {"name", "person_id", "team"} so same-named players can be told apart. team: the
+    current roster team (rosters.current_team), else the latest box-score team.
+    """
     q = query.strip()
     if not q:
         return []
     conn = get_db()
     rows = conn.execute(
         """
-        SELECT DISTINCT p.firstName, p.lastName
+        SELECT DISTINCT p.personId, p.firstName, p.lastName,
+               (SELECT ps.playerteamCity || ' ' || ps.playerteamName FROM player_stats ps
+                 WHERE ps.personId = p.personId ORDER BY ps.gameDateTimeEst DESC LIMIT 1) AS box_team
         FROM players p
         WHERE (p.firstName || ' ' || p.lastName) LIKE ?
           AND EXISTS (
@@ -121,7 +127,13 @@ def search_players(query: str, limit: int = 10) -> list[str]:
         (f"%{q}%", limit),
     ).fetchall()
     conn.close()
-    return [f"{r['firstName']} {r['lastName']}" for r in rows]
+    out = []
+    for r in rows:
+        name = f"{r['firstName']} {r['lastName']}"
+        roster = rosters.current_team(name, int(r["personId"]))
+        out.append({"name": name, "person_id": int(r["personId"]),
+                    "team": roster["team_full"] if roster else r["box_team"]})
+    return out
 
 
 def get_player_id(player_name: str) -> int | None:
@@ -600,21 +612,46 @@ def get_player_context(player_name: str) -> dict | None:
 _ESPN_INJURIES_URL = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/injuries"
 
 
-def get_injury_context(player_name: str) -> str:
-    """Return a short injury note for the player, or '' if none found."""
+def _espn_injury_for(player_name: str) -> tuple[dict | None, str | None]:
+    """
+    (ESPN injury entry, None) for this player, matched by ESPN athlete id through
+    player_match.espn_person_map, never by name; (None, flag) when the name only
+    resolves fuzzily onto a collision; (None, None) when he has no entry.
+    ESPN groups the feed by team: [{"id", "displayName", "injuries": [entry, ...]}].
+    """
+    import player_match
+    conn = get_db()
     try:
-        resp = httpx.get(_ESPN_INJURIES_URL, timeout=8)
-        resp.raise_for_status()
-        data = resp.json()
-        injuries = data.get("injuries", [])
-        name_lower = player_name.lower()
-        for entry in injuries:
-            athlete = entry.get("athlete", {})
-            if name_lower in athlete.get("displayName", "").lower():
-                status = entry.get("status", "")
-                detail = entry.get("shortComment", entry.get("longComment", ""))
-                if status or detail:
-                    return f"{status}: {detail}".strip(": ")
+        who = player_match.person_for_name(conn, player_name, get_player_id(player_name))
+        if who["status"] == "ambiguous":
+            return None, who["flag"]
+        if who["status"] != "ok":
+            return None, None
+        ids = player_match.athlete_ids_for(conn, who["person_id"])
+    finally:
+        conn.close()
+    if not ids:
+        return None, None              # no ESPN athlete tied to him (not on a roster, or flagged)
+    for team in _fetch_espn_injuries():
+        for entry in team.get("injuries", []):
+            if player_match.espn_athlete_id(entry.get("athlete", {})) in ids:
+                return entry, None
+    return None, None
+
+
+def get_injury_context(player_name: str) -> str:
+    """Return a short injury note for the player ('status: detail'), or '' if none found."""
+    try:
+        entry, ambiguous = _espn_injury_for(player_name)
+        if ambiguous:
+            import player_match
+            player_match.flag(f"injury context: {ambiguous}")
+            return ""
+        if entry:
+            status = entry.get("status", "")
+            detail = entry.get("shortComment") or entry.get("longComment", "")
+            if status or detail:
+                return f"{status}: {detail}".strip(": ")
     except Exception:
         pass
     return ""
@@ -634,35 +671,42 @@ def _fetch_espn_injuries() -> list:
 
 
 def get_player_injury_status(player_name: str) -> dict | None:
+    """
+    {"status", "reason"} from ESPN, matched by athlete id (player_match), or None.
+    {"status": "ambiguous", "reason": <flag>} when the name only resolves fuzzily onto
+    a colliding name: shown as such instead of another player's injury.
+    """
     try:
-        teams = _fetch_espn_injuries()
-        all_players = [
-            (player, team)
-            for team in teams
-            for player in team.get("injuries", [])
-            if "athlete" in player
-        ]
-        names = [p["athlete"]["displayName"] for p, _ in all_players]
-        close = difflib.get_close_matches(player_name, names, n=1, cutoff=0.8)
-        if not close:
+        entry, ambiguous = _espn_injury_for(player_name)
+        if ambiguous:
+            import player_match
+            player_match.flag(f"injury status: {ambiguous}")
+            return {"status": "ambiguous", "reason": ambiguous}
+        if entry is None:
             return None
-        matched_player = next(p for p, _ in all_players if p["athlete"]["displayName"] == close[0])
-        return {
-            "status": matched_player.get("status", ""),
-            "reason": matched_player.get("shortComment", ""),
-        }
+        return {"status": entry.get("status", ""), "reason": entry.get("shortComment", "")}
     except Exception:
         return None
 
 
 def get_opponent_injuries(opponent_team: str) -> list[dict]:
+    """Out / Questionable players of opponent_team, matching ESPN's team by its ESPN id
+    (rosters.espn_team_id), else its exact display name; never by fuzzy name."""
     try:
         teams = _fetch_espn_injuries()
-        team_names = [t.get("displayName", "") for t in teams]
-        close = difflib.get_close_matches(opponent_team, team_names, n=1, cutoff=0.7)
-        if not close:
+        nickname = "Trail Blazers" if "Blazers" in opponent_team else opponent_team.split()[-1]
+        conn = get_db()
+        try:
+            row = conn.execute("SELECT espn_team_id FROM rosters WHERE team_name = ? LIMIT 1",
+                               (nickname,)).fetchone()
+        except sqlite3.OperationalError:
+            row = None
+        finally:
+            conn.close()
+        matched_team = next((t for t in teams if row and str(t.get("id")) == str(row[0])), None) \
+            or next((t for t in teams if t.get("displayName") == opponent_team), None)
+        if matched_team is None:
             return []
-        matched_team = next(t for t in teams if t.get("displayName") == close[0])
         result = []
         for player in matched_team.get("injuries", []):
             status = player.get("status", "")
@@ -822,8 +866,11 @@ def get_todays_lines() -> dict:
 def get_player_line(player_name: str, stat_type: str) -> tuple[float | None, str | None]:
     """
     Return (line_value, bookmaker_key) for the given player and stat type,
-    or (None, None) if unavailable.
-    Uses fuzzy name matching (cutoff 0.85) to handle minor OddsAPI name differences.
+    or (None, None) if unavailable, or (None, "ambiguous") when the name has no exact,
+    team-confirmed match and collides with another player's name (flagged).
+    Matching (player_match.match_name): exact rosters.name_key, and the line's game
+    must include the player's current team. No fuzzy matching: it gave players other
+    players' lines (audit of 2026-10-23).
 
     Lines come from get_todays_lines(), which makes no OddsAPI calls: today's
     logged Underdog lines (Points, Rebounds, Assists, 3PM, from line_logger) or
@@ -845,16 +892,22 @@ def get_player_line(player_name: str, stat_type: str) -> tuple[float | None, str
             return entry["value"], entry["source"]
         return None, None
 
-    # Exact match first
-    value, source = _extract(player_name)
-    if value is not None:
-        return value, source
-
-    # Fuzzy fallback
-    close = difflib.get_close_matches(player_name, list(cache.keys()), n=1, cutoff=0.85)
-    if close:
-        return _extract(close[0])
-
+    import player_match
+    nick = lambda t: ("Trail Blazers" if "Blazers" in t else t.split()[-1]) if t else ""
+    ctx = get_player_context(player_name)
+    team = nick(ctx["player_team_full"]) if ctx and ctx.get("player_team_full") else None
+    teams_of = {n: {nick(v.get("home_team", "")), nick(v.get("away_team", ""))}
+                for n, v in cache.items() if isinstance(v, dict)}
+    conn = get_db()
+    try:
+        m = player_match.match_name(conn, player_name, list(cache), teams_of, team)
+    finally:
+        conn.close()
+    if m["status"] == "ok":
+        return _extract(m["name"])
+    if m["status"] == "ambiguous":
+        player_match.flag(f"line: {m['flag']}")
+        return None, "ambiguous"
     return None, None
 
 

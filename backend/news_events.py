@@ -23,23 +23,22 @@ Triggers
   with is_change=True but do not trigger. ESPN items are
   stored as news_items and trigger nothing. Drop-off rows (source='derived')
   are recorded as events but do not trigger: they carry no new status.
-  A changed player triggers only if fuzzy-matched (difflib, cutoff 0.85, as in
-  data_fetcher.get_player_line) to a Points line logged today in
+  A changed player triggers only if his name matches exactly (rosters.name_key,
+  player_match.match_name; no fuzzy matching) a Points line logged today in
   line_snapshots whose game is the same matchup as the report row (both teams
-  agree; guards against same-name players and mis-dated lines). Changes are
-  coalesced to one pull per game per report.
+  agree; guards against same-name players and mis-dated lines). A name with no
+  exact match that collides with a line name is recorded as ambiguous and flagged,
+  never guessed. Changes are coalesced to one pull per game per report.
 
 EVENT_TRIGGERS_ENABLED (default "0") gates the pull itself; events are always
 recorded.
 """
 
 import os
-import difflib
 import datetime as dt
 from zoneinfo import ZoneInfo
 
 EASTERN = ZoneInfo("America/New_York")
-MATCH_CUTOFF = 0.85
 
 
 def init_tables(conn) -> None:
@@ -73,9 +72,15 @@ def init_tables(conn) -> None:
 # ---------------------------------------------------------------------------
 
 def flip_name(name: str) -> str:
-    """'Butler III, Jimmy' -> 'Jimmy Butler III'; 'Moore Jr., Wendell' -> 'Wendell Moore Jr.'"""
-    last, sep, first = name.partition(", ")
-    return f"{first} {last}".strip() if sep else name.strip()
+    """
+    'Butler III, Jimmy' -> 'Jimmy Butler III'; 'Moore Jr., Wendell' -> 'Wendell Moore Jr.';
+    'Udeh, Jr., Ernest' -> 'Ernest Udeh Jr.' (the suffix as its own field, 2026-10-22 report).
+    """
+    parts = [p.strip() for p in name.split(",")]
+    if len(parts) < 2:
+        return name.strip()
+    last, middle, first = parts[0], parts[1:-1], parts[-1]
+    return " ".join(p for p in [first, last, *middle] if p)
 
 
 def _iso_date(mmddyyyy: str) -> str | None:
@@ -137,11 +142,13 @@ def same_matchup(matchup: str, home_team: str, away_team: str) -> bool:
     return {full_to_abbrev(home_team), full_to_abbrev(away_team)} == set(matchup.split("@"))
 
 
-def match_player(player: str, names: list[str]) -> str | None:
-    if player in names:
-        return player
-    close = difflib.get_close_matches(player, names, n=1, cutoff=MATCH_CUTOFF)
-    return close[0] if close else None
+def match_player(conn, player: str, names: list[str]) -> dict:
+    """
+    player_match.match_name over this matchup's line names: exact name_key only (no
+    difflib). {"status": "ok", "name"} / {"status": "ambiguous", "flag"} / not_found.
+    """
+    import player_match
+    return player_match.match_name(conn, player, names)
 
 
 def _live_trigger(game_id: str, note: str) -> str:
@@ -214,10 +221,16 @@ def process_report(conn, *, url: str, rows: list[dict], prev_rows: list[dict] | 
             continue
         lines = {p: v for p, v in lines_lookup(ev["game_date"]).items()
                  if same_matchup(ev["matchup"], v[1], v[2])}
-        m = match_player(ev["player"], list(lines))
-        if m is None:
+        res = match_player(conn, ev["player"], list(lines))
+        if res["status"] == "ambiguous":
+            import player_match
+            player_match.flag(f"official report: {res['flag']}")
+            _set_result(conn, ev_id, None, None, f"no trigger: ambiguous name ({res['flag']})"[:300])
+            continue
+        if res["status"] != "ok":
             _set_result(conn, ev_id, None, None, "no trigger: no Points line today for this game")
             continue
+        m = res["name"]
         by_game.setdefault(lines[m][0], []).append((ev_id, ev, m))
 
     results = {}

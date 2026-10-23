@@ -137,15 +137,22 @@ function PlayerSearch({ value, onChange, onSelect, onClear, searchUrl, placehold
       </div>
       {open && (
         <ul className="card absolute z-50 mt-1 w-full rounded-xl shadow-2xl overflow-hidden animate-slide-down">
-          {suggestions.map((name) => (
-            <li
-              key={name}
-              onMouseDown={() => handleSelect(name)}
-              className="suggestion-item px-4 py-2.5 cursor-pointer text-sm"
-            >
-              {name}
-            </li>
-          ))}
+          {suggestions.map((s) => {
+            // NBA search returns {name, person_id, team}; WNBA search returns plain names.
+            const name = typeof s === 'string' ? s : s.name
+            return (
+              <li
+                key={typeof s === 'string' ? s : s.person_id}
+                onMouseDown={() => handleSelect(name)}
+                className="suggestion-item px-4 py-2.5 cursor-pointer text-sm"
+              >
+                {name}
+                {typeof s !== 'string' && s.team && (
+                  <span className="ml-2 text-xs" style={{ color: 'var(--text-muted)' }}>{s.team}</span>
+                )}
+              </li>
+            )
+          })}
         </ul>
       )}
     </div>
@@ -584,6 +591,8 @@ export default function App() {
           setStatLine(String(data.line))
           setLineSource(data.source ?? null)
           setLineNote('')
+        } else if (data.source === 'ambiguous') {
+          setLineNote('Name is close to another player with a line — not auto-filled, enter manually')
         } else {
           setLineNote('Line not available from sportsbooks — enter manually')
         }

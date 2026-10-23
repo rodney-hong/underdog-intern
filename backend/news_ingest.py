@@ -79,7 +79,8 @@ def init_tables(conn: sqlite3.Connection | None = None) -> None:
             published_at TEXT,            -- UTC ISO; source's own timestamp
             fetched_at   TEXT NOT NULL,   -- UTC ISO
             hash         TEXT NOT NULL UNIQUE,
-            related_url  TEXT             -- derived rows: the previous report the player was in
+            related_url  TEXT,            -- derived rows: the previous report the player was in
+            athlete_id   TEXT             -- espn_injuries: ESPN athlete id (player_match)
         );
         CREATE INDEX IF NOT EXISTS idx_news_items_fetched ON news_items (fetched_at);
 
@@ -106,6 +107,13 @@ def init_tables(conn: sqlite3.Connection | None = None) -> None:
     cols = {r[1] for r in conn.execute("PRAGMA table_info(news_items)")}
     if "related_url" not in cols:
         conn.execute("ALTER TABLE news_items ADD COLUMN related_url TEXT")
+    if "athlete_id" not in cols:
+        conn.execute("ALTER TABLE news_items ADD COLUMN athlete_id TEXT")
+        # Existing ESPN items: the id is in their playercard url.
+        import player_match
+        rows = conn.execute("SELECT id, url FROM news_items WHERE source = 'espn_injuries'").fetchall()
+        conn.executemany("UPDATE news_items SET athlete_id = ? WHERE id = ?",
+                         [(player_match.athlete_id_from_url(r[1]), r[0]) for r in rows])
     conn.commit()
     if own:
         conn.close()
@@ -120,10 +128,11 @@ def _store(conn, source: str, items: list[dict], fetched_at: str) -> int:
     before = conn.total_changes
     conn.executemany(
         "INSERT OR IGNORE INTO news_items "
-        "(source, url, raw_text, published_at, fetched_at, hash, related_url) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        "(source, url, raw_text, published_at, fetched_at, hash, related_url, athlete_id) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         [(source, it["url"], it["raw_text"], it["published_at"], fetched_at,
-          _hash(source, it["hash_text"]), it.get("related_url")) for it in items],
+          _hash(source, it["hash_text"]), it.get("related_url"), it.get("athlete_id"))
+         for it in items],
     )
     conn.commit()
     return conn.total_changes - before
@@ -150,6 +159,7 @@ def _espn_published(date_str: str | None) -> str | None:
 
 
 def espn_items(teams: list[dict]) -> list[dict]:
+    import player_match
     items = []
     for team in teams:
         team_name = team.get("displayName", "")
@@ -166,6 +176,7 @@ def espn_items(teams: list[dict]) -> list[dict]:
             ])
             items.append({
                 "url": url or f"{ESPN_INJURIES_API}#{e.get('id', '')}",
+                "athlete_id": player_match.espn_athlete_id(athlete),
                 "raw_text": text,
                 "published_at": _espn_published(e.get("date")),
                 # date included: ESPN re-dating an entry is a new update, not a duplicate

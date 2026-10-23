@@ -998,6 +998,13 @@ def _run_morning_maintenance(scheduler=None) -> dict:
     except Exception as exc:
         out["rosters"] = f"FAILED: {exc!r}"
         print(f"[maintenance] rosters refresh FAILED: {exc!r} (continuing)")
+    else:
+        try:   # app name matching tables follow the rosters (player_match); never blocks maintenance
+            import player_match
+            out["player_match"] = player_match.rebuild_now()
+        except Exception as exc:
+            out["player_match"] = f"FAILED: {exc!r}"
+            print(f"[maintenance] player_match rebuild FAILED: {exc!r} (continuing)")
 
     due = _pretips_due_within(scheduler, ETL_PRETIP_GUARD_MINUTES)
     tips = _tipoffs_within(ETL_TIPOFF_GUARD_MINUTES)

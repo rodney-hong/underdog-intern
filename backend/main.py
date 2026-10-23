@@ -77,6 +77,9 @@ def startup_event():
     # Current rosters (ESPN, free) before anything schedules a paper prediction:
     # player teams come from them, falling back to box scores.
     _startup_step("rosters.refresh", importlib.import_module("rosters").refresh_rosters)
+    # App name matching: ESPN id -> personId map and the name-collision table, from the
+    # rosters just refreshed (player_match; app display only, not the models).
+    _startup_step("player_match.rebuild", importlib.import_module("player_match").rebuild_now)
 
     # Collection first, each guarded separately so one can't block the other.
     # Paper-mode line logging (Points, UD/FD/DK); it never touches predictions.
@@ -189,7 +192,7 @@ class PredictRequest(BaseModel):
 
 @app.get("/players/search")
 def search_players(q: str = Query(default="", min_length=1)):
-    """Return up to 10 player names matching the query string."""
+    """Up to 10 players matching the query: [{"name", "person_id", "team"}]."""
     if not q.strip():
         return []
     results = data_fetcher.search_players(q)
