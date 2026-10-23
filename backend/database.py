@@ -333,9 +333,61 @@ def _roster_season(conn) -> str | None:
     return seasons[0] if len(seasons) == 1 else None
 
 
-def _resolve_decision(conn, row, known_players: set, available_cols: set) -> dict | None:
+def _person_index(conn) -> tuple[dict, dict]:
+    """
+    Name -> {personId} from every player_stats and players name: one dict keyed by
+    the accent-free full name, one by rosters.name_key (no case, punctuation or
+    Jr./II suffix). A personId can sit under several names: the 2026-27 box scores
+    write 1626171 as 'Bobby Portis Jr.', earlier seasons and players as 'Bobby Portis'.
+    """
+    import rosters
+    exact, loose = {}, {}
+    for pid, first, last in conn.execute(
+            "SELECT DISTINCT personId, firstName, lastName FROM player_stats WHERE personId IS NOT NULL "
+            "UNION SELECT personId, firstName, lastName FROM players WHERE personId IS NOT NULL"):
+        full = f"{first or ''} {last or ''}".strip()
+        exact.setdefault(_ascii_normalize(full), set()).add(int(pid))
+        loose.setdefault(rosters.name_key(full), set()).add(int(pid))
+    return exact, loose
+
+
+def _person_id(conn, player_name: str, index: tuple[dict, dict], day: tuple[str, str],
+               opp_nickname: str) -> tuple[int | None, str | None]:
+    """
+    (personId, None) for a prediction's player name, or (None, why not). An exact
+    full-name match wins; only a name with no exact match falls back to name_key.
+    Several personIds under one name (two Jaylin Williams; stray players-table ids
+    for Luka Doncic) narrow to the one who played the stored opponent that day,
+    else who played that day, else the only one with a box score in the year
+    before. Still more than one: ambiguous, never guessed.
+    """
+    import rosters
+    exact, loose = index
+    ids = exact.get(_ascii_normalize(player_name)) or loose.get(rosters.name_key(player_name))
+    if not ids:
+        return None, "name matches no player_stats or players row (check the name)"
+    if len(ids) == 1:
+        return next(iter(ids)), None
+    marks = ",".join("?" * len(ids))
+    for cond, args in (
+            ("gameDateTimeEst >= ? AND gameDateTimeEst < ? AND opponentteamName = ?", (*day, opp_nickname)),
+            ("gameDateTimeEst >= ? AND gameDateTimeEst < ?", day),
+            ("gameDateTimeEst >= date(?, '-365 days') AND gameDateTimeEst < ?", (day[0], day[0]))):
+        found = {r[0] for r in conn.execute(
+            f"SELECT DISTINCT personId FROM player_stats WHERE personId IN ({marks}) AND {cond}",
+            (*ids, *args))}
+        if len(found) == 1:
+            return found.pop(), None
+        if found:
+            break
+    return None, f"name matches {len(ids)} personIds {sorted(ids)}: ambiguous"
+
+
+def _resolve_decision(conn, row, index: tuple[dict, dict], available_cols: set) -> dict | None:
     """
     What the resolver does with one pending prediction (writes nothing).
+    The name is mapped to a personId once (_person_id), and box scores are matched
+    by personId, so a box-score name change (a new 'Jr.') can't hide a game.
     Returns None for rows it can't evaluate (unmapped stat type, bad date), else a
     dict with "result" (OVER / UNDER / DNP, or None to leave pending), "kind",
     "matched" (the player_stats row used, or the matchup checked for a DNP) and
@@ -346,8 +398,6 @@ def _resolve_decision(conn, row, known_players: set, available_cols: set) -> dic
     if not stat_cols:
         return None
 
-    # Full-name match: splitting at the last space breaks suffixes
-    # ("Jaren Jackson Jr." is firstName 'Jaren', lastName 'Jackson Jr.').
     player_name = row["player_name"].strip()
     opp = row["opponent_team"]
     opp_nickname = "Trail Blazers" if "Blazers" in opp else opp.strip().split()[-1]
@@ -368,17 +418,19 @@ def _resolve_decision(conn, row, known_players: set, available_cols: set) -> dic
     # is the ET date, as an index range.
     day = (game_date_val, (gd + timedelta(days=1)).isoformat())
 
-    out = {"id": row["id"], "player": player_name, "stat": row["stat_type"],
-           "game_date": game_date_val, "opponent": opp,
-           "result": None, "kind": "pending", "matched": None, "warning": None}
+    person_id, why = _person_id(conn, player_name, index, day, opp_nickname)
+    out = {"id": row["id"], "player": player_name, "person_id": person_id,
+           "stat": row["stat_type"], "game_date": game_date_val, "opponent": opp,
+           "result": None, "kind": "pending", "matched": None, "warning": why}
+    if person_id is None:
+        return out
 
     select_cols = [c for c in stat_cols + ["gameDateTimeEst", "numMinutes"]
                    if c in available_cols]
     day_rows = conn.execute(
         f"SELECT {', '.join(select_cols)}, playerteamName, opponentteamName "
-        "FROM player_stats WHERE gameDateTimeEst >= ? AND gameDateTimeEst < ? "
-        "  AND ascii_norm(firstName || ' ' || lastName) = ascii_norm(?)",
-        (*day, player_name),
+        "FROM player_stats WHERE gameDateTimeEst >= ? AND gameDateTimeEst < ? AND personId = ?",
+        (*day, person_id),
     ).fetchall()
 
     game = next((g for g in day_rows if g["opponentteamName"] == opp_nickname), None)
@@ -403,16 +455,12 @@ def _resolve_decision(conn, row, known_players: set, available_cols: set) -> dic
                           f"on {game_date_val}, stored opponent {opp}")
         return out
 
-    # No row that day. DNP only for a known player whose team played the stored
-    # opponent that day.
-    if _ascii_normalize(player_name) not in known_players:
-        out["warning"] = "name matches no player_stats row (check the name)"
-        return out
+    # No row for his personId that day. DNP only if his team played the stored
+    # opponent that day (that game is loaded and he is not in it).
     last = conn.execute(
-        "SELECT playerteamName, personId FROM player_stats WHERE gameDateTimeEst < ? "
-        "  AND ascii_norm(firstName || ' ' || lastName) = ascii_norm(?) "
+        "SELECT playerteamName FROM player_stats WHERE gameDateTimeEst < ? AND personId = ? "
         "ORDER BY gameDateTimeEst DESC LIMIT 1",
-        (game_date_val, player_name),
+        (game_date_val, person_id),
     ).fetchone()
     # His team mirrors the predictor (data_fetcher.get_player_context): the ESPN
     # roster team from rosters.current_team(), else his latest box-score team. The
@@ -421,7 +469,7 @@ def _resolve_decision(conn, row, known_players: set, available_cols: set) -> dic
     import rosters
     team, team_source = None, None
     if _nba_season(gd) == _roster_season(conn):
-        roster = rosters.current_team(player_name, last["personId"] if last else None)
+        roster = rosters.current_team(player_name, person_id)
         if roster:
             team, team_source = roster["team_name"], "roster"
     if team is None and last:
@@ -455,15 +503,10 @@ def _resolve_decisions(conn, pending):
     available_cols = {
         r[1] for r in conn.execute("PRAGMA table_info(player_stats)").fetchall()
     }
-    # Normalized full names in player_stats, read before any write lock is taken.
-    known_players = {
-        _ascii_normalize(f"{f} {l}")
-        for f, l in conn.execute(
-            "SELECT DISTINCT firstName, lastName FROM player_stats "
-            "WHERE firstName IS NOT NULL AND lastName IS NOT NULL")
-    }
+    # Name -> personId index, read once before any write lock is taken.
+    index = _person_index(conn)
     for row in pending:
-        d = _resolve_decision(conn, row, known_players, available_cols)
+        d = _resolve_decision(conn, row, index, available_cols)
         if d and d["warning"]:
             print(f"  WARNING: id {d['id']} {d['player']} ({d['game_date']} vs {d['opponent']}): "
                   f"{d['warning']}; left pending", flush=True)
@@ -478,7 +521,6 @@ def dry_run_pending_predictions() -> list[dict]:
     pending = _pending_predictions()
     print(f"Dry run: {len(pending)} pending app prediction(s), nothing written.", flush=True)
     conn = get_connection()
-    conn.create_function("ascii_norm", 1, _ascii_normalize)
     try:
         return [d for _, d in _resolve_decisions(conn, pending) if d]
     finally:
@@ -488,12 +530,15 @@ def dry_run_pending_predictions() -> list[dict]:
 def resolve_pending_predictions() -> int:
     """
     Fill predictions.actual_result (OVER / UNDER / DNP) from player_stats.
+    The player name is mapped once to a personId (exact full name, else without
+    Jr./II suffix; no match or two personIds: pending with a warning), and box
+    scores are matched by that personId, never by name.
     A prediction is graded only against the player's row on game_date (ET) whose
     opponent is the stored opponent. If he has a row that day against another
     team, or has none and the stored opponent didn't play his team that day, the
     row is left pending with a warning: never graded, never marked DNP.
-    No row while that matchup is loaded means DNP (absent from box score), for a
-    name that matches some player_stats row; his team is the ESPN roster team when
+    No row for his personId while that matchup is loaded means DNP (absent from
+    box score); his team is the ESPN roster team when
     game_date is in the roster's season, else his latest box-score team (as the
     predictor does). Each such row is printed. Nothing loaded for that date means
     the box score isn't in yet: pending.
@@ -509,7 +554,6 @@ def resolve_pending_predictions() -> int:
     dnp_zero_min  = 0
     dnp_absence   = 0
     conn = get_connection()
-    conn.create_function("ascii_norm", 1, _ascii_normalize)
     try:
         for i, (row, d) in enumerate(_resolve_decisions(conn, pending)):
             if i and i % RESOLVE_BATCH_SIZE == 0:
