@@ -1,0 +1,338 @@
+"""
+Screenshot import: image validation (memory only), the swappable extractor (Claude /
+Ollama, both stubbed), normalization, player resolution (exact name_key + team), the
+historical-range flag, and POST /screenshot/extract. The sample image is synthetic
+(tests/synthetic_screenshot.py) and built in memory; nothing is written to disk.
+Set RUN_LIVE_EXTRACTOR=1 to also run the configured extractor on it for real.
+"""
+import io
+import json
+import os
+import random
+import sqlite3
+import sys
+import tempfile
+import types
+
+import pytest
+from PIL import Image
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import database
+import screenshot_import as si
+import synthetic_screenshot as ss
+
+RAW = [  # what an extractor returns for ss.CARDS (strings and labels as a model writes them)
+    {"player_name": "Giannis Antetokounmpo", "team": "MIA", "stat": "Points", "line": 27.5,
+     "higher_multiplier": "1.03x", "lower_multiplier": 0.88},
+    {"player_name": "Brandon Miller", "team": "CHA", "stat": "3-Pointers Made", "line": "2.5",
+     "higher_multiplier": None, "lower_multiplier": None},
+    {"player_name": "Jalen Williams", "team": "OKC", "stat": "Rebounds", "line": 5.5,
+     "higher_multiplier": 0.92, "lower_multiplier": 1.05},
+    {"player_name": "Cade Cunningham", "team": None, "stat": "Assists", "line": 8.5,
+     "higher_multiplier": 1.0, "lower_multiplier": 1.0},
+]
+
+
+# --- image handling ------------------------------------------------------------------
+
+def test_synthetic_png_is_accepted_and_reencoded():
+    png, media = si.prepare_image(ss.render())
+    assert media == "image/png" and Image.open(io.BytesIO(png)).format == "PNG"
+
+
+def test_jpeg_is_accepted_and_large_images_are_scaled_down():
+    buf = io.BytesIO()
+    Image.new("RGB", (4000, 1000), (20, 20, 20)).save(buf, format="JPEG")
+    png, _ = si.prepare_image(buf.getvalue())
+    assert max(Image.open(io.BytesIO(png)).size) == si.MAX_IMAGE_SIDE
+
+
+@pytest.mark.parametrize("data", [b"", b"not an image at all", b"%PDF-1.4 ..."])
+def test_non_images_are_rejected(data):
+    with pytest.raises(si.BadImage):
+        si.prepare_image(data)
+
+
+def test_oversized_upload_is_rejected(monkeypatch):
+    monkeypatch.setattr(si, "MAX_IMAGE_BYTES", 100)
+    with pytest.raises(si.BadImage, match="over"):
+        si.prepare_image(ss.render())
+
+
+# --- normalization ------------------------------------------------------------------------
+
+def test_rows_are_normalized():
+    rows = [si.normalize_row(r) for r in RAW]
+    assert [(r["player_name"], r["team"], r["stat"], r["line"], r["higher_multiplier"], r["lower_multiplier"])
+            for r in rows] == [
+        ("Giannis Antetokounmpo", "MIA", "Points", 27.5, 1.03, 0.88),
+        ("Brandon Miller", "CHA", "3PM", 2.5, None, None),
+        ("Jalen Williams", "OKC", "Rebounds", 5.5, 0.92, 1.05),
+        ("Cade Cunningham", None, "Assists", 8.5, 1.0, 1.0)]
+
+
+def test_rows_without_a_name_or_line_are_dropped_and_odd_stats_kept_unmapped():
+    assert si.normalize_row({"player_name": "", "line": 3}) is None
+    assert si.normalize_row({"player_name": "X", "line": None}) is None
+    r = si.normalize_row({"player_name": "X", "stat": "Fantasy Points", "line": 40.5})
+    assert r["stat"] is None and r["stat_text"] == "Fantasy Points"
+
+
+# --- swappable extractor ----------------------------------------------------------------
+
+def test_extractor_setting(monkeypatch):
+    monkeypatch.delenv("SCREENSHOT_EXTRACTOR", raising=False)
+    assert si.extractor_name() == "claude"
+    monkeypatch.setenv("SCREENSHOT_EXTRACTOR", "Ollama")
+    assert si.extractor_name() == "ollama"
+    monkeypatch.setenv("SCREENSHOT_EXTRACTOR", "tesseract")
+    with pytest.raises(si.ExtractorUnavailable, match="SCREENSHOT_EXTRACTOR"):
+        si.extractor_name()
+
+
+def test_claude_without_a_key_is_unavailable(monkeypatch):
+    monkeypatch.setenv("SCREENSHOT_EXTRACTOR", "claude")
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    with pytest.raises(si.ExtractorUnavailable, match="ANTHROPIC_API_KEY"):
+        si.extract_rows(ss.render())
+
+
+def test_claude_request_sends_the_image_and_schema_and_parses_json(monkeypatch):
+    import anthropic
+    sent = {}
+
+    class FakeMessages:
+        def create(self, **kw):
+            sent.update(kw)
+            return types.SimpleNamespace(stop_reason="end_turn", content=[
+                types.SimpleNamespace(type="text", text=json.dumps({"rows": RAW}))])
+
+    class FakeClient:
+        def __init__(self, *a, **kw):
+            self.beta = types.SimpleNamespace(messages=FakeMessages())
+
+    monkeypatch.setenv("SCREENSHOT_EXTRACTOR", "claude")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key-not-real")
+    monkeypatch.setattr(anthropic, "Anthropic", FakeClient)
+    name, rows = si.extract_rows(ss.render())
+    assert name == "claude" and [r["stat"] for r in rows] == ["Points", "3PM", "Rebounds", "Assists"]
+    assert sent["model"] == si.CLAUDE_MODEL
+    assert sent["output_config"]["format"] == {"type": "json_schema", "schema": si.SCHEMA}
+    image, text = sent["messages"][0]["content"]
+    assert image["type"] == "image" and image["source"]["media_type"] == "image/png"
+    assert Image.open(io.BytesIO(__import__("base64").b64decode(image["source"]["data"]))).format == "PNG"
+    assert "never infer" in text["text"] and "predict" not in text["text"].lower()
+
+
+def test_claude_refusal_is_unavailable(monkeypatch):
+    import anthropic
+
+    class FakeClient:
+        def __init__(self, *a, **kw):
+            self.beta = types.SimpleNamespace(messages=types.SimpleNamespace(
+                create=lambda **kw: types.SimpleNamespace(stop_reason="refusal", content=[])))
+
+    monkeypatch.setenv("SCREENSHOT_EXTRACTOR", "claude")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key-not-real")
+    monkeypatch.setattr(anthropic, "Anthropic", FakeClient)
+    with pytest.raises(si.ExtractorUnavailable, match="declined"):
+        si.extract_rows(ss.render())
+
+
+def test_ollama_request_and_parsing(monkeypatch):
+    import httpx
+    sent = {}
+
+    def post(url, json=None, timeout=None):
+        sent.update(url=url, body=json)
+        return httpx.Response(200, request=httpx.Request("POST", url),
+                              json={"message": {"content": __import__("json").dumps({"rows": RAW})}})
+
+    monkeypatch.setenv("SCREENSHOT_EXTRACTOR", "ollama")
+    monkeypatch.setattr(si.httpx, "post", post)
+    name, rows = si.extract_rows(ss.render())
+    assert name == "ollama" and len(rows) == 4 and rows[0]["higher_multiplier"] == 1.03
+    assert sent["url"].endswith("/api/chat") and sent["body"]["model"] == si.OLLAMA_MODEL
+    assert sent["body"]["format"] == "json" and len(sent["body"]["messages"][0]["images"]) == 1
+
+
+def test_ollama_down_is_unavailable(monkeypatch):
+    import httpx
+
+    def post(url, **kw):
+        raise httpx.ConnectError("refused")
+
+    monkeypatch.setenv("SCREENSHOT_EXTRACTOR", "ollama")
+    monkeypatch.setattr(si.httpx, "post", post)
+    with pytest.raises(si.ExtractorUnavailable, match="Ollama"):
+        si.extract_rows(ss.render())
+
+
+# --- resolution and range flags (temp DB) ------------------------------------------------
+
+@pytest.fixture
+def db(tmp_path, monkeypatch):
+    path = str(tmp_path / "test.db")
+    monkeypatch.setattr(database, "DB_PATH", path)
+    database._person_index_cache.clear()
+    conn = sqlite3.connect(path)
+    conn.execute("CREATE TABLE rosters (athlete_id TEXT, player_name TEXT, name_key TEXT, team_abbrev TEXT, "
+                 "team_city TEXT, team_name TEXT)")
+    conn.executemany("INSERT INTO rosters VALUES (?,?,?,?,?,?)", [
+        ("1", "Giannis Antetokounmpo", "giannis antetokounmpo", "MIA", "Miami", "Heat"),
+        ("2", "Brandon Miller", "brandon miller", "CHA", "Charlotte", "Hornets"),
+        ("3", "Jalen Williams", "jalen williams", "OKC", "Oklahoma City", "Thunder"),
+        ("4", "Jaylin Williams", "jaylin williams", "OKC", "Oklahoma City", "Thunder"),
+        ("5", "Cade Cunningham", "cade cunningham", "DET", "Detroit", "Pistons"),
+        ("6", "Jalen Smith", "jalen smith", "CHI", "Chicago", "Bulls"),
+        ("7", "Jalen Smith", "jalen smith", "PHX", "Phoenix", "Suns"),
+    ])
+    conn.execute("CREATE TABLE player_stats (personId INTEGER, firstName TEXT, lastName TEXT, "
+                 "gameDateTimeEst TEXT, gameType TEXT, opponentteamName TEXT, points REAL, "
+                 "reboundsTotal REAL, assists REAL, threePointersMade REAL)")
+    conn.execute("CREATE TABLE players (personId INTEGER, firstName TEXT, lastName TEXT)")
+    random.seed(1)
+    rows = []
+    for pid, first, last, pts in ((10, "Giannis", "Antetokounmpo", (18, 44)), (20, "Brandon", "Miller", (8, 30)),
+                                  (30, "Jalen", "Williams", (10, 32))):
+        conn.execute("INSERT INTO players VALUES (?,?,?)", (pid, first, last))
+        for g in range(90):
+            rows.append((pid, first, last, f"2026-0{1 + g % 4}-{1 + g % 28:02d} 19:30:00", "Regular Season",
+                         "Knicks", random.randint(*pts), random.randint(2, 12), random.randint(1, 9),
+                         random.randint(0, 5)))
+    conn.executemany("INSERT INTO player_stats VALUES (?,?,?,?,?,?,?,?,?,?)", rows)
+    conn.commit()
+    conn.close()
+    database.init_db()
+    return path
+
+
+def _resolve(name, team):
+    conn = database.get_connection()
+    try:
+        return si.resolve_player(conn, name, team)
+    finally:
+        conn.close()
+
+
+def test_exact_name_and_team_resolves_one_player(db):
+    assert _resolve("Jalen Williams", "OKC") == {"status": "ok", "player_name": "Jalen Williams",
+                                                 "team_abbrev": "OKC", "team_name": "Oklahoma City Thunder"}
+    assert _resolve("Cade Cunningham", None)["status"] == "ok"          # no team on the card: one roster match
+
+
+def test_wrong_team_or_two_matches_stay_blank(db):
+    assert _resolve("Jalen Williams", "DEN") == {"status": "not_found"}
+    assert _resolve("Jalen Smith", None) == {"status": "ambiguous"}       # two Jalen Smiths, no team shown
+    assert _resolve("Jalen Smith", "PHX")["status"] == "ok"               # the card's team settles it
+    assert _resolve("Jalen Wiliams", "OKC") == {"status": "not_found"}    # no fuzzy matching
+
+
+def _context(name):
+    return {"next_opponent_full": {"Giannis Antetokounmpo": "Charlotte Hornets"}.get(name, "Miami Heat"),
+            "is_home": False, "is_back_to_back": True, "next_game_date": "2026-10-24"}
+
+
+def test_confirmation_rows_resolve_fill_context_and_flag_ranges(db):
+    rows = [si.normalize_row(r) for r in RAW]
+    rows[0]["line"] = 75.5                                               # misread: outside his range
+    out = si.confirmation_rows(rows + [si.normalize_row({"player_name": "Jalen Smith", "stat": "Points",
+                                                         "line": 9.5})], context_fn=_context)
+    g, b, j, c, js = out
+    assert g["resolved_player"] == "Giannis Antetokounmpo" and g["opponent_team"] == "Charlotte Hornets"
+    assert g["game_date"] == "2026-10-24" and g["is_back_to_back"] is True
+    assert any("outside his range" in f for f in g["flags"]) and g["range"]["games"] == 82
+    assert b["flags"] == [] and j["flags"] == []                         # lines inside their ranges
+    assert c["resolved_player"] == "Cade Cunningham" and c["flags"] == ["no game history for this stat"]
+    assert js["resolved_player"] == "" and js["match"] == "ambiguous" and js["opponent_team"] == ""
+
+
+def test_unsupported_stat_is_flagged(db):
+    [r] = si.confirmation_rows([si.normalize_row({"player_name": "Brandon Miller", "team": "CHA",
+                                                  "stat": "Fantasy Points", "line": 30.5})], context_fn=_context)
+    assert r["stat"] is None and r["flags"][0].startswith("stat 'Fantasy Points' is not one of")
+
+
+# --- POST /screenshot/extract -----------------------------------------------------------------
+
+@pytest.fixture
+def client(db, monkeypatch, tmp_path):
+    from fastapi.testclient import TestClient
+    import main
+    import data_fetcher
+    monkeypatch.setattr(main, "LOCAL_HOSTS", main.LOCAL_HOSTS | {"testclient"})
+    monkeypatch.setenv("SCREENSHOT_EXTRACTOR", "claude")
+    monkeypatch.setitem(si._EXTRACT, "claude", lambda png, media: RAW)
+    monkeypatch.setattr(data_fetcher, "get_player_context", _context)
+    spool = tmp_path / "spool"
+    spool.mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(spool))           # where an upload over 1 MB spools
+    return TestClient(main.app), spool
+
+
+def _predictions():
+    conn = sqlite3.connect(database.DB_PATH)
+    try:
+        return conn.execute("SELECT COUNT(*) FROM predictions").fetchone()[0]
+    finally:
+        conn.close()
+
+
+def test_extract_returns_rows_and_predicts_nothing(client):
+    c, _ = client
+    r = c.post("/screenshot/extract", files={"file": ("cards.png", ss.render(), "image/png")})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["extractor"] == "claude"
+    assert [x["resolved_player"] for x in body["rows"]] == ["Giannis Antetokounmpo", "Brandon Miller",
+                                                            "Jalen Williams", "Cade Cunningham"]
+    assert [x["stat"] for x in body["rows"]] == ["Points", "3PM", "Rebounds", "Assists"]
+    assert _predictions() == 0                                     # nothing until Predict is clicked
+
+
+def test_large_upload_leaves_no_file_behind(client):
+    c, spool = client
+    buf = io.BytesIO()
+    Image.frombytes("RGB", (1000, 1000), os.urandom(3_000_000)).save(buf, format="PNG")
+    assert buf.tell() > 1024 * 1024                                # big enough to spool to disk
+    assert c.post("/screenshot/extract", files={"file": ("big.png", buf.getvalue(), "image/png")}).status_code == 200
+    assert list(spool.iterdir()) == []
+
+
+def test_extract_errors(client, monkeypatch):
+    c, _ = client
+    assert c.post("/screenshot/extract", files={"file": ("x.txt", b"hello", "text/plain")}).status_code == 400
+
+    def unavailable(png, media):
+        raise si.ExtractorUnavailable("ANTHROPIC_API_KEY is not set in backend/.env")
+
+    monkeypatch.setitem(si._EXTRACT, "claude", unavailable)
+    r = c.post("/screenshot/extract", files={"file": ("cards.png", ss.render(), "image/png")})
+    assert r.status_code == 503 and "ANTHROPIC_API_KEY" in r.json()["detail"]
+    def unreadable(png, media):
+        return json.loads("this is not json")                      # model wrote prose, not JSON
+
+    monkeypatch.setitem(si._EXTRACT, "claude", unreadable)
+    r = c.post("/screenshot/extract", files={"file": ("c.png", ss.render(), "image/png")})
+    assert r.status_code == 502 and "unreadable" in r.json()["detail"]
+    assert _predictions() == 0
+
+
+def test_extract_is_localhost_only(db):
+    from fastapi.testclient import TestClient
+    import main
+    r = TestClient(main.app).post("/screenshot/extract", files={"file": ("c.png", ss.render(), "image/png")})
+    assert r.status_code == 403
+
+
+# --- optional: the real extractor on the synthetic image ------------------------------------
+
+@pytest.mark.skipif(os.getenv("RUN_LIVE_EXTRACTOR") != "1", reason="set RUN_LIVE_EXTRACTOR=1 to call the real extractor")
+def test_live_extractor_reads_the_synthetic_screenshot():
+    name, rows = si.extract_rows(ss.render())
+    got = [(r["player_name"], r["stat"], r["line"], r["higher_multiplier"], r["lower_multiplier"]) for r in rows]
+    want = [(c["player_name"], c["stat"], c["line"], c["higher"], c["lower"]) for c in ss.CARDS]
+    assert got == want, f"{name} misread the synthetic screenshot: {got}"

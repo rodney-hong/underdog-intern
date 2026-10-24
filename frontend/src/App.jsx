@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
 import History from './History'
+import ScreenshotImport from './ScreenshotImport'
 import { fetchTrackRecord, pct, rangeStr } from './trackRecord'
 
 const API = 'http://localhost:8000'
@@ -842,6 +843,8 @@ export default function App() {
             </div>
 
             <SlipCard slip={slipResult} onClear={() => setSlipResult(null)} />
+
+            <ScreenshotImport teams={allTeams} />
           </>
         )}
 

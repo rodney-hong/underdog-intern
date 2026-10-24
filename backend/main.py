@@ -16,9 +16,10 @@ for _stream in (sys.stdout, sys.stderr):
         _stream.reconfigure(errors="replace")
     except (AttributeError, ValueError):
         pass
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, field_validator
+from starlette.concurrency import run_in_threadpool
 
 import data_fetcher
 import predictor
@@ -679,6 +680,34 @@ def sync_now(request: Request):
     """
     _require_local(request)
     return line_logger.run_sync(line_logger._scheduler, trigger="sync now", lock_wait_minutes=0)
+
+
+@app.post("/screenshot/extract")
+async def screenshot_extract(request: Request, file: UploadFile = File(...)):
+    """
+    Screenshot of player cards -> rows for the app's confirmation table. The extractor
+    (screenshot_import.SCREENSHOT_EXTRACTOR) only transcribes the cards; nothing is
+    predicted or logged here: the app calls /predict for each row the user confirms.
+    The upload is read into memory and closed; the image is never written to disk.
+    """
+    import json
+    import screenshot_import as si
+    _require_local(request)
+    try:
+        data = await file.read(si.MAX_IMAGE_BYTES + 1)
+    finally:
+        await file.close()
+    try:
+        name, rows = await run_in_threadpool(si.extract_rows, data)
+    except si.BadImage as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    except si.ExtractorUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+    except (json.JSONDecodeError, KeyError, TypeError) as exc:
+        raise HTTPException(status_code=502, detail=f"extractor returned unreadable output ({exc!r})")
+    finally:
+        del data
+    return {"extractor": name, "rows": await run_in_threadpool(si.confirmation_rows, rows)}
 
 
 @app.get("/sync")

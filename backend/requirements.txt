@@ -11,3 +11,6 @@ joblib
 matplotlib
 apscheduler==3.11.0
 pdfplumber==0.11.4
+anthropic==2.3.0
+pillow
+python-multipart
