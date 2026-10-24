@@ -660,7 +660,7 @@ export default function App() {
         } else if (data.source === 'ambiguous') {
           setLineNote('Name is close to another player with a line — not auto-filled, enter manually')
         } else {
-          setLineNote('Line not available from sportsbooks — enter manually')
+          setLineNote(data.reason || 'Line not available from sportsbooks — enter manually')
         }
       })
       .catch(() => {})

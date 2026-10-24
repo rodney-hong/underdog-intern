@@ -911,6 +911,54 @@ def get_player_line(player_name: str, stat_type: str) -> tuple[float | None, str
     return None, None
 
 
+def missing_line_reason(player_name: str, stat_type: str) -> str:
+    """
+    Why get_player_line found no line, in words for the app: no logged stat type, no
+    game today for the player's team, no pull yet for that game (with the next pull
+    time), or a pull without an Underdog line for this player. Read-only; no API call.
+    """
+    if stat_type not in _NBA_STAT_TYPE_MAP or stat_type not in line_logger.STAT_MARKETS:
+        return f"no lines are logged for {stat_type}; enter manually"
+    ctx = get_player_context(player_name)
+    team_full = ctx.get("player_team_full") if ctx else None
+    if not team_full:
+        return "player's current team not found; enter manually"
+    nick = "Trail Blazers" if "Blazers" in team_full else team_full.split()[-1]
+    eastern = ZoneInfo("America/New_York")
+    now = dt.datetime.now(eastern)
+    today = now.date().isoformat()
+    conn = get_db()
+    try:
+        game = conn.execute(
+            "SELECT gameDateTimeEst, awayTeamName, homeTeamName FROM schedule "
+            "WHERE substr(gameDateTimeEst, 1, 10) = ? AND (homeTeamName = ? OR awayTeamName = ?) "
+            "ORDER BY gameDateTimeEst LIMIT 1", (today, nick, nick)).fetchone()
+        last = conn.execute(
+            "SELECT MAX(captured_at) FROM line_snapshots WHERE game_date = ? "
+            "AND (home_team LIKE ? OR away_team LIKE ?)", (today, f"%{nick}", f"%{nick}")).fetchone()[0]
+    except sqlite3.Error:
+        game, last = None, None
+    finally:
+        conn.close()
+    if game is None:
+        return f"no {nick} game on today's schedule; enter manually"
+    tip = dt.datetime.fromisoformat(str(game[0])[:19].replace("T", " ")).replace(tzinfo=eastern)
+    pretip = tip - dt.timedelta(minutes=line_logger.PRETIP_MINUTES)
+    label = f"{game[1]} @ {game[2]}, {tip:%H:%M} ET"
+    if last:
+        at = dt.datetime.fromisoformat(last).astimezone(eastern)
+        return (f"no Underdog {stat_type} line for {player_name} in the latest pull for this "
+                f"game ({label}; pulled {at:%H:%M} ET); enter manually")
+    if now < pretip:
+        nxt = f"pre-tip pull at {pretip:%H:%M} ET"
+        if line_logger.OPEN_PULL_ENABLED and now.hour < line_logger.OPEN_PULL_HOUR_ET:
+            nxt = f"open pull at {line_logger.OPEN_PULL_HOUR_ET}:00 ET, {nxt}"
+        return f"no lines logged yet for this game ({label}); {nxt}"
+    if now < tip:
+        return f"no lines logged yet for this game ({label}); pre-tip pull due now ({pretip:%H:%M} ET)"
+    return f"no lines were logged for this game ({label}); it has started"
+
+
 # ---------------------------------------------------------------------------
 # WNBA — ESPN public API + BallDontLie + OddsAPI
 # ---------------------------------------------------------------------------

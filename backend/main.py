@@ -564,10 +564,18 @@ def build_slip(size: int = Query(default=2, ge=1, le=5)):
 def get_player_line(player_name: str, stat_type: str):
     """
     Return the sportsbook line for a player's stat type for today's game.
-    { "line": 27.5, "source": "fanduel" } or { "line": null, "source": null }
+    { "line": 27.5, "source": "underdog", "reason": null }, or with no line
+    { "line": null, "source": null, "reason": "no lines logged yet for this game (...)" }
+    ("source": "ambiguous" for a name collision, reason null).
     """
     line, source = data_fetcher.get_player_line(player_name, stat_type)
-    return {"line": line, "source": source}
+    reason = None
+    if line is None and source != "ambiguous":
+        try:
+            reason = data_fetcher.missing_line_reason(player_name, stat_type)
+        except Exception as exc:   # an explanation must never break the line lookup
+            reason = f"line not available ({exc!r}); enter manually"
+    return {"line": line, "source": source, "reason": reason}
 
 
 # ---------------------------------------------------------------------------

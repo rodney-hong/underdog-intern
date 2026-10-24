@@ -106,6 +106,8 @@ def env(tmp_path, monkeypatch):
     monkeypatch.setattr(database, "run_etl", run_etl)
     monkeypatch.setitem(sys.modules, "rosters", types.SimpleNamespace(refresh_rosters=lambda: {"teams": 30}))
     monkeypatch.setitem(sys.modules, "player_match", types.SimpleNamespace(rebuild_now=dict))
+    monkeypatch.setattr(line_logger, "run_catchup_pulls",
+                        lambda tag="": state.setdefault("catchup", []).append(tag) or {"pulled": []})
     monkeypatch.setitem(sys.modules, "paper_predictions",
                         types.SimpleNamespace(resolve_paper_predictions=lambda: PAPER_RESOLVED))
     state["path"] = path
@@ -142,6 +144,7 @@ def test_startup_sync_loads_a_new_version_immediately(env, monkeypatch, capsys):
     assert len(env["etl_calls"]) == 1 and env["etl_calls"][0] - t0 < 10   # no 15-minute delay
     assert env["pretip_locked_during_etl"] is True         # pre-tip jobs queue behind the load
     assert out["rosters"] == "refreshed at startup"
+    assert env["catchup"] == ["[sync]"] and out["catchup"] == {"pulled": []}   # catch-up pulls ran
     log = capsys.readouterr().out
     assert "[sync] start (startup)" in log
     for step in ("1/5 backup OK", "2/5 rosters", "3/5 Kaggle newest Ready v521, loaded v520",

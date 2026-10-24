@@ -154,6 +154,7 @@ def maintenance(db, tmp_path, monkeypatch):
     monkeypatch.setattr(line_logger, "backup_database", lambda: "/backups/predictions_test.db")
     monkeypatch.setitem(sys.modules, "rosters", types.SimpleNamespace(refresh_rosters=dict))
     monkeypatch.setitem(sys.modules, "player_match", types.SimpleNamespace(rebuild_now=dict))
+    monkeypatch.setattr(line_logger, "run_catchup_pulls", lambda tag="": {"stub": True})  # no OddsAPI
 
     def latest():
         calls["checks"] += 1

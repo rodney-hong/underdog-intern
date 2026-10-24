@@ -26,6 +26,9 @@ Schedule (two pulls per game):
               Scheduled by a free events-only job at SCHEDULE_HOUR_ET (06:00, and on
               startup) whether or not the open pull is on; if that events call fails
               it retries every 20 min until the last tip-off.
+    catchup — late start (after the open pull's catch-up window): on startup and Sync
+              now, one pull for each game with no pull yet whose pre-tip pull is more
+              than 15 min away (run_catchup_pulls), so the app has lines. Not 'open'.
 
 Every pull is recorded in odds_pull_log with x-requests-remaining before and
 after. A monthly credit cap (ODDS_MONTHLY_CREDIT_CAP, default 500) is enforced
@@ -617,6 +620,76 @@ def run_open_pull(phase: str = "open", scheduler=None) -> int:
     return total
 
 
+CATCHUP_MIN_LEAD_MINUTES = 15   # no catch-up pull if the game's pre-tip pull is this close
+
+
+def _pulled_any_phase(game_id: str, game_date: str) -> bool:
+    """A successful event_odds pull of this game today, in any phase."""
+    conn = get_db()
+    row = conn.execute(
+        "SELECT 1 FROM odds_pull_log WHERE endpoint = 'event_odds' AND game_id = ? "
+        "AND game_date = ? AND http_status = 200 LIMIT 1", (game_id, game_date)).fetchone()
+    conn.close()
+    return row is not None
+
+
+def run_catchup_pulls(tag: str = "[line_logger]") -> dict:
+    """
+    Late start (startup / Sync now): one pull, pull_phase 'catchup', for each game on
+    today's slate with no successful pull yet in any phase and its pre-tip pull more
+    than CATCHUP_MIN_LEAD_MINUTES away, so the app has lines before the pre-tip pull.
+    'open' stays the 10:00 pull only: nothing is done while the open pull or its restart
+    catch-up (until OPEN_PULL_HOUR_ET + OPEN_CATCHUP_HOURS) can still cover the slate.
+    Same 8 markets and books as every pull (pull_event: monthly cap, account quota);
+    each pull also must not dip into the scheduled-pull reserve (check_unscheduled_spend,
+    as for news-triggered pulls). Each pull runs under _PRETIP_LOCK. Paper predictions
+    come from pre-tip pulls only, so none are logged here.
+    Returns {"pulled": [...], "skipped": {game: reason}, "credits": int} or {"skipped_all": reason}.
+    """
+    now_et = dt.datetime.now(EASTERN)
+    if OPEN_PULL_ENABLED and now_et.hour < OPEN_PULL_HOUR_ET + OPEN_CATCHUP_HOURS:
+        reason = (f"before {OPEN_PULL_HOUR_ET + OPEN_CATCHUP_HOURS}:00 ET: the {OPEN_PULL_HOUR_ET}:00 "
+                  f"open pull (or its restart catch-up) covers today's games")
+        print(f"{tag} catch-up pulls: none ({reason})")
+        return {"skipped_all": reason}
+    init_tables()
+    all_events, remaining = fetch_events(phase="catchup")
+    if all_events is None:
+        print(f"{tag} catch-up pulls: none (events feed unavailable)")
+        return {"skipped_all": "events feed unavailable"}
+    now = dt.datetime.now(dt.timezone.utc)
+    out: dict = {"pulled": [], "skipped": {}, "credits": 0}
+    for event in todays(all_events):
+        label = f"{event.get('away_team')} @ {event.get('home_team')}"
+        commence = _commence(event)
+        game_date = commence.astimezone(EASTERN).date().isoformat()
+        pretip_at = commence - dt.timedelta(minutes=PRETIP_MINUTES)
+        if commence <= now:
+            out["skipped"][label] = "started"
+        elif _pulled_any_phase(event["id"], game_date):
+            out["skipped"][label] = "already pulled today"
+        elif pretip_at <= now + dt.timedelta(minutes=CATCHUP_MIN_LEAD_MINUTES):
+            out["skipped"][label] = f"pre-tip pull at {pretip_at.astimezone(EASTERN):%H:%M} ET is near"
+        else:
+            ok, reason, _ = check_unscheduled_spend(CREDITS_PER_PULL, all_events)
+            if not ok:
+                log_skip(endpoint="event_odds", phase="catchup", game_id=event["id"],
+                         game_date=game_date, remaining=remaining, reason=reason)
+                out["skipped"][label] = reason
+                continue
+            with _PRETIP_LOCK:
+                used_before = credits_used_this_month()
+                rows, remaining = pull_event(event, "catchup", remaining)
+                out["credits"] += credits_used_this_month() - used_before
+            if _pulled_any_phase(event["id"], game_date):
+                out["pulled"].append(f"{label} ({rows} rows)")
+            else:
+                out["skipped"][label] = "pull failed or refused (see odds_pull_log)"
+    print(f"{tag} catch-up pulls: {len(out['pulled'])} game(s) pulled, {out['credits']} credits"
+          f"{': ' + ', '.join(out['pulled']) if out['pulled'] else ''}; skipped {out['skipped'] or 'none'}")
+    return out
+
+
 def _last_tip_today_utc() -> dt.datetime | None:
     """Latest tip-off on today's ET slate from the `schedule` table (ET wall-clock), or None."""
     today = dt.datetime.now(EASTERN).date().isoformat()
@@ -1127,6 +1200,7 @@ def run_sync(scheduler=None, trigger: str = "manual", refresh_rosters: bool = Tr
 
 def _run_sync(scheduler, trigger: str, refresh_rosters: bool) -> dict:
     """
+      0. catch-up pulls for today's games with no pull yet (run_catchup_pulls; never blocks sync);
       1. back up predictions.db unless today's backup exists (_ensure_backup); abort on failure;
       2. refresh ESPN rosters and the player_match tables (a failure is logged, sync continues);
       3. ask Kaggle for the newest Ready version;
@@ -1159,6 +1233,12 @@ def _run_sync(scheduler, trigger: str, refresh_rosters: bool) -> dict:
         out["kaggle_retry"] = _schedule_kaggle_retry(scheduler, path, _stored_kaggle_version(),
                                                      today, attempt=1, run_at=run_at)
         out["next_check"] = out["kaggle_retry"]
+
+    try:   # lines first, so a late start gives the app lines before a long ETL
+        out["catchup"] = run_catchup_pulls(tag)
+    except Exception as exc:
+        out["catchup"] = f"FAILED: {exc!r}"
+        print(f"{tag} catch-up pulls FAILED: {exc!r} (continuing)")
 
     try:
         path, how = _ensure_backup()
