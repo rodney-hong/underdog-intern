@@ -137,7 +137,7 @@ Every prediction is logged to the `predictions` table.
 - **Books:** `underdog, fanduel, draftkings, prizepicks, novig, prophetx, kalshi, betmgm, espnbet, betrivers`, requested together in one OddsAPI call per event.
 - **Schedule** (APScheduler, US Eastern time):
   - 06:00: a free events call schedules today's pre-tip pulls
-  - 07:00: morning maintenance (backup, then ETL unless a pre-tip pull is near, then resolve results)
+  - 07:00: daily data sync (the same routine as at startup; see below)
   - 10:00: open pull
   - 30 minutes before tip-off: pre-tip pull
 - **Storage:** every outcome, both sides, with price, under its real market key, in `line_snapshots`. Rows are keyed so they never overwrite or merge. `odds_pull_log` tracks credit usage against a monthly cap (`ODDS_MONTHLY_CREDIT_CAP`, default 500).
@@ -171,7 +171,9 @@ pip install -r requirements.txt
 uvicorn main:app --reload --port 8000
 ```
 
-Startup enables WAL, refreshes rosters, starts the line-logger and news schedulers, initializes the database, resolves pending paper predictions, and checks that the frozen model files are present. The Kaggle ETL does **not** run at startup by default (`SKIP_STARTUP_ETL=1`): it runs in the morning maintenance job, or by hand.
+Startup enables WAL, refreshes rosters, starts the line-logger and news schedulers, initializes the database, and checks that the frozen model files are present. As soon as startup completes, a data sync runs in the background (`line_logger.run_sync`, `[sync]` log lines): back up `predictions.db` (if today's backup doesn't exist), refresh rosters, check Kaggle for the newest Ready version, run the ETL if it is newer, then resolve app and paper predictions. If Kaggle has nothing newer, the version check repeats hourly while the server is up. The same sync runs daily at 07:00 ET and from the app's **Sync now** button (`POST /sync`, localhost only; `GET /sync` returns the last result).
+
+ETL guards: the ETL never runs at the same time as a pre-tip job (it takes the pre-tip lock, waiting for a running job, and pre-tip jobs that come due queue behind it), and never starts within 10 minutes of a scheduled pull (open or pre-tip, from the scheduler and the `schedule` table); it is moved to the end of that window instead. That is enough because the load goes into staging tables and is swapped in with one short transaction, so readers only ever see the old tables or the new ones.
 
 ### Frontend
 
@@ -190,7 +192,6 @@ Open http://localhost:5173.
 | `ODDS_API_KEY` | Live lines (line logger, `/lines`, `/slip`) |
 | `ODDS_API_HISTORICAL_KEY` | `historical_odds_etl.py` only |
 | `ODDS_MONTHLY_CREDIT_CAP` | OddsAPI credit cap per month (default 500) |
-| `SKIP_STARTUP_ETL` | `1` (default) skips the Kaggle ETL at startup |
 | `LINE_LOGGER_ENABLED`, `NEWS_INGEST_ENABLED`, `PAPER_PREDICTIONS_ENABLED` | Set to anything other than `1` to disable (all default to `1`) |
 | `LINE_LOG_SCHEDULE_HOUR_ET`, `LINE_LOG_OPEN_HOUR_ET`, `LINE_LOG_PRETIP_MINUTES`, `LINE_LOG_OPEN_PULL_ENABLED` | Line-logger schedule (defaults 6, 10, 30, 1) |
 | `NEWS_POLL_MINUTES`, `NBA_REPORT_CRON_MINUTES` | News polling (defaults 20 and `2,17,32,47`) |

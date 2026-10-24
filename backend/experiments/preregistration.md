@@ -726,3 +726,8 @@ Recorded on 2026-10-23 at about 13:45 ET. paper_predictions held 664 rows with s
 ### 4. Games with no pre-tip pull on 2026-10-20
 - Philadelphia 76ers @ New York Knicks and Oklahoma City Thunder @ San Antonio Spurs have no pre-tip pull and no paper rows, because the backend was not running at their pre-tip times. Both have 10:00 open snapshots.
 - They are absent from H1, H2, H3, section 4, and the open-vs-pre-tip analyses, which need both snapshots.
+
+## Entry: sync timing (2026-10-24)
+- From commit e29cf56, the ETL may run at any time except within 10 minutes of a scheduled pull or while a pre-tip job runs (pre-tip lock); the 90-minute pre-tip and 60-minute pull guards in the data-freshness entry no longer apply. Tables are swapped atomically, so a pre-tip job sees either the previous or the new box scores, never a partial load.
+- Consequence: paper rows within one slate may be built on different Kaggle versions. Each row's data_as_of records which. Analysis rules are unchanged.
+- Sync also runs at backend startup and on demand (Sync now).
