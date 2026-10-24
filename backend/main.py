@@ -16,7 +16,7 @@ for _stream in (sys.stdout, sys.stderr):
         _stream.reconfigure(errors="replace")
     except (AttributeError, ValueError):
         pass
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, field_validator
 
@@ -29,9 +29,10 @@ import news_ingest
 app = FastAPI(title="SportsBettr API", version="1.0.0")
 
 # Allow the Vite dev server to call us
+ALLOWED_ORIGINS = ["http://localhost:5173", "http://127.0.0.1:5173"]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -91,24 +92,12 @@ def startup_event():
 
     _startup_step("database.init_db", database.init_db)
 
-    # NBA: the ETL replaces player_stats/players/schedule in place, so by default it
-    # does not run at startup (SKIP_STARTUP_ETL=1): run it by hand, off game hours,
-    # after a backup. The 2026-27 models are frozen either way: startup never retrains.
-    if os.getenv("SKIP_STARTUP_ETL", "1") == "1":
-        print("[startup] Kaggle ETL SKIPPED (SKIP_STARTUP_ETL=1); player_stats, players and "
-              "schedule are unchanged. Run database.run_etl() by hand, off game hours, after a backup.")
-    else:
-        _startup_step("database.run_etl", database.run_etl)
-    # Paper predictions from the frozen model: fill results from any new box scores.
-    pp_ok, paper_predictions = _startup_step("import paper_predictions",
-                                             importlib.import_module, "paper_predictions")
-    if pp_ok:
-        ok, n = _startup_step("paper_predictions.resolve", paper_predictions.resolve_paper_predictions)
-        if ok:
-            print(f"Paper predictions resolved: {n}")
+    # NBA data (backup -> Kaggle check -> ETL under the guards -> resolve app and paper
+    # predictions) syncs in the background as soon as startup completes (_startup_complete).
+    # The 2026-27 models are frozen either way: startup never retrains them.
     if not ml_ok:
         print("[startup] ml_trainer import failed: skipping the frozen-model check and WNBA training.")
-        print("[startup] complete")
+        _startup_complete()
         return
     missing = [st for st in ml_trainer.FROZEN_MODEL_TYPES
                if not os.path.exists(ml_trainer.model_path(st))]
@@ -127,7 +116,13 @@ def startup_event():
         print("Skipping WNBA training: WNBA ETL failed; existing models kept.")
     else:
         print("WNBA models up to date, skipping training.")
-    print("[startup] complete")
+    _startup_complete()
+
+
+def _startup_complete():
+    """Startup is done: sync the data now, in the background (line_logger.run_sync)."""
+    _startup_step("line_logger.start_sync_in_background", line_logger.start_sync_in_background)
+    print("[startup] complete; data sync running in the background ([sync] lines)")
 
 
 @app.on_event("shutdown")
@@ -639,3 +634,36 @@ def get_wnba_player_line(player_name: str, stat_type: str):
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+# ---------------------------------------------------------------------------
+# Data sync (line_logger.run_sync), localhost only
+# ---------------------------------------------------------------------------
+
+LOCAL_HOSTS = {"127.0.0.1", "::1", "localhost"}
+
+
+def _require_local(request: Request) -> None:
+    """403 unless the caller is on this machine and, if a browser, is the app itself."""
+    host = request.client.host if request.client else None
+    origin = request.headers.get("origin")
+    if host not in LOCAL_HOSTS or (origin is not None and origin not in ALLOWED_ORIGINS):
+        raise HTTPException(status_code=403, detail="sync is available from this machine only")
+
+
+@app.post("/sync")
+def sync_now(request: Request):
+    """
+    Sync now: the same guarded routine as the startup and 07:00 syncs (backup ->
+    rosters -> Kaggle check -> ETL if newer -> resolve). Runs to completion (an ETL takes
+    minutes); returns {"status": "busy"} at once if another sync or ETL is running.
+    """
+    _require_local(request)
+    return line_logger.run_sync(line_logger._scheduler, trigger="sync now", lock_wait_minutes=0)
+
+
+@app.get("/sync")
+def last_sync(request: Request):
+    """The latest finished sync's result in this backend process (null before the first)."""
+    _require_local(request)
+    return {"last": line_logger.last_sync()}

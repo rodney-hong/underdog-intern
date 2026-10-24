@@ -489,6 +489,72 @@ function SlipCard({ slip, onClear }) {
 }
 
 // ---------------------------------------------------------------------------
+// Sync now (POST /sync: backup -> rosters -> Kaggle check -> ETL if newer -> resolve)
+// ---------------------------------------------------------------------------
+
+const SYNC_STATUS_CLS = {
+  loaded:        'status-neutral',
+  'up to date':  'status-neutral',
+  waited:        'status-questionable',
+  busy:          'status-questionable',
+  unavailable:   'status-questionable',
+  'check failed': 'status-out',
+  failed:        'status-out',
+}
+
+function SyncPanel() {
+  const [syncing, setSyncing] = useState(false)
+  const [sync, setSync] = useState(null)
+
+  // Show the startup sync's result, if it has finished.
+  useEffect(() => {
+    fetch(`${API}/sync`)
+      .then((r) => (r.ok ? r.json() : null))
+      .then((d) => { if (d?.last) setSync(d.last) })
+      .catch(() => {})
+  }, [])
+
+  const handleSync = async () => {
+    setSyncing(true)
+    try {
+      const res = await fetch(`${API}/sync`, { method: 'POST' })
+      if (!res.ok) throw new Error((await res.json()).detail || 'Sync failed')
+      setSync(await res.json())
+    } catch (e) {
+      setSync({ status: 'failed', summary: e.message || 'Sync failed. Is the backend running?' })
+    } finally {
+      setSyncing(false)
+    }
+  }
+
+  return (
+    <div className="w-full max-w-lg mb-6 space-y-2">
+      <button
+        onClick={handleSync}
+        disabled={syncing}
+        className="btn-ghost w-full py-2.5 rounded-xl text-sm font-medium"
+      >
+        {syncing ? 'Syncing… (a new Kaggle version takes a few minutes)' : 'Sync now'}
+      </button>
+      {sync && (
+        <div className={`animate-fade-in border rounded-xl px-4 py-3 text-xs ${SYNC_STATUS_CLS[sync.status] ?? 'status-neutral'}`}>
+          <div className="font-semibold uppercase tracking-widest mb-1">
+            {sync.status}{sync.trigger ? ` · ${sync.trigger}` : ''}{sync.finished_at ? ` · ${sync.finished_at.slice(11, 16)} ET` : ''}
+          </div>
+          <div>{sync.summary}</div>
+          {sync.status === 'loaded' && (
+            <div className="mt-1">
+              Loaded v{sync.version_loaded} · {sync.rows_added?.toLocaleString()} rows added ·{' '}
+              {sync.app_resolved} app + {sync.paper_resolved} paper predictions resolved
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------------------
 // Main App
 // ---------------------------------------------------------------------------
 
@@ -731,6 +797,8 @@ export default function App() {
           {theme === 'dark' ? <SunIcon /> : <MoonIcon />}
         </button>
       </div>
+
+      <SyncPanel />
 
       {currentPage === 'history' && <History />}
 

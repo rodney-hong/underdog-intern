@@ -1,11 +1,11 @@
 """
-Kaggle 404 path and tip-off guard for the ETL / morning maintenance.
+Kaggle 404 path, ETL guards (pre-tip lock + 10-minute pull window) and the hourly
+Kaggle retry for the ETL / daily sync (line_logger.run_sync).
 Every test runs against a temp DB with Kaggle, backups, rosters and resolvers stubbed:
 nothing touches predictions.db or the network.
 """
 import datetime as dt
 import os
-import shutil
 import sqlite3
 import sys
 import types
@@ -143,11 +143,33 @@ def test_run_etl_404_leaves_tables_untouched(db, monkeypatch):
 
 
 @pytest.fixture
-def maintenance(db, monkeypatch):
-    """Stub every maintenance step except the ETL decision; record what happened."""
-    calls = {"etl": 0, "restore": 0, "resolve": 0}
+def maintenance(db, tmp_path, monkeypatch):
+    """Stub every sync step except the ETL decision; record what happened. Kaggle
+    reports calls['latest'] (default 521, newer than the loaded 520). The implicit
+    10:00 open-pull window is off so results don't depend on the clock."""
+    calls = {"etl": 0, "restore": 0, "resolve": 0, "app_resolve": 0, "latest": 521,
+             "checks": 0, "downloads": 0}
+    monkeypatch.setattr(line_logger, "OPEN_PULL_ENABLED", False)
+    monkeypatch.setattr(line_logger, "BACKUP_DIR", str(tmp_path / "backups"))
     monkeypatch.setattr(line_logger, "backup_database", lambda: "/backups/predictions_test.db")
     monkeypatch.setitem(sys.modules, "rosters", types.SimpleNamespace(refresh_rosters=dict))
+    monkeypatch.setitem(sys.modules, "player_match", types.SimpleNamespace(rebuild_now=dict))
+
+    def latest():
+        calls["checks"] += 1
+        return calls["latest"]
+
+    def download(version):
+        calls["downloads"] += 1
+        return {}
+
+    def app_resolve():
+        calls["app_resolve"] += 1
+        return 0
+
+    monkeypatch.setattr(database, "get_latest_kaggle_version", latest)
+    monkeypatch.setattr(database, "download_kaggle_files", download)
+    monkeypatch.setattr(database, "resolve_pending_predictions", app_resolve)
 
     def resolve():
         calls["resolve"] += 1
@@ -193,49 +215,51 @@ def test_maintenance_other_failure_still_restores(maintenance):
     assert maintenance["restore"] == 1 and maintenance["resolve"] == 1
 
 
-# --- tip-off guard ------------------------------------------------------------
+# --- ETL guards: 10-minute pull window (the 90/60-minute rules are gone) -------------
 
 NOW = dt.datetime(2026, 10, 21, 17, 30, tzinfo=ET)
 
 
-def test_tipoffs_within_window(db):
-    _add_games(db,
-               (1, "2026-10-21 17:00:00"),   # already tipped: not in window
-               (2, "2026-10-21 18:59:00"),   # +89 min
-               (3, "2026-10-21 19:00:00"),   # +90 min, inclusive
-               (4, "2026-10-21 19:01:00"),   # +91 min
-               (5, "2026-10-22 18:00:00"))   # tomorrow
-    assert line_logger._tipoffs_within(90, now=NOW) == ["2 @ 18:59 ET", "3 @ 19:00 ET"]
+def test_schedule_table_gives_pretip_pull_times(db):
+    _add_games(db, (1, "2026-10-21 19:00:00"), (2, "2026-10-22 00:30:00"),
+               (3, "2026-10-23 19:00:00"))          # two days out: not counted
+    assert line_logger._schedule_pretip_times(NOW) == [
+        dt.datetime(2026, 10, 21, 18, 30, tzinfo=ET), dt.datetime(2026, 10, 22, 0, 0, tzinfo=ET)]
 
 
-def test_tipoffs_within_converts_utc_now_to_et(db):
-    _add_games(db, (2, "2026-10-21 18:59:00"))
-    assert line_logger._tipoffs_within(90, now=NOW.astimezone(dt.timezone.utc)) == ["2 @ 18:59 ET"]
-
-
-def test_tipoffs_within_no_schedule_table(tmp_path, monkeypatch):
+def test_schedule_pretip_times_no_schedule_table(tmp_path, monkeypatch):
     monkeypatch.setattr(line_logger, "DB_PATH", str(tmp_path / "empty.db"))
-    assert line_logger._tipoffs_within(90, now=NOW) == []
+    assert line_logger._schedule_pretip_times(NOW) == []
 
 
-def test_manual_maintenance_skips_etl_before_tipoff(maintenance, db):
-    soon = dt.datetime.now(ET) + dt.timedelta(minutes=45)
+def test_clear_of_pulls_uses_schedule_table_without_a_scheduler(db, monkeypatch):
+    monkeypatch.setattr(line_logger, "OPEN_PULL_ENABLED", False)
+    _add_games(db, (1, "2026-10-21 19:00:00"))      # pre-tip pull 18:30
+    at = lambda h, m: NOW.replace(hour=h, minute=m)
+    assert line_logger._clear_of_pulls(None, at(18, 19)) == at(18, 19)
+    assert line_logger._clear_of_pulls(None, at(18, 20)) == at(18, 40)
+    assert line_logger._clear_of_pulls(None, at(18, 39)) == at(18, 40)
+
+
+def test_manual_sync_runs_etl_45_min_before_tipoff(maintenance, db):
+    """The old 90-minute tip-off rule would have skipped this; the pull is 15 min away."""
+    soon = dt.datetime.now(ET) + dt.timedelta(minutes=line_logger.PRETIP_MINUTES + 15)
     _add_games(db, (22600085, soon.strftime("%Y-%m-%d %H:%M:%S")))
     maintenance["set_etl"](lambda: True)
-    out = line_logger.run_morning_maintenance()  # no scheduler: manual run
-    assert out["etl"].startswith(f"skipped: game(s) tip within {line_logger.ETL_TIPOFF_GUARD_MINUTES} min")
-    assert maintenance["etl"] == 0 and maintenance["resolve"] == 1
-
-
-def test_manual_maintenance_runs_etl_when_no_tipoff_soon(maintenance, db):
-    later = dt.datetime.now(ET) + dt.timedelta(minutes=line_logger.ETL_TIPOFF_GUARD_MINUTES + 30)
-    _add_games(db, (22600085, later.strftime("%Y-%m-%d %H:%M:%S")))
-    maintenance["set_etl"](lambda: False)
     out = line_logger.run_morning_maintenance()
-    assert out["etl"] == "up to date" and maintenance["etl"] == 1
+    assert out["etl"] == "ran" and out["status"] == "loaded" and maintenance["etl"] == 1
 
 
-# --- version check --------------------------------------------------------------
+def test_manual_sync_waits_within_10_min_of_a_pretip_pull(maintenance, db):
+    soon = dt.datetime.now(ET) + dt.timedelta(minutes=line_logger.PRETIP_MINUTES + 5)
+    _add_games(db, (22600085, soon.strftime("%Y-%m-%d %H:%M:%S")))
+    maintenance["set_etl"](lambda: True)
+    out = line_logger.run_morning_maintenance()
+    assert out["status"] == "waited" and maintenance["etl"] == 0
+    assert out["etl"] == f"waited: within {line_logger.PULL_WINDOW_MINUTES} min of a scheduled pull"
+    assert out["kaggle_retry"] == "no scheduler, no retry"
+    assert maintenance["resolve"] == 1                 # resolve still runs
+
 
 def test_latest_version_uses_newest_ready_not_lagging_current(monkeypatch):
     import kagglehub.clients
@@ -268,17 +292,10 @@ class _FakeScheduler:
 
 @pytest.fixture
 def retry(maintenance, monkeypatch):
-    """Retry-job stubs on top of `maintenance`: Kaggle reports calls['latest']; a
-    successful ETL writes that version into kaggle_version like run_etl does.
-    The implicit 10:00 open-pull window is off so results don't depend on the clock."""
-    maintenance.update(latest=520, checks=0)
-    monkeypatch.setattr(line_logger, "OPEN_PULL_ENABLED", False)
-
-    def latest():
-        maintenance["checks"] += 1
-        return maintenance["latest"]
-
-    monkeypatch.setattr(database, "get_latest_kaggle_version", latest)
+    """Retry-job stubs on top of `maintenance`: Kaggle reports calls['latest'] (520,
+    nothing new, unless a test raises it); a successful ETL writes that version into
+    kaggle_version like run_etl does."""
+    maintenance["latest"] = 520
 
     def load():
         if line_logger._stored_kaggle_version() == maintenance["latest"]:
@@ -294,8 +311,7 @@ def retry(maintenance, monkeypatch):
 
 
 def _today():
-    # Day of the next check, so "next check falls past today" never trips near midnight.
-    return (dt.datetime.now(ET) + dt.timedelta(minutes=line_logger.KAGGLE_RETRY_MINUTES)).date().isoformat()
+    return dt.datetime.now(ET).date().isoformat()
 
 
 def test_maintenance_up_to_date_schedules_hourly_retry(retry):
@@ -322,40 +338,42 @@ def test_retry_new_version_runs_etl_and_resolve_then_stops(retry):
     assert sched.added == []  # no further checks once loaded
 
 
-def test_retry_tipoff_guard_skips_check_and_keeps_retrying(retry, db):
+def test_retry_runs_etl_45_min_before_tipoff(retry, db):
+    """The old 90-minute tip-off guard is gone: only the pull window and pre-tip lock count."""
     soon = dt.datetime.now(ET) + dt.timedelta(minutes=45)
     _add_games(db, (22600085, soon.strftime("%Y-%m-%d %H:%M:%S")))
     retry["latest"] = 521
-    sched = _FakeScheduler()
-    assert line_logger.run_kaggle_version_retry(sched, "/b.db", 520, _today(), attempt=2) == "skipped: guard"
-    assert retry["checks"] == 0 and retry["etl"] == 0
-    [job] = sched.added                      # not stopped for the day: next check scheduled
-    assert job["id"] == "kaggle_version_retry" and job["kwargs"]["attempt"] == 3
+    assert line_logger.run_kaggle_version_retry(_FakeScheduler(), "/b.db", 520, _today()) == "loaded"
+    assert retry["etl"] == 1 and retry["resolve"] == 1 and retry["app_resolve"] == 1
 
 
-def test_retry_pretip_guard_skips_check_and_keeps_retrying(retry):
+def test_retry_runs_etl_30_min_before_a_pretip_pull(retry):
+    """The old 60-minute pre-tip guard is gone too."""
     job = types.SimpleNamespace(id="pretip:abc", next_run_time=dt.datetime.now(dt.timezone.utc)
                                 + dt.timedelta(minutes=30))
     retry["latest"] = 521
-    sched = _FakeScheduler([job])
-    assert line_logger.run_kaggle_version_retry(sched, "/b.db", 520, _today()) == "skipped: guard"
-    assert retry["checks"] == 0 and retry["etl"] == 0
-    assert [j["id"] for j in sched.added] == ["kaggle_version_retry"]
+    assert line_logger.run_kaggle_version_retry(_FakeScheduler([job]), "/b.db", 520, _today()) == "loaded"
+    assert retry["etl"] == 1
 
 
-def test_retry_after_closed_window_loads_new_version(retry, db):
-    """Guard closed at check 1, open at check 2: the new version is loaded at check 2."""
+def test_retry_within_10_min_of_a_pretip_pull_is_deferred_to_window_end(retry):
+    pull = dt.datetime.now(ET) + dt.timedelta(minutes=8)
+    sched = _FakeScheduler([types.SimpleNamespace(id="pretip:abc", next_run_time=pull)])
     retry["latest"] = 521
+    assert line_logger.run_kaggle_version_retry(sched, "/b.db", 520, _today(), attempt=2) == "deferred: pull window"
+    assert retry["etl"] == 0
+    [job] = sched.added
+    assert job["run_date"] == pull + dt.timedelta(minutes=line_logger.PULL_WINDOW_MINUTES)
+    assert job["kwargs"]["attempt"] == 2
+
+
+def test_retry_keeps_going_past_midnight(retry):
+    """While the server is up the hourly retry never stops for the day."""
     sched = _FakeScheduler()
-    soon = dt.datetime.now(ET) + dt.timedelta(minutes=45)
-    _add_games(db, (22600085, soon.strftime("%Y-%m-%d %H:%M:%S")))
-    assert line_logger.run_kaggle_version_retry(sched, "/b.db", 520, _today()) == "skipped: guard"
-    conn = sqlite3.connect(db)
-    conn.execute("DELETE FROM schedule")              # that game has tipped and gone
-    conn.commit()
-    conn.close()
-    assert line_logger.run_kaggle_version_retry(sched, "/b.db", 520, _today(), attempt=2) == "loaded"
-    assert retry["etl"] == 1 and retry["resolve"] == 1
+    yesterday = (dt.datetime.now(ET) - dt.timedelta(days=1)).date().isoformat()
+    assert line_logger.run_kaggle_version_retry(sched, "/b.db", 520, yesterday, attempt=20) == "up to date"
+    [job] = sched.added
+    assert job["kwargs"]["attempt"] == 21
 
 
 def test_retry_no_duplicate_etl_once_loaded(retry):
@@ -397,27 +415,27 @@ def _job(id_, when):
     return types.SimpleNamespace(id=id_, next_run_time=when)
 
 
-def test_clear_of_pulls_open_pull_window(monkeypatch):
+def test_clear_of_pulls_open_pull_window(db, monkeypatch):
     monkeypatch.setattr(line_logger, "OPEN_PULL_ENABLED", True)
     monkeypatch.setattr(line_logger, "OPEN_PULL_HOUR_ET", 10)
     day = dt.datetime(2026, 10, 23, tzinfo=ET)
     at = lambda h, m: day.replace(hour=h, minute=m)
     # The open pull counts even after it fired (cron next_run_time is tomorrow by then).
     sched = _FakeScheduler([_job("line_open_pull", at(10, 0) + dt.timedelta(days=1))])
-    assert line_logger._clear_of_pulls(sched, at(9, 44)) == at(9, 44)
-    assert line_logger._clear_of_pulls(sched, at(9, 45)) == at(10, 15)
-    assert line_logger._clear_of_pulls(sched, at(10, 14)) == at(10, 15)
-    assert line_logger._clear_of_pulls(sched, at(10, 15)) == at(10, 15)
+    assert line_logger._clear_of_pulls(sched, at(9, 49)) == at(9, 49)
+    assert line_logger._clear_of_pulls(sched, at(9, 50)) == at(10, 10)
+    assert line_logger._clear_of_pulls(sched, at(10, 9)) == at(10, 10)
+    assert line_logger._clear_of_pulls(sched, at(10, 10)) == at(10, 10)
 
 
-def test_clear_of_pulls_chains_overlapping_windows(monkeypatch):
+def test_clear_of_pulls_chains_overlapping_windows(db, monkeypatch):
     monkeypatch.setattr(line_logger, "OPEN_PULL_ENABLED", True)
     monkeypatch.setattr(line_logger, "OPEN_PULL_HOUR_ET", 10)
     day = dt.datetime(2026, 10, 23, tzinfo=ET)
     at = lambda h, m: day.replace(hour=h, minute=m)
-    sched = _FakeScheduler([_job("pretip:a", at(10, 20)), _job("pretip-retry:b", at(10, 40)),
-                            _job("line_pretip_scheduler", at(10, 5))])  # not a pull
-    assert line_logger._clear_of_pulls(sched, at(9, 50)) == at(10, 55)
+    sched = _FakeScheduler([_job("pretip:a", at(10, 15)), _job("pretip-retry:b", at(10, 30)),
+                            _job("line_pretip_scheduler", at(10, 35))])  # not a pull
+    assert line_logger._clear_of_pulls(sched, at(9, 55)) == at(10, 40)
 
 
 def test_retry_check_inside_pull_window_is_deferred_not_dropped(retry):
@@ -425,7 +443,7 @@ def test_retry_check_inside_pull_window_is_deferred_not_dropped(retry):
     sched = _FakeScheduler([_job("line_open_pull", pull)])
     retry["latest"] = 521
     assert line_logger.run_kaggle_version_retry(sched, "/b.db", 520, _today(), attempt=2) == "deferred: pull window"
-    assert retry["checks"] == 0 and retry["etl"] == 0
+    assert retry["checks"] == 1 and retry["etl"] == 0
     [job] = sched.added
     assert job["run_date"] == pull + dt.timedelta(minutes=line_logger.PULL_WINDOW_MINUTES)
     assert job["kwargs"]["attempt"] == 2
@@ -437,49 +455,6 @@ def test_next_check_pushed_past_pull_window(retry):
     line_logger._schedule_kaggle_retry(sched, "/b.db", 520, pull.date().isoformat(), attempt=2)
     [job] = sched.added
     assert job["run_date"] == pull + dt.timedelta(minutes=line_logger.PULL_WINDOW_MINUTES)
-
-
-# --- startup resume -----------------------------------------------------------------
-
-@pytest.fixture
-def todays_backup(retry, db, tmp_path, monkeypatch):
-    """A copy of the DB (kaggle_version 520) as today's maintenance backup."""
-    monkeypatch.setattr(line_logger, "BACKUP_DIR", str(tmp_path / "backups"))
-    os.makedirs(line_logger.BACKUP_DIR)
-    path = os.path.join(line_logger.BACKUP_DIR,
-                        f"predictions_{dt.datetime.now(ET).date().isoformat()}.db")
-    shutil.copy(db, path)
-    return path
-
-
-def test_startup_resume_loads_newer_ready_version(retry, todays_backup):
-    retry["latest"] = 521
-    assert line_logger.resume_kaggle_retry(_FakeScheduler()) == "loaded"
-    assert retry["etl"] == 1 and retry["resolve"] == 1
-
-
-def test_startup_resume_respects_guards(retry, todays_backup, db):
-    _add_games(db, (22600085, (dt.datetime.now(ET) + dt.timedelta(minutes=45)).strftime("%Y-%m-%d %H:%M:%S")))
-    retry["latest"] = 521
-    assert line_logger.resume_kaggle_retry(_FakeScheduler()) == "skipped: guard"
-    assert retry["checks"] == 0 and retry["etl"] == 0
-
-
-def test_startup_resume_skips_if_loaded_since_maintenance(retry, todays_backup, db):
-    conn = sqlite3.connect(db)
-    conn.execute("UPDATE kaggle_version SET version = 521")
-    conn.commit()
-    conn.close()
-    retry["latest"] = 522
-    sched = _FakeScheduler()
-    assert line_logger.resume_kaggle_retry(sched) == "already loaded today"
-    assert retry["checks"] == 0 and retry["etl"] == 0 and sched.added == []
-
-
-def test_startup_resume_without_todays_maintenance(retry, tmp_path, monkeypatch):
-    monkeypatch.setattr(line_logger, "BACKUP_DIR", str(tmp_path / "none"))
-    assert line_logger.resume_kaggle_retry(_FakeScheduler()) == "no maintenance today"
-    assert retry["checks"] == 0
 
 
 # --- failed retry ETL restores only the ETL tables ----------------------------------
@@ -532,6 +507,7 @@ def test_failed_retry_etl_restores_only_etl_tables(db, tmp_path, monkeypatch):
 
     monkeypatch.setattr(line_logger, "OPEN_PULL_ENABLED", False)
     monkeypatch.setattr(database, "get_latest_kaggle_version", lambda: 521)
+    monkeypatch.setattr(database, "download_kaggle_files", lambda v: {})
     monkeypatch.setattr(database, "run_etl", half_loaded_etl)
     out = line_logger.run_kaggle_version_retry(_FakeScheduler(), backup, 520, _today())
 

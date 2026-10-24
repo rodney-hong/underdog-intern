@@ -141,12 +141,12 @@ def test_maintenance_skips_while_another_process_holds_the_etl_lock(db, held_by_
     held_by_other_process("etl")
     monkeypatch.setattr(line_logger, "MAINTENANCE_LOCK_WAIT_MINUTES", 0.02)   # ~1 s
     ran = []
-    monkeypatch.setattr(line_logger, "_run_morning_maintenance", lambda s=None: ran.append(1))
-    assert line_logger.run_morning_maintenance() == {"skipped": "etl lock held"}
+    monkeypatch.setattr(line_logger, "_run_sync", lambda *a: ran.append(1))
+    assert line_logger.run_morning_maintenance()["status"] == "busy"
     assert ran == []
     out = capsys.readouterr().out
     assert "waiting for the etl lock (held by another process)" in out
-    assert "[maintenance] SKIPPED" in out
+    assert "[sync] maintenance: another sync, ETL or maintenance is running" in out
 
 
 def test_kaggle_retry_defers_while_maintenance_runs_in_another_thread(db, monkeypatch):
@@ -163,12 +163,12 @@ def test_kaggle_retry_defers_while_maintenance_runs_in_another_thread(db, monkey
     monkeypatch.setattr(line_logger, "OPEN_PULL_ENABLED", False)
     inside, release = threading.Event(), threading.Event()
 
-    def slow_maintenance(scheduler=None):
+    def slow_maintenance(*a):
         inside.set()
         release.wait(10)
         return {}
 
-    monkeypatch.setattr(line_logger, "_run_morning_maintenance", slow_maintenance)
+    monkeypatch.setattr(line_logger, "_run_sync", slow_maintenance)
     t = threading.Thread(target=line_logger.run_morning_maintenance)
     t.start()
     inside.wait(10)

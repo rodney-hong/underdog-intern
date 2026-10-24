@@ -253,37 +253,6 @@ def test_paper_insert_does_not_hold_the_write_lock_during_feature_work(season, s
     assert in_txn and not any(in_txn)
 
 
-# --- startup maintenance catch-up ------------------------------------------------------
-
-class _Sched:
-    def __init__(self):
-        self.added = []
-
-    def add_job(self, fn, trigger, **kw):
-        self.added.append((fn, kw))
-
-
-def test_startup_catches_up_missed_maintenance(tmp_path, monkeypatch):
-    monkeypatch.setattr(line_logger, "BACKUP_DIR", str(tmp_path))
-    s = _Sched()
-    at = dt.datetime(2026, 10, 24, 9, 30, tzinfo=line_logger.EASTERN)
-    assert line_logger._schedule_maintenance_catchup(s, at) is True
-    [(fn, kw)] = s.added
-    assert fn is line_logger.run_morning_maintenance and kw["id"] == "morning_maintenance_catchup"
-    assert kw["run_date"] == at + dt.timedelta(minutes=line_logger.PULL_WINDOW_MINUTES)
-
-
-def test_startup_no_catchup_when_maintenance_ran_or_too_early(tmp_path, monkeypatch):
-    monkeypatch.setattr(line_logger, "BACKUP_DIR", str(tmp_path))
-    s = _Sched()
-    assert line_logger._schedule_maintenance_catchup(
-        s, dt.datetime(2026, 10, 24, 6, 50, tzinfo=line_logger.EASTERN)) is False
-    (tmp_path / "predictions_2026-10-24.db").write_bytes(b"")
-    assert line_logger._schedule_maintenance_catchup(
-        s, dt.datetime(2026, 10, 24, 9, 30, tzinfo=line_logger.EASTERN)) is False
-    assert s.added == []
-
-
 # --- v2 effective-date switch (V2_EFFECTIVE_DATE, ET game date) -----------------------
 
 def test_v2_in_effect_boundary():
