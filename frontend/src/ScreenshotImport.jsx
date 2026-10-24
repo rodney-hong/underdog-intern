@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { SCREENSHOT_STATS, toEditable, isReady, predictBody } from './screenshotRows'
+import { SCREENSHOT_STATS, toEditable, isReady, predictBody, loggedLineDiffers } from './screenshotRows'
 
 const API = 'http://localhost:8000'
 
@@ -69,7 +69,7 @@ export default function ScreenshotImport({ teams }) {
   const cell = 'input-field rounded-lg px-2 py-1 text-xs w-full'
 
   return (
-    <div className="w-full max-w-3xl mt-6 space-y-3">
+    <div className="w-full max-w-3xl mb-6 space-y-3">
       <div
         tabIndex={0}
         onPaste={onPaste}
@@ -104,11 +104,17 @@ export default function ScreenshotImport({ teams }) {
             <tbody>
               {rows.map((r) => {
                 const res = results[r.key]
+                const logged = loggedLineDiffers(r)
                 return (
                   <tr key={r.key} className="align-top">
                     <td className="p-1 min-w-[160px]">
-                      <input className={cell} value={r.player_name} placeholder={r.card_name}
-                             onChange={(e) => update(r.key, 'player_name', e.target.value)} />
+                      <div className="flex items-center gap-1">
+                        {r.alerts.length > 0 && (
+                          <span title={r.alerts.join('\n')} style={{ color: 'var(--warning)' }}>⚑</span>
+                        )}
+                        <input className={cell} value={r.player_name} placeholder={r.card_name}
+                               onChange={(e) => update(r.key, 'player_name', e.target.value)} />
+                      </div>
                       {r.flags.map((f) => (
                         <div key={f} className="mt-0.5" style={{ color: 'var(--warning)' }}>{f}</div>
                       ))}
@@ -120,9 +126,15 @@ export default function ScreenshotImport({ teams }) {
                         {SCREENSHOT_STATS.map((s) => <option key={s} value={s}>{s}</option>)}
                       </select>
                     </td>
-                    <td className="p-1 w-20">
-                      <input className={cell} inputMode="decimal" value={r.stat_line}
-                             onChange={(e) => update(r.key, 'stat_line', e.target.value)} />
+                    <td className="p-1 w-24">
+                      <div className="flex items-center gap-1">
+                        <input className={cell} inputMode="decimal" value={r.stat_line}
+                               onChange={(e) => update(r.key, 'stat_line', e.target.value)} />
+                        {logged != null && (
+                          <span style={{ color: 'var(--text-muted)' }}
+                                title={`${r.logged_line.pull_phase} ${r.logged_line.captured_at}`}>{logged}</span>
+                        )}
+                      </div>
                       {(r.higher != null || r.lower != null) && (
                         <div className="mt-0.5" style={{ color: 'var(--text-muted)' }}>
                           {r.higher != null ? `H ${r.higher}x` : ''} {r.lower != null ? `L ${r.lower}x` : ''}

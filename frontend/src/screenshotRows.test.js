@@ -31,3 +31,13 @@ test('edits are what gets predicted', () => {
   assert.equal(predictBody(r).player_name, 'Jalen Williams')
   assert.equal(predictBody(r).stat_line, 5.5)
 })
+
+test('the logged Underdog line shows only when it differs from the screenshot line', async () => {
+  const { loggedLineDiffers } = await import('./screenshotRows.js')
+  const logged = { line: 26.5, captured_at: '2026-10-24T21:30:00+00:00', pull_phase: 'pretip' }
+  assert.equal(loggedLineDiffers(toEditable({ ...extracted, logged_line: logged }, 0)), 26.5)
+  assert.equal(loggedLineDiffers(toEditable({ ...extracted, logged_line: { ...logged, line: 27.5 } }, 0)), null)
+  assert.equal(loggedLineDiffers(toEditable(extracted, 0)), null)
+  assert.deepEqual(toEditable({ ...extracted, alerts: ['two reads disagree on line'] }, 0).alerts,
+    ['two reads disagree on line'])
+})

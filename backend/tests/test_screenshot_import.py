@@ -85,9 +85,9 @@ def test_rows_without_a_name_or_line_are_dropped_and_odd_stats_kept_unmapped():
 
 def test_extractor_setting(monkeypatch):
     monkeypatch.delenv("SCREENSHOT_EXTRACTOR", raising=False)
+    assert si.extractor_name() == "ollama" and si.OLLAMA_MODEL == "gemma4:12b"
+    monkeypatch.setenv("SCREENSHOT_EXTRACTOR", "Claude")
     assert si.extractor_name() == "claude"
-    monkeypatch.setenv("SCREENSHOT_EXTRACTOR", "Ollama")
-    assert si.extractor_name() == "ollama"
     monkeypatch.setenv("SCREENSHOT_EXTRACTOR", "tesseract")
     with pytest.raises(si.ExtractorUnavailable, match="SCREENSHOT_EXTRACTOR"):
         si.extractor_name()
@@ -140,23 +140,6 @@ def test_claude_refusal_is_unavailable(monkeypatch):
     monkeypatch.setattr(anthropic, "Anthropic", FakeClient)
     with pytest.raises(si.ExtractorUnavailable, match="declined"):
         si.extract_rows(ss.render())
-
-
-def test_ollama_request_and_parsing(monkeypatch):
-    import httpx
-    sent = {}
-
-    def post(url, json=None, timeout=None):
-        sent.update(url=url, body=json)
-        return httpx.Response(200, request=httpx.Request("POST", url),
-                              json={"message": {"content": __import__("json").dumps({"rows": RAW})}})
-
-    monkeypatch.setenv("SCREENSHOT_EXTRACTOR", "ollama")
-    monkeypatch.setattr(si.httpx, "post", post)
-    name, rows = si.extract_rows(ss.render())
-    assert name == "ollama" and len(rows) == 4 and rows[0]["higher_multiplier"] == 1.03
-    assert sent["url"].endswith("/api/chat") and sent["body"]["model"] == si.OLLAMA_MODEL
-    assert sent["body"]["format"] == "json" and len(sent["body"]["messages"][0]["images"]) == 1
 
 
 def test_ollama_down_is_unavailable(monkeypatch):
@@ -331,8 +314,14 @@ def test_extract_is_localhost_only(db):
 # --- optional: the real extractor on the synthetic image ------------------------------------
 
 @pytest.mark.skipif(os.getenv("RUN_LIVE_EXTRACTOR") != "1", reason="set RUN_LIVE_EXTRACTOR=1 to call the real extractor")
-def test_live_extractor_reads_the_synthetic_screenshot():
-    name, rows = si.extract_rows(ss.render())
-    got = [(r["player_name"], r["stat"], r["line"], r["higher_multiplier"], r["lower_multiplier"]) for r in rows]
-    want = [(c["player_name"], c["stat"], c["line"], c["higher"], c["lower"]) for c in ss.CARDS]
-    assert got == want, f"{name} misread the synthetic screenshot: {got}"
+@pytest.mark.parametrize("image, cards", [(ss.render, ss.CARDS), (ss.render_grid, ss.GRID_CARDS)],
+                         ids=["list", "grid"])
+def test_live_extractor_reads_the_synthetic_screenshot(image, cards):
+    name, rows = si.extract_rows(image())
+    got = [(r["player_name"], r["stat"], r["line"]) for r in rows]
+    assert got == [(c["player_name"], c["stat"], c["line"]) for c in cards], f"{name} misread: {got}"
+    if name == "claude":                                       # the Ollama path doesn't read multipliers
+        assert [(r["higher_multiplier"], r["lower_multiplier"]) for r in rows] == \
+            [(c["higher"], c["lower"]) for c in cards]
+    else:
+        assert all(r["reads_agree"] for r in rows)

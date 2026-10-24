@@ -6,11 +6,14 @@ The LLM only transcribes text from the image (player, team, stat, line, multipli
 It never predicts: predictions come from /predict after the user confirms each row.
 
 Extractor (SCREENSHOT_EXTRACTOR in .env):
-  claude  (default) Claude API, key ANTHROPIC_API_KEY, model SCREENSHOT_CLAUDE_MODEL.
-  ollama  local Ollama vision model SCREENSHOT_OLLAMA_MODEL (default gemma4:e2b) at
-          OLLAMA_URL. Measured 2026-10-24 on a synthetic 4-card screenshot: names and
-          lines right, but '3-Pointers Made' read as Points in 3/3 runs, and its
-          schema-constrained mode returned wrong lines; so it is not the default.
+  ollama  (default) local Ollama vision model SCREENSHOT_OLLAMA_MODEL (default gemma4:12b)
+          at OLLAMA_URL. The screenshot's card grid is detected (detect_cards), each card
+          is cropped and upscaled and read on its own, twice (READ_SCALES), asking only
+          for the raw text: name, stat label, line. Stat labels are mapped in code
+          (normalize_stat). Multipliers are not read. Two reads that disagree flag the row.
+          No cards detected: the whole image is read instead, also twice.
+  claude  Claude API, key ANTHROPIC_API_KEY, model SCREENSHOT_CLAUDE_MODEL; whole image,
+          one call, multipliers included.
 The image is held in memory only: nothing is written to disk.
 """
 
@@ -19,6 +22,7 @@ import io
 import json
 import os
 import re
+import time
 
 import httpx
 from dotenv import load_dotenv
@@ -26,9 +30,12 @@ from dotenv import load_dotenv
 load_dotenv()
 
 EXTRACTORS = ("claude", "ollama")
+DEFAULT_EXTRACTOR = "ollama"
 CLAUDE_MODEL = os.getenv("SCREENSHOT_CLAUDE_MODEL", "claude-opus-5-5")
-OLLAMA_MODEL = os.getenv("SCREENSHOT_OLLAMA_MODEL", "gemma4:e2b")
+OLLAMA_MODEL = os.getenv("SCREENSHOT_OLLAMA_MODEL", "gemma4:12b")
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
+OLLAMA_PARALLEL = int(os.getenv("SCREENSHOT_OLLAMA_PARALLEL", "6"))   # concurrent card reads (6: fastest measured, RTX 5070 Ti)
+READ_SCALES = (2, 3)           # each card is read twice, upscaled 2x and 3x
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
 MAX_IMAGE_SIDE = 2000          # longer side, px; larger screenshots are scaled down first
 SUPPORTED_STATS = ("Points", "Rebounds", "Assists", "3PM")
@@ -137,28 +144,147 @@ def _extract_claude(png: bytes, media_type: str) -> list[dict]:
     return json.loads(text)["rows"]
 
 
-def _extract_ollama(png: bytes, media_type: str) -> list[dict]:
-    # JSON mode, not a JSON schema: the schema-constrained output gave wrong numbers.
-    try:
-        resp = httpx.post(f"{OLLAMA_URL}/api/chat", timeout=300, json={
-            "model": OLLAMA_MODEL, "stream": False, "format": "json",
+# --- Ollama: card grid -> one card per call, read twice ---------------------------------
+
+CARD_PROMPT = (
+    "This image is one player card from a sports pick'em app. Copy its raw text. Return JSON "
+    '{"player_name": ..., "stat_label": ..., "line": ...}: player_name exactly as written; '
+    "stat_label, the stat words exactly as written (for example 'Points' or '3-Pointers Made'); "
+    "line, the number shown with that stat, exactly as written. Ignore buttons, multipliers, "
+    "teams and game times. Use null for anything not visible. Do not guess."
+)
+SHEET_PROMPT = (
+    "This is a screenshot of player cards from a sports pick'em app. For every card copy its "
+    'raw text. Return JSON {"cards": [{"player_name": ..., "stat_label": ..., "line": ...}]}: '
+    "player_name and stat_label exactly as written, line the number shown with that stat. "
+    "Ignore buttons, multipliers, teams and game times. Do not guess."
+)
+
+
+def detect_cards(img) -> list[tuple[int, int, int, int]]:
+    """
+    Boxes (x0, y0, x1, y1) of the cards in a pick'em screenshot, in reading order, or []
+    when no grid of cards is found. A card is a solid filled panel standing out from the
+    page background: threshold against the border colour, open away thin separators,
+    label connected regions, then keep the ones that are mostly filled, card-sized, and
+    of the grid's common size (drops headers, nav bars and stray text).
+    """
+    import numpy as np
+    from scipy import ndimage
+    scale = min(1.0, 1200 / max(img.size))
+    small = img.resize((max(1, int(img.width * scale)), max(1, int(img.height * scale)))) if scale < 1 else img
+    a = np.asarray(small.convert("RGB")).astype(np.int16)
+    h, w = a.shape[:2]
+    border = np.concatenate([a[:3].reshape(-1, 3), a[-3:].reshape(-1, 3),
+                             a[:, :3].reshape(-1, 3), a[:, -3:].reshape(-1, 3)])
+    bg = np.median(border, axis=0)
+    mask = np.abs(a - bg).max(axis=2) > 6
+    mask = ndimage.binary_opening(mask, structure=np.ones((5, 5)))
+    labels, _ = ndimage.label(mask)
+    boxes = []
+    for i, sl in enumerate(ndimage.find_objects(labels), start=1):
+        if sl is None:
+            continue
+        y0, y1, x0, x1 = sl[0].start, sl[0].stop, sl[1].start, sl[1].stop
+        bw, bh = x1 - x0, y1 - y0
+        if bw < 0.12 * w or bh < 0.05 * h or (bw > 0.98 * w and bh > 0.9 * h):
+            continue
+        if bw > 6 * bh or bh > 4 * bw:         # bars and strips, not cards
+            continue
+        if (labels[y0:y1, x0:x1] == i).mean() < 0.7:
+            continue
+        boxes.append((x0, y0, x1, y1))
+    if not boxes:
+        return []
+    areas = sorted((b[2] - b[0]) * (b[3] - b[1]) for b in boxes)
+    med = areas[len(areas) // 2]
+    boxes = [b for b in boxes if 0.5 * med <= (b[2] - b[0]) * (b[3] - b[1]) <= 2 * med]
+    row_h = min(b[3] - b[1] for b in boxes)
+    boxes.sort(key=lambda b: (round(b[1] / (row_h / 2)), b[0]))
+    inv = 1 / scale
+    return [(int(x0 * inv), int(y0 * inv), int(x1 * inv), int(y1 * inv)) for x0, y0, x1, y1 in boxes]
+
+
+def _ollama_json(img, prompt: str) -> dict:
+    """One Ollama call on a PIL image: temperature 0, thinking off, JSON mode."""
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    body = {"model": OLLAMA_MODEL, "stream": False, "format": "json", "think": False,
             "options": {"temperature": 0},
-            "messages": [{"role": "user", "images": [base64.b64encode(png).decode()],
-                          "content": PROMPT + ' Shape: {"rows": [{"player_name", "team", "stat", '
-                                              '"line", "higher_multiplier", "lower_multiplier"}]}'}],
-        })
-        resp.raise_for_status()
-    except httpx.HTTPError as exc:
-        raise ExtractorUnavailable(f"Ollama ({OLLAMA_URL}, {OLLAMA_MODEL}) failed: {exc}") from exc
-    data = json.loads(resp.json()["message"]["content"])
-    return data["rows"] if isinstance(data, dict) else data
+            "messages": [{"role": "user", "content": prompt,
+                          "images": [base64.b64encode(buf.getvalue()).decode()]}]}
+    for attempt in (1, 2):   # one retry on a 5xx: a model load can fail once (CUDA init, VRAM)
+        try:
+            resp = httpx.post(f"{OLLAMA_URL}/api/chat", timeout=300, json=body)
+            resp.raise_for_status()
+            break
+        except httpx.HTTPStatusError as exc:
+            if attempt == 2 or exc.response.status_code < 500:
+                raise ExtractorUnavailable(f"Ollama ({OLLAMA_URL}, {OLLAMA_MODEL}) failed: {exc}") from exc
+            time.sleep(2)
+        except httpx.HTTPError as exc:
+            raise ExtractorUnavailable(f"Ollama ({OLLAMA_URL}, {OLLAMA_MODEL}) failed: {exc}") from exc
+    text = resp.json()["message"]["content"].strip()
+    text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text)    # tolerate a fenced reply
+    return json.loads(text)
+
+
+def _read_key(r: dict) -> tuple:
+    """What two reads must agree on: name (case/space-insensitive), mapped stat, line."""
+    return (re.sub(r"\s+", " ", str(r.get("player_name") or "")).strip().lower(),
+            normalize_stat(r.get("stat_label")) or str(r.get("stat_label") or "").strip().lower(),
+            _number(r.get("line")))
+
+
+def _two_reads(first: dict, second: dict) -> dict:
+    """One raw row from two reads of the same card: the first read's text (the second's
+    if the first has no name or line), with alerts where they disagree on name, stat or line."""
+    a, b = _read_key(first), _read_key(second)
+    alerts = [f"two reads disagree on {what}: {x!r} vs {y!r}"
+              for what, x, y in zip(("name", "stat", "line"), a, b) if x != y]
+    base = first if first.get("player_name") and _number(first.get("line")) is not None else second
+    return {"player_name": base.get("player_name"), "team": None, "stat": base.get("stat_label"),
+            "line": base.get("line"), "higher_multiplier": None, "lower_multiplier": None,
+            "reads_agree": not alerts, "alerts": alerts}
+
+
+def _upscale(img, factor: float):
+    from PIL import Image
+    return img.resize((int(img.width * factor), int(img.height * factor)), Image.LANCZOS)
+
+
+def _extract_ollama(png: bytes, media_type: str) -> list[dict]:
+    """Cards detected: each card cropped and read at each of READ_SCALES (up to
+    OLLAMA_PARALLEL calls at once), one raw row per card. No cards: the whole image,
+    read twice (1x and 1.5x)."""
+    from concurrent.futures import ThreadPoolExecutor
+    from PIL import Image
+    img = Image.open(io.BytesIO(png)).convert("RGB")
+    boxes = detect_cards(img)
+    if not boxes:
+        first, second = [_ollama_json(_upscale(img, f) if f > 1 else img, SHEET_PROMPT).get("cards") or []
+                         for f in (1, 1.5)]
+        rows = [_two_reads(x, second[i] if i < len(second) else {}) for i, x in enumerate(first)]
+        if len(second) != len(first):
+            for r in rows:
+                r["alerts"].append(f"two reads found {len(first)} and {len(second)} cards")
+                r["reads_agree"] = False
+        return rows
+    jobs = []
+    for x0, y0, x1, y1 in boxes:
+        card = img.crop((max(0, x0 - 4), max(0, y0 - 4), min(img.width, x1 + 4), min(img.height, y1 + 4)))
+        jobs += [_upscale(card, f) for f in READ_SCALES]
+    with ThreadPoolExecutor(max_workers=max(1, OLLAMA_PARALLEL)) as ex:
+        results = list(ex.map(lambda im: _ollama_json(im, CARD_PROMPT), jobs))
+    n = len(READ_SCALES)
+    return [_two_reads(results[i], results[i + 1]) for i in range(0, len(results), n)]
 
 
 _EXTRACT = {"claude": _extract_claude, "ollama": _extract_ollama}
 
 
 def extractor_name() -> str:
-    name = os.getenv("SCREENSHOT_EXTRACTOR", "claude").strip().lower()
+    name = os.getenv("SCREENSHOT_EXTRACTOR", DEFAULT_EXTRACTOR).strip().lower()
     if name not in EXTRACTORS:
         raise ExtractorUnavailable(f"SCREENSHOT_EXTRACTOR={name!r}; use one of {EXTRACTORS}")
     return name
@@ -209,7 +335,8 @@ def normalize_row(r: dict) -> dict | None:
     return {"player_name": name, "team": team, "stat_text": str(r.get("stat") or "").strip(),
             "stat": normalize_stat(r.get("stat")), "line": line,
             "higher_multiplier": _number(r.get("higher_multiplier")),
-            "lower_multiplier": _number(r.get("lower_multiplier"))}
+            "lower_multiplier": _number(r.get("lower_multiplier")),
+            "reads_agree": r.get("reads_agree"), "alerts": list(r.get("alerts") or [])}
 
 
 # ---------------------------------------------------------------------------
@@ -264,16 +391,99 @@ def historical_range(conn, player_name: str, stat: str) -> dict | None:
     return {"min": min(vals), "max": max(vals), "games": len(vals)}
 
 
-def confirmation_rows(rows: list[dict], context_fn=None) -> list[dict]:
+def _person_id(conn, player_name: str) -> int | None:
+    """personId for a resolved roster name: exact name, else name_key; only if unique."""
+    import database
+    import rosters
+    exact, loose = database._cached_person_index(conn)
+    ids = exact.get(database._ascii_normalize(player_name)) or loose.get(rosters.name_key(player_name))
+    return next(iter(ids)) if ids and len(ids) == 1 else None
+
+
+def logged_underdog_line(conn, player_name: str, team_name: str, stat: str,
+                         game_date: str) -> dict | None:
+    """
+    The latest Underdog line logged in line_snapshots on game_date (ET) for this player
+    (exact name_key, in a game of his team) and stat, from either of the stat's markets:
+    {"line", "captured_at", "pull_phase"}. None when nothing is logged, or when the latest
+    pull holds more than one Underdog point for him (as line_logger.todays_underdog_lines).
+    """
+    import line_logger
+    import rosters
+    markets = line_logger.STAT_MARKETS.get(stat)
+    if not markets:
+        return None
+    nick = "Trail Blazers" if "Blazers" in team_name else team_name.split()[-1]
+    try:
+        rows = conn.execute(
+            f"SELECT player_name, point, captured_at, pull_phase FROM line_snapshots "
+            f"WHERE game_date = ? AND bookmaker = 'underdog' AND market_key IN ({', '.join('?' * len(markets))}) "
+            f"AND (home_team LIKE ? OR away_team LIKE ?)",
+            (game_date, *markets, f"%{nick}", f"%{nick}")).fetchall()
+    except Exception:
+        return None
+    key = rosters.name_key(player_name)
+    rows = [r for r in rows if rosters.name_key(r["player_name"]) == key and r["point"] is not None]
+    if not rows:
+        return None
+    latest = max(r["captured_at"] for r in rows)
+    points = {float(r["point"]) for r in rows if r["captured_at"] == latest}
+    if len(points) != 1:
+        return None
+    phase = next(r["pull_phase"] for r in rows if r["captured_at"] == latest)
+    return {"line": points.pop(), "captured_at": latest, "pull_phase": phase}
+
+
+_LINE_CHECKS_DDL = """
+    CREATE TABLE IF NOT EXISTS line_checks (
+        id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+        checked_at         TEXT NOT NULL,   -- UTC ISO, when the screenshot was read
+        person_id          INTEGER,         -- NULL: card not resolved to one player
+        stat_type          TEXT,            -- Points / Rebounds / Assists / 3PM, NULL if unmapped
+        screenshot_line    REAL NOT NULL,
+        logged_line        REAL,            -- latest Underdog line in today's line_snapshots
+        logged_captured_at TEXT,            -- its capture time (UTC ISO)
+        logged_pull_phase  TEXT,            -- open / pretip / catchup / event / ...
+        matches            INTEGER,         -- 1 / 0; NULL when nothing was logged to compare
+        reads_agree        INTEGER          -- 1 / 0 for the two reads; NULL (one read: Claude)
+    )"""
+
+
+def record_line_checks(conn, rows: list[dict], checked_at: str) -> int:
+    """One line_checks row per extracted card (numbers only, no image)."""
+    conn.execute(_LINE_CHECKS_DDL)
+    data = []
+    for r in rows:
+        logged = r.get("logged_line")
+        match = None if logged is None else int(abs(logged["line"] - r["line"]) < 1e-9)
+        agree = r.get("reads_agree")
+        data.append((checked_at, r.get("person_id"), r.get("stat"), r["line"],
+                     logged and logged["line"], logged and logged["captured_at"],
+                     logged and logged["pull_phase"], match, None if agree is None else int(agree)))
+    conn.executemany("INSERT INTO line_checks (checked_at, person_id, stat_type, screenshot_line, "
+                     "logged_line, logged_captured_at, logged_pull_phase, matches, reads_agree) "
+                     "VALUES (?,?,?,?,?,?,?,?,?)", data)
+    conn.commit()
+    return len(data)
+
+
+def confirmation_rows(rows: list[dict], context_fn=None, record: bool = True) -> list[dict]:
     """
     Each extracted row plus what the confirmation table needs: the resolved player
     (blank unless exactly one exact name_key + team match), his next game context for
-    /predict (opponent, home, back-to-back, game date), the historical range and flags.
+    /predict (opponent, home, back-to-back, game date), the historical range and flags,
+    and today's logged Underdog line for him and that stat. The screenshot line is the one
+    predicted; a logged line that differs adds an alert (shown as the row's flag icon), as
+    do two reads that disagree. With `record`, every card is written to line_checks.
     """
+    import datetime as dt
+    from zoneinfo import ZoneInfo
     import database
     if context_fn is None:
         import data_fetcher
         context_fn = data_fetcher.get_player_context
+    checked_at = dt.datetime.now(dt.timezone.utc)
+    today = checked_at.astimezone(ZoneInfo("America/New_York")).date().isoformat()
     conn = database.get_connection()
     try:
         out = []
@@ -281,7 +491,8 @@ def confirmation_rows(rows: list[dict], context_fn=None) -> list[dict]:
             who = resolve_player(conn, r["player_name"], r["team"])
             row = {**r, "resolved_player": who.get("player_name", ""), "match": who["status"],
                    "opponent_team": "", "is_home": False, "is_back_to_back": False,
-                   "game_date": None, "range": None, "flags": []}
+                   "game_date": None, "range": None, "flags": [], "alerts": list(r.get("alerts") or []),
+                   "logged_line": None, "person_id": None}
             if r["stat"] is None:
                 row["flags"].append(f"stat '{r['stat_text']}' is not one of {', '.join(SUPPORTED_STATS)}")
             if who["status"] == "ok":
@@ -297,7 +508,16 @@ def confirmation_rows(rows: list[dict], context_fn=None) -> list[dict]:
                     elif not rng["min"] <= r["line"] <= rng["max"]:
                         row["flags"].append(f"line {r['line']:g} is outside his range "
                                             f"{rng['min']:g}–{rng['max']:g} (last {rng['games']} games)")
+                row["person_id"] = _person_id(conn, who["player_name"])
+                if r["stat"]:
+                    logged = logged_underdog_line(conn, who["player_name"], who["team_name"], r["stat"], today)
+                    row["logged_line"] = logged
+                    if logged and abs(logged["line"] - r["line"]) >= 1e-9:
+                        row["alerts"].append(f"logged Underdog line {logged['line']:g} "
+                                             f"({logged['pull_phase']} pull) differs from {r['line']:g}")
             out.append(row)
+        if record and out:
+            record_line_checks(conn, out, checked_at.isoformat())
         return out
     finally:
         conn.close()

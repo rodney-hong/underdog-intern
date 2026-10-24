@@ -723,6 +723,9 @@ export default function App() {
       {currentPage === 'history' && <History />}
 
       {currentPage === 'predict' && <>
+        {/* Main entry: screenshot -> confirm -> predict (manual form below) */}
+        {sport === 'NBA' && <ScreenshotImport teams={allTeams} />}
+
         {/* Form card */}
         <div className="card w-full max-w-lg rounded-2xl p-6 shadow-2xl space-y-4">
           {/* Sport toggle */}
@@ -844,7 +847,6 @@ export default function App() {
 
             <SlipCard slip={slipResult} onClear={() => setSlipResult(null)} />
 
-            <ScreenshotImport teams={allTeams} />
           </>
         )}
 
