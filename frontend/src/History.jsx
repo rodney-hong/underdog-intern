@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback } from 'react'
 import { fetchTrackRecord, pct, rangeStr } from './trackRecord'
+import { historySummary } from './historyStats'
 
 const API = 'http://localhost:8000'
 const PAGE_SIZES = [10, 25, 50]
@@ -136,6 +137,13 @@ function PredictionRow({ prediction: p, isEditing, editValue, onEdit, onEditChan
       <td className="px-2 py-2 text-xs truncate" style={{ color: 'var(--text-muted)' }}>{gameDateStr}</td>
       <td className="px-2 py-2 truncate" style={{ color: 'var(--text-secondary)' }}>
         <PlayerName name={p.player_name} stat={p.stat_type} league={p.league ?? 'NBA'} />
+        {!!p.is_limited_data && (
+          <span className="ml-1.5 rounded px-1 py-0.5 text-[10px] font-medium"
+                style={{ backgroundColor: 'var(--bg-tertiary)', color: 'var(--text-muted)' }}
+                title="Rookie or fewer than 10 games before this game: not counted in the accuracy figures">
+            limited data
+          </span>
+        )}
       </td>
       <td className="px-2 py-2 truncate" style={{ color: 'var(--text-muted)' }}>{p.stat_type}</td>
       <td className="px-2 py-2 truncate" style={{ color: 'var(--text-secondary)' }}>{p.stat_line}</td>
@@ -235,26 +243,8 @@ export default function History() {
     finally { setCleaning(false) }
   }
 
-  // Derived summary stats (always over full dataset, excluding DNP)
-  const resolved = predictions.filter((p) => p.actual_result !== null && p.actual_result !== 'DNP')
-  const correct = resolved.filter((p) => p.predicted_outcome === p.actual_result)
-  const overallAcc = resolved.length > 0
-    ? `${(correct.length / resolved.length * 100).toFixed(1)}%`
-    : '—'
-
-  const tierStats = [
-    { label: '50–60%', min: 0.5, max: 0.6 },
-    { label: '60–70%', min: 0.6, max: 0.7 },
-    { label: '70%+',   min: 0.7, max: 1.01 },
-  ].map((tier) => {
-    const t = resolved.filter((p) => p.confidence >= tier.min && p.confidence < tier.max)
-    const c = t.filter((p) => p.predicted_outcome === p.actual_result)
-    return {
-      label: tier.label,
-      value: t.length ? `${(c.length / t.length * 100).toFixed(0)}%` : '—',
-      sub: `${t.length} game${t.length !== 1 ? 's' : ''}`,
-    }
-  })
+  // Summary figures over the full dataset (historyStats: DNP and limited-data rows excluded)
+  const summary = historySummary(predictions)
 
   // Filter pipeline
   const filtered = predictions.filter((p) => {
@@ -296,9 +286,9 @@ export default function History() {
       {/* Header row: summary cards + clean button */}
       <div className="flex items-start gap-4 mb-6">
         <div className="grid grid-cols-2 sm:grid-cols-5 gap-3 flex-1">
-          <SummaryCard label="Total" value={predictions.length} sub={`${resolved.length} resolved`} />
-          <SummaryCard label="Accuracy" value={overallAcc} sub={resolved.length > 0 ? `${correct.length}/${resolved.length} correct` : 'no data'} />
-          {tierStats.map((t) => (
+          <SummaryCard label="Total" value={summary.total} sub={`${summary.resolved} resolved`} />
+          <SummaryCard label="Accuracy" value={summary.accuracy} sub={summary.resolved > 0 ? `${summary.correct}/${summary.resolved} correct` : 'no data'} />
+          {summary.tiers.map((t) => (
             <SummaryCard key={t.label} label={t.label} value={t.value} sub={t.sub} />
           ))}
         </div>
@@ -313,6 +303,12 @@ export default function History() {
           </button>
         </div>
       </div>
+
+      {summary.limitedCount > 0 && (
+        <p className="text-xs -mt-4 mb-4" style={{ color: 'var(--text-muted)' }}>
+          {summary.limitedCount} limited-data prediction{summary.limitedCount !== 1 ? 's' : ''} excluded from these figures.
+        </p>
+      )}
 
       {/* Filters row */}
       <div className="flex flex-wrap items-center gap-2 mb-4">

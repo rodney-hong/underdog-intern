@@ -130,7 +130,14 @@ def init_db():
     if "league" not in existing_cols:
         conn.execute("ALTER TABLE predictions ADD COLUMN league TEXT DEFAULT 'NBA'")
         conn.execute("UPDATE predictions SET league = 'NBA' WHERE league IS NULL")
+    if "is_limited_data" not in existing_cols:
+        conn.execute("ALTER TABLE predictions ADD COLUMN is_limited_data INTEGER")
     conn.commit()
+    try:   # display-only flag; a failure must never stop startup
+        out = backfill_limited_data(conn)
+        print(f"Limited-data flags on app predictions: {out}")
+    except Exception as exc:
+        print(f"Limited-data backfill FAILED: {exc!r} (flags unchanged)")
     conn.close()
 
 
@@ -146,6 +153,11 @@ def log_prediction(
     league: str = "NBA",
 ) -> int:
     conn = get_connection()
+    try:   # display-only flag (is_limited_data); never blocks logging
+        limited = 0 if league != "NBA" else int(is_limited_data(
+            player_data_counts(conn, player_name, game_date, opponent_team), explanation))
+    except Exception:
+        limited = None
     existing = conn.execute(
         """
         SELECT id, confidence FROM predictions
@@ -157,8 +169,9 @@ def log_prediction(
     ).fetchone()
     if existing:
         conn.execute(
-            "UPDATE predictions SET confidence = ?, explanation = ?, timestamp = ? WHERE id = ?",
-            (confidence, explanation, datetime.utcnow().isoformat(), existing["id"]),
+            "UPDATE predictions SET confidence = ?, explanation = ?, timestamp = ?, is_limited_data = ? "
+            "WHERE id = ?",
+            (confidence, explanation, datetime.utcnow().isoformat(), limited, existing["id"]),
         )
         conn.commit()
         conn.close()
@@ -167,8 +180,9 @@ def log_prediction(
         """
         INSERT INTO predictions
             (timestamp, player_name, stat_type, stat_line, opponent_team,
-             predicted_outcome, confidence, explanation, actual_result, game_date, league)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)
+             predicted_outcome, confidence, explanation, actual_result, game_date, league,
+             is_limited_data)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)
         """,
         (
             datetime.utcnow().isoformat(),
@@ -181,6 +195,7 @@ def log_prediction(
             explanation,
             game_date,
             league,
+            limited,
         ),
     )
     row_id = cursor.lastrowid
@@ -396,6 +411,129 @@ def _person_id(conn, player_name: str, index: tuple[dict, dict], day: tuple[str,
         if found:
             break
     return None, f"name matches {len(ids)} personIds {sorted(ids)}: ambiguous"
+
+
+# ---------------------------------------------------------------------------
+# Limited-data app predictions (rookies, thin samples): kept and shown, but left out
+# of the History accuracy figures. Display-only: never feeds the model.
+# ---------------------------------------------------------------------------
+
+REGULAR_SEASON_GAME_TYPES = ("Regular Season", "NBA Emirates Cup")   # game_types' regular-season labels
+SEASON_2026_27_START = "2026-10-01"     # "before the 2026-27 season" (preseason is not counted anyway)
+LIMITED_DATA_MIN_GAMES = 10             # fewer counted games before the game -> limited data
+INSUFFICIENT_DATA_PREFIX = "Insufficient game log data"   # predictor's fixed low-data answer
+
+_person_index_cache: dict = {}
+
+
+def _cached_person_index(conn) -> tuple[dict, dict]:
+    """_person_index, rebuilt only when the loaded Kaggle version (or DB) changes."""
+    try:
+        version = conn.execute("SELECT version FROM kaggle_version LIMIT 1").fetchone()
+    except sqlite3.OperationalError:
+        version = None
+    key = (DB_PATH, version[0] if version else None)
+    if key not in _person_index_cache:
+        _person_index_cache.clear()
+        _person_index_cache[key] = _person_index(conn)
+    return _person_index_cache[key]
+
+
+def player_data_counts(conn, player_name: str, game_date: str | None, opponent_team: str = "",
+                       index: tuple[dict, dict] | None = None) -> dict:
+    """
+    From player_stats, by personId (the resolver's exact-name mapping, _person_id):
+      rs_total             regular-season games loaded, any date;
+      rs_before_season     regular-season games before SEASON_2026_27_START;
+      counted_before_game  counted games (game_types.COUNTED_SQL) before game_date.
+    person_id None (name matches no player, or several and they can't be narrowed):
+    the before-counts are None and rs_total is the most any candidate has.
+    """
+    import game_types
+    import rosters
+    from zoneinfo import ZoneInfo
+    index = index or _cached_person_index(conn)
+    gd = game_date or datetime.now(ZoneInfo("America/New_York")).date().isoformat()
+    day = (gd, (date.fromisoformat(gd) + timedelta(days=1)).isoformat())
+    opp = (opponent_team or "").strip()
+    opp_nickname = "Trail Blazers" if "Blazers" in opp else (opp.split()[-1] if opp else "")
+    person_id, _ = _person_id(conn, player_name.strip(), index, day, opp_nickname)
+    rs = ", ".join(f"'{t}'" for t in REGULAR_SEASON_GAME_TYPES)
+
+    def rs_total(pid):
+        return conn.execute(f"SELECT COUNT(*) FROM player_stats WHERE personId = ? AND gameType IN ({rs})",
+                            (pid,)).fetchone()[0]
+
+    if person_id is None:
+        exact, loose = index
+        ids = exact.get(_ascii_normalize(player_name.strip())) or loose.get(rosters.name_key(player_name)) or set()
+        return {"person_id": None, "rs_total": max((rs_total(i) for i in ids), default=0),
+                "rs_before_season": None, "counted_before_game": None}
+    before_season = conn.execute(
+        f"SELECT COUNT(*) FROM player_stats WHERE personId = ? AND gameType IN ({rs}) "
+        f"AND gameDateTimeEst < ?", (person_id, SEASON_2026_27_START)).fetchone()[0]
+    before_game = conn.execute(
+        f"SELECT COUNT(*) FROM player_stats WHERE personId = ? AND gameType IN ({game_types.COUNTED_SQL}) "
+        f"AND gameDateTimeEst < ?", (person_id, gd)).fetchone()[0]
+    return {"person_id": person_id, "rs_total": rs_total(person_id),
+            "rs_before_season": before_season, "counted_before_game": before_game}
+
+
+def is_limited_data(counts: dict, explanation: str = "") -> bool:
+    """No regular-season game before 2026-27, fewer than LIMITED_DATA_MIN_GAMES counted
+    games before the game, a name that can't be pinned to one player, or the predictor's
+    fixed 'Insufficient game log data' answer."""
+    if (explanation or "").startswith(INSUFFICIENT_DATA_PREFIX):
+        return True
+    if counts["person_id"] is None:
+        return True
+    return counts["rs_before_season"] == 0 or counts["counted_before_game"] < LIMITED_DATA_MIN_GAMES
+
+
+def _prediction_game_date(game_date: str | None, timestamp: str | None) -> str | None:
+    """The row's game_date, else the ET date of its (naive UTC) timestamp."""
+    if game_date:
+        return game_date
+    from zoneinfo import ZoneInfo
+    try:
+        return (datetime.fromisoformat(timestamp).replace(tzinfo=ZoneInfo("UTC"))
+                .astimezone(ZoneInfo("America/New_York")).date().isoformat())
+    except (TypeError, ValueError):
+        return None
+
+
+def backfill_limited_data(conn=None) -> dict:
+    """
+    (Re)compute predictions.is_limited_data for every NBA row from player_stats, only
+    games before each row's game date; WNBA rows are 0. Startup runs it (init_db), so
+    rows logged before a box score was loaded are corrected. Returns counts.
+    """
+    own = conn is None
+    conn = conn or get_connection()
+    try:
+        try:
+            conn.execute("SELECT 1 FROM player_stats LIMIT 1")
+        except sqlite3.OperationalError:
+            return {"skipped": "no player_stats"}
+        index = _cached_person_index(conn)
+        rows = conn.execute("SELECT id, player_name, opponent_team, game_date, timestamp, explanation, "
+                            "COALESCE(league, 'NBA') AS league FROM predictions").fetchall()
+        updates, n_limited = [], 0
+        for r in rows:
+            if r["league"] != "NBA":
+                flag = 0
+            else:
+                gd = _prediction_game_date(r["game_date"], r["timestamp"])
+                counts = player_data_counts(conn, r["player_name"], gd, r["opponent_team"], index)
+                flag = int(is_limited_data(counts, r["explanation"]))
+            n_limited += flag
+            updates.append((flag, r["id"]))
+        conn.executemany("UPDATE predictions SET is_limited_data = ? WHERE id = ?", updates)
+        conn.commit()
+        return {"rows": len(rows), "limited": n_limited}
+    finally:
+        if own:
+            conn.close()
 
 
 def _resolve_decision(conn, row, index: tuple[dict, dict], available_cols: set) -> dict | None:

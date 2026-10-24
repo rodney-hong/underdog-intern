@@ -218,7 +218,7 @@ const SOURCE_LABELS = {
   bovada:     'Bovada',
 }
 
-function StatLineField({ value, onChange, onClear, source, lineLoading, lineNote }) {
+function StatLineField({ value, onChange, onClear, source, lineLoading }) {
   const handleChange = (e) => {
     const raw = e.target.value
     if (/^(\d*\.?\d*)$/.test(raw)) onChange(raw)
@@ -236,9 +236,6 @@ function StatLineField({ value, onChange, onClear, source, lineLoading, lineNote
           <span className="text-xs font-medium" style={{ color: 'var(--text-muted)' }}>
             via {SOURCE_LABELS[source] ?? source}
           </span>
-        )}
-        {!lineLoading && !source && lineNote && (
-          <span className="text-xs italic" style={{ color: 'var(--text-muted)' }}>{lineNote}</span>
         )}
       </div>
       <div className="relative">
@@ -313,7 +310,7 @@ const STATUS_CLS = {
 }
 
 function InjuryBanner({ status, reason }) {
-  if (!status) return null
+  if (!status || status === 'ambiguous') return null   // unconfirmed name: show nothing
   const cls = STATUS_CLS[status] ?? 'status-neutral'
   return (
     <div className={`animate-fade-in flex items-start gap-2 border rounded-xl px-4 py-2.5 text-sm ${cls}`}>
@@ -489,72 +486,6 @@ function SlipCard({ slip, onClear }) {
 }
 
 // ---------------------------------------------------------------------------
-// Sync now (POST /sync: backup -> rosters -> Kaggle check -> ETL if newer -> resolve)
-// ---------------------------------------------------------------------------
-
-const SYNC_STATUS_CLS = {
-  loaded:        'status-neutral',
-  'up to date':  'status-neutral',
-  waited:        'status-questionable',
-  busy:          'status-questionable',
-  unavailable:   'status-questionable',
-  'check failed': 'status-out',
-  failed:        'status-out',
-}
-
-function SyncPanel() {
-  const [syncing, setSyncing] = useState(false)
-  const [sync, setSync] = useState(null)
-
-  // Show the startup sync's result, if it has finished.
-  useEffect(() => {
-    fetch(`${API}/sync`)
-      .then((r) => (r.ok ? r.json() : null))
-      .then((d) => { if (d?.last) setSync(d.last) })
-      .catch(() => {})
-  }, [])
-
-  const handleSync = async () => {
-    setSyncing(true)
-    try {
-      const res = await fetch(`${API}/sync`, { method: 'POST' })
-      if (!res.ok) throw new Error((await res.json()).detail || 'Sync failed')
-      setSync(await res.json())
-    } catch (e) {
-      setSync({ status: 'failed', summary: e.message || 'Sync failed. Is the backend running?' })
-    } finally {
-      setSyncing(false)
-    }
-  }
-
-  return (
-    <div className="w-full max-w-lg mb-6 space-y-2">
-      <button
-        onClick={handleSync}
-        disabled={syncing}
-        className="btn-ghost w-full py-2.5 rounded-xl text-sm font-medium"
-      >
-        {syncing ? 'Syncing… (a new Kaggle version takes a few minutes)' : 'Sync now'}
-      </button>
-      {sync && (
-        <div className={`animate-fade-in border rounded-xl px-4 py-3 text-xs ${SYNC_STATUS_CLS[sync.status] ?? 'status-neutral'}`}>
-          <div className="font-semibold uppercase tracking-widest mb-1">
-            {sync.status}{sync.trigger ? ` · ${sync.trigger}` : ''}{sync.finished_at ? ` · ${sync.finished_at.slice(11, 16)} ET` : ''}
-          </div>
-          <div>{sync.summary}</div>
-          {sync.status === 'loaded' && (
-            <div className="mt-1">
-              Loaded v{sync.version_loaded} · {sync.rows_added?.toLocaleString()} rows added ·{' '}
-              {sync.app_resolved} app + {sync.paper_resolved} paper predictions resolved
-            </div>
-          )}
-        </div>
-      )}
-    </div>
-  )
-}
-
-// ---------------------------------------------------------------------------
 // Main App
 // ---------------------------------------------------------------------------
 
@@ -595,7 +526,6 @@ export default function App() {
   const [error, setError] = useState('')
   const [lineSource, setLineSource] = useState(null)
   const [lineLoading, setLineLoading] = useState(false)
-  const [lineNote, setLineNote] = useState('')
   const [gameDate, setGameDate] = useState('')
   const [slipResult, setSlipResult] = useState(null)
   const [slipLoading, setSlipLoading] = useState(false)
@@ -619,7 +549,6 @@ export default function App() {
     setIsBackToBack(false)
     setPlayerContext(null)
     setGameDate('')
-    setLineNote('')
     const prefix = sport === 'WNBA' ? '/wnba' : ''
     fetch(`${API}${prefix}/players/${encodeURIComponent(selectedPlayer)}/team`)
       .then((r) => r.json())
@@ -641,26 +570,20 @@ export default function App() {
   useEffect(() => {
     if (!selectedPlayer || !statType) {
       setLineSource(null)
-      setLineNote('')
       return
     }
     let active = true
     setLineLoading(true)
     setLineSource(null)
-    setLineNote('')
     const prefix = sport === 'WNBA' ? '/wnba' : ''
     fetch(`${API}${prefix}/lines/${encodeURIComponent(selectedPlayer)}/${encodeURIComponent(statType)}`)
       .then((r) => r.json())
       .then((data) => {
         if (!active) return
+        // No line (none logged, or the name isn't confirmed): leave the box empty.
         if (data.line != null) {
           setStatLine(String(data.line))
           setLineSource(data.source ?? null)
-          setLineNote('')
-        } else if (data.source === 'ambiguous') {
-          setLineNote('Name is close to another player with a line — not auto-filled, enter manually')
-        } else {
-          setLineNote(data.reason || 'Line not available from sportsbooks — enter manually')
         }
       })
       .catch(() => {})
@@ -704,7 +627,6 @@ export default function App() {
     setError('')
     setLineSource(null)
     setLineLoading(false)
-    setLineNote('')
     setGameDate('')
   }
 
@@ -725,7 +647,6 @@ export default function App() {
     setError('')
     setLineSource(null)
     setLineLoading(false)
-    setLineNote('')
     setGameDate('')
   }
 
@@ -798,8 +719,6 @@ export default function App() {
         </button>
       </div>
 
-      <SyncPanel />
-
       {currentPage === 'history' && <History />}
 
       {currentPage === 'predict' && <>
@@ -856,7 +775,6 @@ export default function App() {
                 onClear={() => { setStatLine(''); setLineSource(null); setResult(null) }}
                 source={lineSource}
                 lineLoading={lineLoading}
-                lineNote={lineNote}
               />
               <StatTypeField
                 value={statType}

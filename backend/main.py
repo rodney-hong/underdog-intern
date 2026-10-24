@@ -261,8 +261,17 @@ def predict_prop(req: PredictRequest):
     """
     Predict OVER or UNDER for a player prop line.
     Returns: { outcome, confidence, explanation }
-    Logs every prediction to predictions.db.
+    Logs every prediction to predictions.db. NBA: a player with no counted regular-season
+    game in player_stats gets no prediction (422 "Not enough NBA games") and no row.
     """
+    if req.league != "WNBA":
+        conn = database.get_connection()
+        try:
+            counts = database.player_data_counts(conn, req.player_name, req.game_date, req.opponent_team)
+        finally:
+            conn.close()
+        if counts["rs_total"] == 0:
+            raise HTTPException(status_code=422, detail="Not enough NBA games")
     _predict_fn = predictor.predict_wnba if req.league == "WNBA" else predictor.predict
     result = _predict_fn(
         player_name=req.player_name,
@@ -327,7 +336,8 @@ def get_prediction_history():
     conn = database.get_connection()
     rows = conn.execute(
         """SELECT id, timestamp, player_name, stat_type, stat_line, opponent_team,
-                  predicted_outcome, confidence, explanation, actual_result, game_date, league
+                  predicted_outcome, confidence, explanation, actual_result, game_date, league,
+                  is_limited_data
            FROM predictions
            ORDER BY timestamp DESC"""
     ).fetchall()
@@ -377,7 +387,8 @@ def update_prediction_result(pred_id: int, req: ActualResultRequest):
     conn.commit()
     row = conn.execute(
         """SELECT id, timestamp, player_name, stat_type, stat_line, opponent_team,
-                  predicted_outcome, confidence, explanation, actual_result, game_date, league
+                  predicted_outcome, confidence, explanation, actual_result, game_date, league,
+                  is_limited_data
            FROM predictions WHERE id = ?""",
         (pred_id,),
     ).fetchone()
