@@ -10,7 +10,10 @@ Extractor (SCREENSHOT_EXTRACTOR in .env):
           at OLLAMA_URL. The screenshot's card grid is detected (detect_cards), each card
           is cropped and upscaled and read on its own, twice (READ_SCALES), asking only
           for the raw text: name, stat label, line. Stat labels are mapped in code
-          (normalize_stat). Multipliers are not read. Two reads that disagree flag the row.
+          (normalize_stat). Multipliers are NOT read on this path, so the prices of
+          Underdog's 5-point rung cards (lines on x4.5 / x9.5 with non-1.0x multipliers,
+          which OddsAPI doesn't carry) are not captured yet: line_checks records only that
+          a line is on a rung (is_rung). Two reads that disagree flag the row.
           No cards detected: the whole image is read instead, also twice.
   claude  Claude API, key ANTHROPIC_API_KEY, model SCREENSHOT_CLAUDE_MODEL; whole image,
           one call, multipliers included.
@@ -405,8 +408,11 @@ def logged_underdog_line(conn, player_name: str, team_name: str, stat: str,
     """
     The latest Underdog line logged in line_snapshots on game_date (ET) for this player
     (exact name_key, in a game of his team) and stat, from either of the stat's markets:
-    {"line", "captured_at", "pull_phase"}. None when nothing is logged, or when the latest
-    pull holds more than one Underdog point for him (as line_logger.todays_underdog_lines).
+    {"line", "captured_at", "pull_phase", "market_key", "over_price", "under_price"}
+    (the main market's row when both markets carry it). None when nothing is logged, or
+    when the latest pull holds more than one Underdog point for him (as
+    line_logger.todays_underdog_lines). This is OddsAPI's Underdog line, the standard
+    pick at the book line; Underdog's 5-point rung cards are not in that feed.
     """
     import line_logger
     import rosters
@@ -416,7 +422,7 @@ def logged_underdog_line(conn, player_name: str, team_name: str, stat: str,
     nick = "Trail Blazers" if "Blazers" in team_name else team_name.split()[-1]
     try:
         rows = conn.execute(
-            f"SELECT player_name, point, captured_at, pull_phase FROM line_snapshots "
+            f"SELECT player_name, point, captured_at, pull_phase, market_key, side, price FROM line_snapshots "
             f"WHERE game_date = ? AND bookmaker = 'underdog' AND market_key IN ({', '.join('?' * len(markets))}) "
             f"AND (home_team LIKE ? OR away_team LIKE ?)",
             (game_date, *markets, f"%{nick}", f"%{nick}")).fetchall()
@@ -430,8 +436,16 @@ def logged_underdog_line(conn, player_name: str, team_name: str, stat: str,
     points = {float(r["point"]) for r in rows if r["captured_at"] == latest}
     if len(points) != 1:
         return None
-    phase = next(r["pull_phase"] for r in rows if r["captured_at"] == latest)
-    return {"line": points.pop(), "captured_at": latest, "pull_phase": phase}
+    pull = [r for r in rows if r["captured_at"] == latest]
+    market = markets[0] if any(r["market_key"] == markets[0] for r in pull) else pull[0]["market_key"]
+    price = {r["side"]: r["price"] for r in pull if r["market_key"] == market}
+    return {"line": points.pop(), "captured_at": latest, "pull_phase": pull[0]["pull_phase"],
+            "market_key": market, "over_price": price.get("Over"), "under_price": price.get("Under")}
+
+
+def is_rung(line: float) -> bool:
+    """On one of Underdog's 5-point rungs: x4.5 or x9.5 (4.5, 9.5, 14.5, 19.5, 24.5, ...)."""
+    return abs((line - 4.5) / 5 - round((line - 4.5) / 5)) < 1e-9
 
 
 _LINE_CHECKS_DDL = """
@@ -445,24 +459,39 @@ _LINE_CHECKS_DDL = """
         logged_captured_at TEXT,            -- its capture time (UTC ISO)
         logged_pull_phase  TEXT,            -- open / pretip / catchup / event / ...
         matches            INTEGER,         -- 1 / 0; NULL when nothing was logged to compare
-        reads_agree        INTEGER          -- 1 / 0 for the two reads; NULL (one read: Claude)
+        reads_agree        INTEGER,         -- 1 / 0 for the two reads; NULL (one read: Claude)
+        is_rung            INTEGER,         -- 1: screenshot line on a 5-point rung (x4.5 / x9.5)
+        logged_market_key  TEXT,            -- market of the logged line (main or _alternate)
+        logged_over_price  REAL,            -- its Over / Under prices (American)
+        logged_under_price REAL,
+        line_diff          REAL             -- screenshot_line - logged_line
     )"""
+_LINE_CHECKS_ADDED = (("is_rung", "INTEGER"), ("logged_market_key", "TEXT"), ("logged_over_price", "REAL"),
+                      ("logged_under_price", "REAL"), ("line_diff", "REAL"))
 
 
 def record_line_checks(conn, rows: list[dict], checked_at: str) -> int:
-    """One line_checks row per extracted card (numbers only, no image)."""
+    """One line_checks row per extracted card (numbers only, no image). Silent: the
+    comparison with the logged line is recorded here, never flagged in the table."""
     conn.execute(_LINE_CHECKS_DDL)
+    have = {c[1] for c in conn.execute("PRAGMA table_info(line_checks)")}
+    for col, kind in _LINE_CHECKS_ADDED:
+        if col not in have:
+            conn.execute(f"ALTER TABLE line_checks ADD COLUMN {col} {kind}")
     data = []
     for r in rows:
-        logged = r.get("logged_line")
-        match = None if logged is None else int(abs(logged["line"] - r["line"]) < 1e-9)
+        logged = r.get("logged_line") or {}
+        diff = None if not logged else round(r["line"] - logged["line"], 4)
+        match = None if diff is None else int(abs(diff) < 1e-9)
         agree = r.get("reads_agree")
         data.append((checked_at, r.get("person_id"), r.get("stat"), r["line"],
-                     logged and logged["line"], logged and logged["captured_at"],
-                     logged and logged["pull_phase"], match, None if agree is None else int(agree)))
+                     logged.get("line"), logged.get("captured_at"), logged.get("pull_phase"), match,
+                     None if agree is None else int(agree), int(is_rung(r["line"])),
+                     logged.get("market_key"), logged.get("over_price"), logged.get("under_price"), diff))
     conn.executemany("INSERT INTO line_checks (checked_at, person_id, stat_type, screenshot_line, "
-                     "logged_line, logged_captured_at, logged_pull_phase, matches, reads_agree) "
-                     "VALUES (?,?,?,?,?,?,?,?,?)", data)
+                     "logged_line, logged_captured_at, logged_pull_phase, matches, reads_agree, is_rung, "
+                     "logged_market_key, logged_over_price, logged_under_price, line_diff) "
+                     "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)", data)
     conn.commit()
     return len(data)
 
@@ -473,8 +502,10 @@ def confirmation_rows(rows: list[dict], context_fn=None, record: bool = True) ->
     (blank unless exactly one exact name_key + team match), his next game context for
     /predict (opponent, home, back-to-back, game date), the historical range and flags,
     and today's logged Underdog line for him and that stat. The screenshot line is the one
-    predicted; a logged line that differs adds an alert (shown as the row's flag icon), as
-    do two reads that disagree. With `record`, every card is written to line_checks.
+    predicted. Alerts (the row's flag icon) only for uncertain rows: the two reads disagree,
+    or the player can't be resolved. A difference from the logged line is not an alert
+    (a 5-point rung card differs by design); it is recorded silently in line_checks.
+    With `record`, every card is written to line_checks.
     """
     import datetime as dt
     from zoneinfo import ZoneInfo
@@ -510,11 +541,11 @@ def confirmation_rows(rows: list[dict], context_fn=None, record: bool = True) ->
                                             f"{rng['min']:g}–{rng['max']:g} (last {rng['games']} games)")
                 row["person_id"] = _person_id(conn, who["player_name"])
                 if r["stat"]:
-                    logged = logged_underdog_line(conn, who["player_name"], who["team_name"], r["stat"], today)
-                    row["logged_line"] = logged
-                    if logged and abs(logged["line"] - r["line"]) >= 1e-9:
-                        row["alerts"].append(f"logged Underdog line {logged['line']:g} "
-                                             f"({logged['pull_phase']} pull) differs from {r['line']:g}")
+                    row["logged_line"] = logged_underdog_line(conn, who["player_name"], who["team_name"],
+                                                              r["stat"], today)
+            else:
+                row["alerts"].append("player not resolved: " + (
+                    "several roster players match" if who["status"] == "ambiguous" else "no exact roster match"))
             out.append(row)
         if record and out:
             record_line_checks(conn, out, checked_at.isoformat())

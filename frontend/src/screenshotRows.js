@@ -18,7 +18,7 @@ export function toEditable(row, i) {
     higher: row.higher_multiplier ?? null,
     lower: row.lower_multiplier ?? null,
     flags: row.flags || [],
-    alerts: row.alerts || [],          // reads disagree / logged line differs: the flag icon's tooltip
+    alerts: row.alerts || [],          // two reads disagree / player not resolved: the flag icon's tooltip
     logged_line: row.logged_line ?? null,
   }
 }

@@ -255,15 +255,70 @@ def _checks(path):
         conn.close()
 
 
-def test_latest_logged_line_is_used_and_a_difference_flags_the_row(db):
-    _snap(db, "Giannis Antetokounmpo", "player_points_alternate", 26.5, "2026-10-24T14:00:00+00:00", "open")
-    _snap(db, "Giannis Antetokounmpo", "player_points", 27.5, "2026-10-24T21:30:00+00:00", "pretip")
+def _rung_cols(path):
+    conn = sqlite3.connect(path)
+    try:
+        return conn.execute("SELECT is_rung, logged_market_key, logged_over_price, logged_under_price, line_diff "
+                            "FROM line_checks ORDER BY id").fetchall()
+    finally:
+        conn.close()
+
+
+def _snap_pair(path, player, market, point, captured, phase, over, under, **kw):
+    _snap(path, player, market, point, captured, phase, **kw)
+    conn = sqlite3.connect(path)
+    conn.execute("UPDATE line_snapshots SET price = ? WHERE player_name = ? AND market_key = ? "
+                 "AND captured_at = ? AND side = 'Over'", (over, player, market, captured))
+    conn.execute("INSERT INTO line_snapshots (game_id, game_date, home_team, away_team, player_name, "
+                 "market_key, bookmaker, side, point, price, captured_at, pull_phase, outcome_index) "
+                 "SELECT game_id, game_date, home_team, away_team, player_name, market_key, bookmaker, "
+                 "'Under', point, ?, captured_at, pull_phase, 1 FROM line_snapshots "
+                 "WHERE player_name = ? AND market_key = ? AND captured_at = ? AND side = 'Over'",
+                 (under, player, market, captured))
+    conn.commit()
+    conn.close()
+
+
+def test_latest_logged_line_with_market_and_prices_and_no_flag_for_a_difference(db):
+    _snap_pair(db, "Giannis Antetokounmpo", "player_points_alternate", 26.5, "2026-10-24T14:00:00+00:00",
+               "open", -125, -174)
+    _snap_pair(db, "Giannis Antetokounmpo", "player_points", 27.5, "2026-10-24T21:30:00+00:00",
+               "pretip", -137, -137)
     [same] = si.confirmation_rows(_rows(("Giannis Antetokounmpo", "Points", 27.5)), context_fn=_ctx)
-    assert same["logged_line"] == {"line": 27.5, "captured_at": "2026-10-24T21:30:00+00:00", "pull_phase": "pretip"}
-    assert same["alerts"] == []
-    [diff] = si.confirmation_rows(_rows(("Giannis Antetokounmpo", "Points", 28.5)), context_fn=_ctx)
-    assert diff["line"] == 28.5                                 # the screenshot line is what's predicted
-    assert diff["alerts"] == ["logged Underdog line 27.5 (pretip pull) differs from 28.5"]
+    assert same["logged_line"] == {"line": 27.5, "captured_at": "2026-10-24T21:30:00+00:00", "pull_phase": "pretip",
+                                   "market_key": "player_points", "over_price": -137, "under_price": -137}
+    # A 5-point rung card (24.5) differs from the standard 1.0x line by design: no flag.
+    [rung] = si.confirmation_rows(_rows(("Giannis Antetokounmpo", "Points", 24.5)), context_fn=_ctx)
+    assert rung["line"] == 24.5 and rung["logged_line"]["line"] == 27.5      # the screenshot line is predicted
+    assert rung["alerts"] == []
+
+
+def test_main_market_row_preferred_when_both_markets_carry_the_line(db):
+    _snap_pair(db, "Brandon Miller", "player_threes_alternate", 2.5, "2026-10-24T21:00:00+00:00",
+               "pretip", -155, -125)
+    _snap_pair(db, "Brandon Miller", "player_threes", 2.5, "2026-10-24T21:00:00+00:00", "pretip", -137, -137)
+    [r] = si.confirmation_rows(_rows(("Brandon Miller", "3PM", 2.5)), context_fn=_ctx, record=False)
+    assert (r["logged_line"]["market_key"], r["logged_line"]["over_price"]) == ("player_threes", -137)
+
+
+def test_only_uncertain_rows_are_flagged(db):
+    rows = _rows(("Giannis Antetokounmpo", "Points", 24.5), ("Nobody Known", "Points", 10.5))
+    rows[0]["alerts"] = ["two reads disagree on line: 24.5 vs 21.5"]
+    flagged = si.confirmation_rows(rows, context_fn=_ctx, record=False)
+    assert flagged[0]["alerts"] == ["two reads disagree on line: 24.5 vs 21.5"]
+    assert flagged[1]["alerts"] == ["player not resolved: no exact roster match"]
+    conn = sqlite3.connect(db)
+    conn.execute("INSERT INTO rosters VALUES ('9', 'Cade Cunningham', 'cade cunningham', 'DAL', 'Dallas', 'Mavericks')")
+    conn.commit()
+    conn.close()
+    [two] = si.confirmation_rows(_rows(("Cade Cunningham", "Assists", 8.5)), context_fn=_ctx, record=False)
+    assert two["resolved_player"] == "" and two["alerts"] == ["player not resolved: several roster players match"]
+
+
+@pytest.mark.parametrize("line, rung", [(4.5, True), (9.5, True), (14.5, True), (24.5, True), (39.5, True),
+                                        (27.5, False), (17.5, False), (13.5, False), (2.5, False), (0.5, False)])
+def test_is_rung(line, rung):
+    assert si.is_rung(line) is rung
 
 
 def test_no_logged_line_two_points_or_another_teams_game(db):
@@ -280,21 +335,43 @@ def test_no_logged_line_two_points_or_another_teams_game(db):
 
 
 def test_every_card_is_recorded_in_line_checks(db):
-    _snap(db, "Giannis Antetokounmpo", "player_points", 27.5, "2026-10-24T21:30:00+00:00", "pretip")
-    _snap(db, "Brandon Miller", "player_threes_alternate", 3.5, "2026-10-24T21:00:00+00:00", "catchup")
+    _snap_pair(db, "Giannis Antetokounmpo", "player_points", 27.5, "2026-10-24T21:30:00+00:00", "pretip", -137, -137)
+    _snap_pair(db, "Brandon Miller", "player_threes_alternate", 3.5, "2026-10-24T21:00:00+00:00", "catchup",
+               -155, -125)
     rows = _rows(("Giannis Antetokounmpo", "Points", 27.5), ("Brandon Miller", "3-Pointers Made", 2.5),
-                 ("Cade Cunningham", "Assists", 8.5), ("Nobody Known", "Points", 10.5))
+                 ("Cade Cunningham", "Assists", 8.5), ("Nobody Known", "Points", 9.5))
     rows[2]["reads_agree"] = False
     si.confirmation_rows(rows, context_fn=_ctx)
     assert _checks(db) == [
         (203507, "Points", 27.5, 27.5, "pretip", 1, 1),
         (1641706, "3PM", 2.5, 3.5, "catchup", 0, 1),
         (1630595, "Assists", 8.5, None, None, None, 0),
-        (None, "Points", 10.5, None, None, None, 1)]
+        (None, "Points", 9.5, None, None, None, 1)]
+    assert _rung_cols(db) == [
+        (0, "player_points", -137, -137, 0.0),
+        (0, "player_threes_alternate", -155, -125, -1.0),
+        (0, None, None, None, None),
+        (1, None, None, None, None)]
     conn = sqlite3.connect(db)
     cols = [r[1] for r in conn.execute("PRAGMA table_info(line_checks)")]
     conn.close()
     assert not any("image" in c or "multiplier" in c for c in cols)   # numbers only
+
+
+def test_an_existing_line_checks_table_gets_the_new_columns(db):
+    conn = sqlite3.connect(db)
+    conn.execute("""CREATE TABLE line_checks (id INTEGER PRIMARY KEY AUTOINCREMENT, checked_at TEXT NOT NULL,
+        person_id INTEGER, stat_type TEXT, screenshot_line REAL NOT NULL, logged_line REAL,
+        logged_captured_at TEXT, logged_pull_phase TEXT, matches INTEGER, reads_agree INTEGER)""")
+    conn.execute("INSERT INTO line_checks (checked_at, person_id, stat_type, screenshot_line, logged_line, "
+                 "logged_captured_at, logged_pull_phase, matches, reads_agree) VALUES "
+                 "('2026-10-24T23:52:00+00:00', 1, 'Points', 24.5, 27.5, '2026-10-24T23:40:00+00:00', 'pretip', 0, 1)")
+    conn.commit()
+    conn.close()
+    _snap_pair(db, "Giannis Antetokounmpo", "player_points", 27.5, "2026-10-24T21:30:00+00:00", "pretip", -137, -137)
+    si.confirmation_rows(_rows(("Giannis Antetokounmpo", "Points", 24.5)), context_fn=_ctx)
+    assert _rung_cols(db) == [(None, None, None, None, None), (1, "player_points", -137, -137, -3.0)]
+    assert len(_checks(db)) == 2                                   # the earlier row is kept
 
 
 def test_record_false_writes_nothing(db):
@@ -336,8 +413,25 @@ def test_report_match_rate_by_stat_and_minutes_since_pull(db):
     ], "2026-10-24T21:20:00+00:00")
     r = line_checks_report.report(db)
     assert r["total"] == 4 and r["compared"] == 3 and r["overall"] == (2, 3) and r["reads_disagree"] == 1
+    assert r["by_rung"] == {"rung (x4.5 / x9.5)": (0, 0), "other lines": (2, 3)}
     assert r["by_stat"] == {"3PM": (1, 1), "Points": (1, 2)}
     assert r["by_age"]["0-30 min"] == (2, 2) and r["by_age"]["120-240 min"] == (0, 1)
+
+
+def test_report_separates_rung_cards_including_rows_from_before_is_rung(db):
+    conn = sqlite3.connect(db)
+    si.record_line_checks(conn, [
+        {"person_id": 1, "stat": "Points", "line": 24.5, "reads_agree": True,
+         "logged_line": {"line": 27.5, "captured_at": "2026-10-24T23:40:00+00:00", "pull_phase": "pretip"}},
+        {"person_id": 2, "stat": "Points", "line": 14.5, "reads_agree": True,
+         "logged_line": {"line": 14.5, "captured_at": "2026-10-24T23:40:00+00:00", "pull_phase": "pretip"}},
+        {"person_id": 3, "stat": "Points", "line": 17.5, "reads_agree": True,
+         "logged_line": {"line": 17.5, "captured_at": "2026-10-24T23:40:00+00:00", "pull_phase": "pretip"}},
+    ], "2026-10-24T23:52:00+00:00")
+    conn.execute("UPDATE line_checks SET is_rung = NULL WHERE person_id = 1")     # recorded before the column
+    conn.commit()
+    conn.close()
+    assert line_checks_report.report(db)["by_rung"] == {"rung (x4.5 / x9.5)": (1, 2), "other lines": (1, 1)}
 
 
 def test_report_without_the_table(tmp_path):

@@ -32,8 +32,8 @@ test('edits are what gets predicted', () => {
   assert.equal(predictBody(r).stat_line, 5.5)
 })
 
-test('alerts (logged line, read disagreements) are kept for the flag tooltip', () => {
-  const alerts = ['logged Underdog line 27.5 (pretip pull) differs from 24.5']
+test('alerts (read disagreements, unresolved player) are kept for the flag tooltip', () => {
+  const alerts = ['player not resolved: no exact roster match']
   assert.deepEqual(toEditable({ ...extracted, alerts }, 0).alerts, alerts)
   assert.deepEqual(toEditable(extracted, 0).alerts, [])
 })
