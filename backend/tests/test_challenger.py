@@ -1,7 +1,7 @@
 """
 Challenger Stage 1: the feature builder gives identical values for a training row and
 for live inference of the same game (synthetic DB with trades, long absences, same-time
-tips and 0-minute rows); the data guard refuses 2025-26; NB helpers behave. A last test
+tips and 0-minute rows); the data guard refuses 2026-27 (Stage 2 guard); NB helpers behave. A last test
 runs challenger_predict on the real predictions.db if the dev model file exists.
 """
 import datetime as dt
@@ -24,7 +24,7 @@ TEAMS = [1610612738, 1610612752, 1610612748, 1610612741, 1610612747, 1610612744]
 
 
 def _db(path, seed=3):
-    """Two synthetic seasons (2023-24, 2024-25) plus one 2025-26 game that must never be read."""
+    """Two synthetic seasons (2023-24, 2024-25) plus one 2026-27 game that must never be read."""
     rng = np.random.default_rng(seed)
     roster = {tm: [10_000 + i * 10 + k for k in range(6)] for i, tm in enumerate(TEAMS)}
     rows, sched = [], []
@@ -50,7 +50,7 @@ def _db(path, seed=3):
                         rows.append(_row(p, gid, tip, "Regular Season", home, tm, opp, mins, rng))
                 gid += 1
         gid = 22400001
-    rows.append(_row(roster[TEAMS[0]][0], 22500001, dt.datetime(2025, 10, 22, 19, 30), "Regular Season",
+    rows.append(_row(roster[TEAMS[0]][0], 22600001, dt.datetime(2026, 10, 22, 19, 30), "Regular Season",
                      1, TEAMS[0], TEAMS[1], 30.0, rng))
     rows.append(_row(roster[TEAMS[0]][1], 22300999, dt.datetime(2024, 1, 5, 19, 0), "Preseason",
                      1, TEAMS[0], TEAMS[1], 30.0, rng))
@@ -91,7 +91,7 @@ def test_loader_never_reads_reserved_seasons(db):
     assert not set(df["season"]) & guard.FORBIDDEN_SEASONS
     assert (df["gameId"] != 22300999).all()                     # preseason excluded
     with pytest.raises(AssertionError):
-        guard.assert_dev_only(pd.Series(pd.to_datetime(["2025-10-22 19:30:00"])))
+        guard.assert_dev_only(pd.Series(pd.to_datetime(["2026-10-22 19:30:00"])))
 
 
 def test_inference_features_equal_training_frame(db):
@@ -114,11 +114,11 @@ def test_inference_features_equal_training_frame(db):
 def test_inference_refuses_reserved_season(db):
     conn = sqlite3.connect(db)
     with pytest.raises(ValueError):
-        inference.features_before_tip(conn, 10_000, 22500001)
+        inference.features_before_tip(conn, 10_000, 22600001)
     conn.close()
     with pytest.raises(ValueError):
-        guard.assert_dev_tip("2025-10-22 19:30:00")
-    guard.assert_dev_tip("2025-04-13 15:30:00")
+        guard.assert_dev_tip("2026-10-22 19:30:00")
+    guard.assert_dev_tip("2026-04-12 15:30:00")
 
 
 def test_features_use_only_earlier_games(db):
@@ -175,4 +175,4 @@ def test_challenger_predict_real_db():
     assert 0 < out["p_over"] < 1 and out["mu"] > 0
     assert out["data_as_of"] < out["tip"]
     with pytest.raises(ValueError):
-        inference.challenger_predict(r[0], "Points", 22500580, 24.5)       # a 2025-26 game
+        inference.challenger_predict(r[0], "Points", 22600101, 24.5)       # a 2026-27 game

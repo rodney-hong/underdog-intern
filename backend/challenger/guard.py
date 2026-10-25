@@ -1,8 +1,9 @@
 """
 guard.py  (challenger, Stage 1)
 
-DATA RULE: Stage 1 never loads, fits on or evaluates on a 2025-26 or 2026-27 game.
-2025-26 is reserved for the pre-registered one-shot Stage 2 test. Every query in
+DATA RULE: Stage 1 never loaded, fitted on or evaluated on a 2025-26 or 2026-27 game.
+Stage 2 (pre-registration commit a760c8c) moves the guard to 2026-07-01 so the one-shot
+test can score 2025-26 with the frozen files; 2026-27 stays excluded. Every query in
 backend/challenger/ is bounded by `gameDateTimeEst < DATA_END` (or by an earlier tip
 time), and what was actually loaded is checked again with assert_dev_only().
 """
@@ -10,8 +11,8 @@ time), and what was actually loaded is checked again with assert_dev_only().
 import numpy as np
 import pandas as pd
 
-DATA_END = "2025-07-01"                          # exclusive: nothing on/after this is read
-FORBIDDEN_SEASONS = frozenset({"2025-26", "2026-27"})
+DATA_END = "2026-07-01"                          # exclusive: nothing on/after this is read
+FORBIDDEN_SEASONS = frozenset({"2026-27"})       # Stage 1 was "2025-07-01" / {2025-26, 2026-27}
 
 # Regular season as game_types.py counts it: "Regular Season" (incl. the 2024-25 Cup
 # group/knockout games) and "NBA Emirates Cup" (the 2023 Cup group stage, QF and SF,
