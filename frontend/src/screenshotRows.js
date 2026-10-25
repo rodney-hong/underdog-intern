@@ -18,15 +18,9 @@ export function toEditable(row, i) {
     higher: row.higher_multiplier ?? null,
     lower: row.lower_multiplier ?? null,
     flags: row.flags || [],
-    alerts: row.alerts || [],          // reads disagree / logged line differs: the row's flag icon
+    alerts: row.alerts || [],          // reads disagree / logged line differs: the flag icon's tooltip
     logged_line: row.logged_line ?? null,
   }
-}
-
-// Today's logged Underdog line when it differs from the screenshot line, else null.
-export function loggedLineDiffers(r) {
-  const line = parseFloat(r.stat_line)
-  return r.logged_line && Number.isFinite(line) && r.logged_line.line !== line ? r.logged_line.line : null
 }
 
 // Ready for /predict: a player, a supported stat, a positive line and an opponent.
