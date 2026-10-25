@@ -392,7 +392,8 @@ def get_prediction_history():
     rows = conn.execute(
         """SELECT id, timestamp, player_name, stat_type, stat_line, opponent_team,
                   predicted_outcome, confidence, explanation, actual_result, game_date, league,
-                  is_limited_data, COALESCE(model, 'frozen') AS model
+                  is_limited_data, COALESCE(model, 'frozen') AS model,
+                  COALESCE(is_current, 1) AS is_current
            FROM predictions
            ORDER BY timestamp DESC"""
     ).fetchall()
@@ -403,9 +404,9 @@ def get_prediction_history():
 @app.delete("/predictions/duplicates")
 def delete_duplicate_predictions():
     """
-    Remove duplicate predictions, keeping the row with the highest confidence for each
-    unique combination of player_name, stat_type, stat_line, opponent_team, and game_date.
-    Ties are broken by lowest id.
+    Remove exact duplicate predictions, keeping the newest row (timestamp, then id) for each
+    combination of player_name, stat_type, stat_line, opponent_team, game_date and model
+    (a challenger row never removes a frozen one). is_current is recomputed after.
     """
     conn = database.get_connection()
     cursor = conn.execute(
@@ -416,8 +417,8 @@ def delete_duplicate_predictions():
                 SELECT id,
                        ROW_NUMBER() OVER (
                            PARTITION BY player_name, stat_type, stat_line, opponent_team,
-                                        COALESCE(game_date, '')
-                           ORDER BY id DESC
+                                        COALESCE(game_date, ''), COALESCE(model, 'frozen')
+                           ORDER BY timestamp DESC, id DESC
                        ) AS rn
                 FROM predictions
             )
@@ -426,6 +427,7 @@ def delete_duplicate_predictions():
         """
     )
     deleted = cursor.rowcount
+    database.refresh_current(conn)
     conn.commit()
     conn.close()
     return {"deleted": deleted}
@@ -443,7 +445,8 @@ def update_prediction_result(pred_id: int, req: ActualResultRequest):
     row = conn.execute(
         """SELECT id, timestamp, player_name, stat_type, stat_line, opponent_team,
                   predicted_outcome, confidence, explanation, actual_result, game_date, league,
-                  is_limited_data, COALESCE(model, 'frozen') AS model
+                  is_limited_data, COALESCE(model, 'frozen') AS model,
+                  COALESCE(is_current, 1) AS is_current
            FROM predictions WHERE id = ?""",
         (pred_id,),
     ).fetchone()

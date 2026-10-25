@@ -137,6 +137,9 @@ def init_db():
         # 'frozen' (the 2026-27 XGBoost / heuristic path). Every earlier row is 'frozen'.
         conn.execute("ALTER TABLE predictions ADD COLUMN model TEXT")
         conn.execute("UPDATE predictions SET model = 'frozen' WHERE model IS NULL")
+    if "is_current" not in existing_cols:
+        conn.execute("ALTER TABLE predictions ADD COLUMN is_current INTEGER")
+    refresh_current(conn)          # recomputed for every row on each start (idempotent)
     conn.commit()
     try:   # display-only flag; a failure must never stop startup
         out = backfill_limited_data(conn)
@@ -164,21 +167,25 @@ def log_prediction(
             player_data_counts(conn, player_name, game_date, opponent_team), explanation))
     except Exception:
         limited = None
+    # A repeat at the same line, with the same model, replaces that row's pick in full
+    # (outcome, confidence, explanation, time); a different line or model is a new row.
     existing = conn.execute(
         """
-        SELECT id, confidence FROM predictions
+        SELECT id FROM predictions
         WHERE player_name = ? AND stat_type = ? AND stat_line = ? AND opponent_team = ?
           AND COALESCE(game_date, '') = COALESCE(?, '') AND COALESCE(model, 'frozen') = ?
-        ORDER BY timestamp DESC LIMIT 1
+        ORDER BY timestamp DESC, id DESC LIMIT 1
         """,
         (player_name, stat_type, stat_line, opponent_team, game_date, model),
     ).fetchone()
     if existing:
         conn.execute(
-            "UPDATE predictions SET confidence = ?, explanation = ?, timestamp = ?, is_limited_data = ? "
-            "WHERE id = ?",
-            (confidence, explanation, datetime.utcnow().isoformat(), limited, existing["id"]),
+            "UPDATE predictions SET predicted_outcome = ?, confidence = ?, explanation = ?, timestamp = ?, "
+            "is_limited_data = ?, league = ?, model = ? WHERE id = ?",
+            (predicted_outcome, confidence, explanation, datetime.utcnow().isoformat(), limited, league,
+             model, existing["id"]),
         )
+        refresh_current(conn, player_name, stat_type, game_date, model)
         conn.commit()
         conn.close()
         return existing["id"]
@@ -206,9 +213,34 @@ def log_prediction(
         ),
     )
     row_id = cursor.lastrowid
+    refresh_current(conn, player_name, stat_type, game_date, model)
     conn.commit()
     conn.close()
     return row_id
+
+
+# is_current: 1 for the latest prediction (timestamp, then id) per (player_name, stat_type,
+# game_date, model); 0 for the earlier ones it superseded. Every row is kept; History stats
+# count current rows only. A row without game_date is never grouped (each stays current).
+_CURRENT_SQL = """
+    UPDATE predictions SET is_current = CASE WHEN game_date IS NULL OR id = (
+        SELECT p2.id FROM predictions p2
+        WHERE p2.player_name = predictions.player_name AND p2.stat_type = predictions.stat_type
+          AND p2.game_date = predictions.game_date
+          AND COALESCE(p2.model, 'frozen') = COALESCE(predictions.model, 'frozen')
+        ORDER BY p2.timestamp DESC, p2.id DESC LIMIT 1) THEN 1 ELSE 0 END
+"""
+
+
+def refresh_current(conn, player_name: str | None = None, stat_type: str | None = None,
+                    game_date: str | None = None, model: str | None = None) -> None:
+    """Recompute is_current for one (player, stat, game_date, model) group, or for every row."""
+    if player_name is None:
+        conn.execute(_CURRENT_SQL)
+    else:
+        conn.execute(_CURRENT_SQL + " WHERE player_name = ? AND stat_type = ? AND "
+                     "COALESCE(game_date, '') = COALESCE(?, '') AND COALESCE(model, 'frozen') = ?",
+                     (player_name, stat_type, game_date, model))
 
 
 # ---------------------------------------------------------------------------

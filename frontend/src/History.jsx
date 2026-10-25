@@ -134,7 +134,7 @@ function PredictionRow({ prediction: p, isEditing, editValue, onEdit, onEditChan
     : '—'
 
   return (
-    <tr style={{ backgroundColor: stripe ? 'var(--bg-stripe)' : 'transparent' }}>
+    <tr style={{ backgroundColor: stripe ? 'var(--bg-stripe)' : 'transparent', opacity: p.is_current === 0 ? 0.45 : 1 }}>
       <td className="px-2 py-2 text-xs truncate" style={{ color: 'var(--text-muted)' }}>{dateStr}</td>
       <td className="px-2 py-2 text-xs truncate" style={{ color: 'var(--text-muted)' }}>{gameDateStr}</td>
       <td className="px-2 py-2 truncate" style={{ color: 'var(--text-secondary)' }}>

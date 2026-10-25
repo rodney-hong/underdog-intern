@@ -38,3 +38,17 @@ test('rows without the flag (null) are counted; no resolved rows gives dashes', 
   assert.equal(s.accuracy, '—')
   assert.ok(s.tiers.every((t) => t.value === '—'))
 })
+
+test('superseded rows are excluded from Total, Accuracy and every bucket', () => {
+  const sup = (c, pr, a) => ({ ...row(c, pr, a), is_current: 0 })
+  const s = historySummary([
+    sup(0.55, 'OVER', 'UNDER'),       // earlier pick, same player/stat/game/model
+    { ...row(0.65, 'UNDER', 'UNDER'), is_current: 1 },
+    row(0.75, 'OVER', 'OVER'),        // rows without the field count as current
+  ])
+  assert.equal(s.total, 2)
+  assert.equal(s.resolved, 2)
+  assert.equal(s.accuracy, '100.0%')
+  assert.deepEqual(s.tiers.map((t) => t.sub), ['0 games', '1 game', '1 game'])
+  assert.equal(s.limitedCount, 0)
+})
