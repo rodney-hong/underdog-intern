@@ -731,3 +731,60 @@ Recorded on 2026-10-23 at about 13:45 ET. paper_predictions held 664 rows with s
 - From commit e29cf56, the ETL may run at any time except within 10 minutes of a scheduled pull or while a pre-tip job runs (pre-tip lock); the 90-minute pre-tip and 60-minute pull guards in the data-freshness entry no longer apply. Tables are swapped atomically, so a pre-tip job sees either the previous or the new box scores, never a partial load.
 - Consequence: paper rows within one slate may be built on different Kaggle versions. Each row's data_as_of records which. Analysis rules are unchanged.
 - Sync also runs at backend startup and on demand (Sync now).
+
+## Entry: challenger Stage 2, one-shot test on 2025-26 (drafted 2026-10-24)
+
+Recorded before any 2025-26 game has been loaded, fitted on or scored by the challenger or its baseline. Stage 1 (commit 0169636) used seasons through 2024-25 only. Its loader, inference and tests assert this (backend/challenger/guard.py). Development results: backend/experiments/results/challenger_stage1_20261024T200132.md. Earlier sections are unchanged.
+
+### Frozen design
+- Code: backend/challenger/ at commit 0169636. Features (features.py), model (model.py), inference (inference.py). Nothing in them changes for Stage 2 except guard.py (see "Unlock").
+- Rows: played (numMinutes > 0) games of type "Regular Season" or "NBA Emirates Cup". Training rows need at least 1 earlier played regular-season game. Scored rows need at least 5. NULL team ids are filled from (city, name) as in features.load_team_map. Rows that still have no team id are dropped and counted.
+- Features: every feature uses only games that tip before the target game.
+  - Minutes model: EWMA of minutes (half-lives 3, 10 and 30 games), rest days (capped at 10), back-to-back, home, team games missed since his previous game (capped at 20), games since returning from 5 or more missed team games (capped at 10), prior games, prior seasons.
+  - Rate models: EWMA per-minute stat (half-lives 3, 10 and 30), EWMA usage (3, 10 and 30), opponent's allowed stat over its last 5 games divided by the league mean over the last 300 team-games, home. Points also uses prior games. 3PM also uses EWMA 3PA per minute (3, 10 and 30).
+- Hyperparameters: HistGradientBoosting with learning rate 0.05, no early stopping and random_state 7.
+  - Minutes: squared error, 500 iterations, 15 leaves, min leaf 500.
+  - Rates: Poisson loss on stat/minutes, weighted by minutes, 200 iterations, 15 leaves. Min leaf is 500 for Points and 3PM and 100 for Rebounds and Assists.
+  - mu = max(E[minutes], 1) × rate. Y ~ NB2(mu, alpha).
+- Training: seasons 2012-13 to 2024-25. Alpha per stat is the MLE on out-of-fold predictions over 4 contiguous season blocks: Points 0.3172, Rebounds 0.1107, Assists 0.0963, 3PM 0.1342.
+- Model file: backend/challenger/models/challenger_stage2_frozen.pkl.
+  - File SHA-256: 0e4fa88fee927f70d8b2a6679310f36b5f12b099d1861266cab11ae53723d604.
+  - Content fingerprint (model.fingerprint): d18451fedc40b51e0c7d29b50ba07515ec6b935bd4597d63b2ffee913b81ee7f.
+  - Stage 2 loads this file with expected_sha set. It is not refitted. A refit with the same code and data reproduces the fingerprint (checked 2026-10-24), not the file bytes.
+- Baseline (b), frozen the same way: experiments/per_player_models.py's pooled HGB.
+  - Features: FEATS. Hyperparameters: fit_pooled.
+  - Training: seasons 2012-13 to 2024-25. Alpha is the MLE on out-of-fold predictions over the same blocks.
+  - File: backend/challenger/models/baseline_b_stage2_frozen.pkl.
+  - File SHA-256: 59f96ad61a1d900184229995770ff7102d617c86bd5e7a423ea2e0dd3bcd0370.
+  - Content fingerprint: e2b7233d06e8b8a513ae8c3e2a46f2c9817810fd0ba61ac749540dcb406f7bd1.
+- The model files are kept outside git. Copies are in backend/backups/challenger_models_2026-10-24/; their SHA-256s were checked against the values above on 2026-10-24.
+
+### Unlock
+- Stage 2 starts with one commit that changes guard.py: DATA_END becomes 2026-07-01 and FORBIDDEN_SEASONS becomes {2026-27}. It also adds the Stage 2 scoring script. No other challenger file changes. 2026-27 stays excluded.
+- Features for 2025-26 rows come from the same build_features() over data through 2025-26. Features are closed-left, so they equal live pre-tip inference (parity test: tests/test_challenger.py). challenger_predict is spot-checked on 50 random scored rows. Any mismatch is reported.
+
+### Test set
+- 2025-26 regular season, rows as above. Each player-game-stat is one row for each of Points, Rebounds, Assists and 3PM. No line data is used, and no backfilled line (historical.db) enters this test.
+- The Kaggle version and the row and game counts are recorded when the test is run.
+- The test is computed once. No hyperparameter, feature, file or rule changes after any 2025-26 result is seen.
+
+### Primary metric and pass rule
+- Primary: the mean per-row difference in NB log-likelihood, challenger minus baseline (b), pooled over the four stats.
+- Uncertainty: game-clustered bootstrap over game ids, 2,000 resamples, seed 20261024, percentile 95% CI.
+- Pass iff the lower bound of the 95% CI is above 0.
+- Development reference (2024-25, dev models trained through 2023-24): +0.0067 [+0.0048, +0.0085] over 1,224 games.
+- Passing shows better stat forecasts than baseline (b). It is not evidence of an edge against the market; that requires a separate line-based test with its own entry.
+
+### Consequence
+- If the test passes, the challenger is frozen as-is (this file hash and fingerprint), logs its predictions to its own table from the next game day, and drives the app; the frozen 2026-27 models keep logging the paper rows unchanged. If it fails, it is not promoted, and the result is reported.
+
+### Secondary (reported, not decisive)
+- The same difference per stat, and per experience bucket (rookie, 1–3, 4+ prior seasons), each with its bootstrap CI.
+- Challenger minus baseline (a), the last-10 average with an NB alpha fitted on 2012-13 to 2024-25.
+- MAE.
+- Calibration of P(stat > L) at five lines per row: the player's median of his last 20 earlier games (min 5), median ± 2, and the nearest x4.5/x9.5 rungs below (≤) and above (>) the median. Lines below 0 are dropped. Over = stat > L.
+  - Per stat and line: Brier score, log loss, ECE, and a reliability table over 10 equal-width bins (mean P, observed rate, n). All three models are scored on the same rows.
+- Known from development: Points P(over) is over-confident above 0.7 (observed 0.60–0.73 on 2024-25); its calibration on 2025-26 is reported.
+- Evaluating the challenger on real or backfilled book lines needs its own dated entry, as in "Test A on backfilled historical lines".
+
+No result on 2025-26 had been computed when this entry was written.
