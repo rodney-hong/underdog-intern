@@ -246,17 +246,18 @@ function OpponentInjuryReport({ injuries, opponentName }) {
 // stat, counting only picks resolved before this prediction. Never alters the result.
 const TRACK_RECORD_SHOW_N = 5   // below this, only "not enough picks yet"; "small sample" until tr.enough (n >= 20)
 
-function TrackRecordLine({ player, stat, league, predictionId }) {
+function TrackRecordLine({ player, stat, league, predictionId, model }) {
   const [tr, setTr] = useState(null)
   useEffect(() => {
     setTr(null)
     if (!player || !stat || predictionId == null) return
     let live = true
-    fetchTrackRecord({ player, stat, league, before: predictionId })
+    // the record of the model that made this pick
+    fetchTrackRecord({ player, stat, league, before: predictionId, model: model || 'all' })
       .then((d) => { if (live) setTr(d) })
       .catch(() => {})
     return () => { live = false }
-  }, [player, stat, league, predictionId])
+  }, [player, stat, league, predictionId, model])
   if (!tr) return null
   return (
     <p className="text-xs" style={{ color: 'var(--text-muted)' }}>
@@ -290,7 +291,8 @@ function ResultCard({ result, player, stat, league }) {
       <p className="text-sm leading-relaxed border-t pt-4" style={{ color: 'var(--text-secondary)', borderTopColor: 'var(--border)' }}>
         {result.explanation}
       </p>
-      <TrackRecordLine player={player} stat={stat} league={league} predictionId={result.prediction_id} />
+      <TrackRecordLine player={player} stat={stat} league={league} predictionId={result.prediction_id}
+                       model={result.model} />
     </div>
   )
 }

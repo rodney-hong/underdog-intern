@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from 'react'
-import { fetchTrackRecord, pct, rangeStr } from './trackRecord'
+import { fetchTrackRecord, pct, rangeStr, TRACK_MODEL } from './trackRecord'
 import { historySummary } from './historyStats'
 
 const API = 'http://localhost:8000'
@@ -55,16 +55,17 @@ function FilterSelect({ value, onChange, options }) {
 // Prediction row
 // ---------------------------------------------------------------------------
 
-// Player name with a hover tooltip: the app's current track record on this player
-// and stat (resolved picks only). Fixed-positioned so the truncating cell can't clip it.
-function PlayerName({ name, stat, league }) {
+// Player name with a hover tooltip: the app's track record on this player and stat for the
+// model filter's choice, over the rows the stats cards count (current, not limited-data,
+// resolved). Fixed-positioned so the truncating cell can't clip it.
+function PlayerName({ name, stat, league, model }) {
   const [tip, setTip] = useState(null)   // { x, y, tr, error }
 
   const show = (e) => {
     const r = e.currentTarget.getBoundingClientRect()
     const pos = { x: r.left, y: r.bottom + 6 }
     setTip({ ...pos, tr: null })
-    fetchTrackRecord({ player: name, stat, league })
+    fetchTrackRecord({ player: name, stat, league, model })
       .then((tr) => setTip((t) => (t ? { ...t, tr } : t)))
       .catch(() => setTip((t) => (t ? { ...t, error: true } : t)))
   }
@@ -104,7 +105,7 @@ function PlayerName({ name, stat, league }) {
   )
 }
 
-function PredictionRow({ prediction: p, isEditing, editValue, onEdit, onEditChange, onEditConfirm, onEditCancel, stripe }) {
+function PredictionRow({ prediction: p, isEditing, editValue, onEdit, onEditChange, onEditConfirm, onEditCancel, stripe, model }) {
   const isOver = p.predicted_outcome === 'OVER'
   const isDNP = p.actual_result === 'DNP'
   const isResolved = p.actual_result !== null && !isDNP
@@ -142,7 +143,7 @@ function PredictionRow({ prediction: p, isEditing, editValue, onEdit, onEditChan
       <td className="px-2 py-2 text-xs truncate" style={{ color: 'var(--text-muted)' }}>{dateStr}</td>
       <td className="px-2 py-2 text-xs truncate" style={{ color: 'var(--text-muted)' }}>{gameDateStr}</td>
       <td className="px-2 py-2 truncate" style={{ color: 'var(--text-secondary)' }}>
-        <PlayerName name={p.player_name} stat={p.stat_type} league={p.league ?? 'NBA'} />
+        <PlayerName name={p.player_name} stat={p.stat_type} league={p.league ?? 'NBA'} model={model} />
         {!!p.is_limited_data && (
           <span className="ml-1.5 rounded px-1 py-0.5 text-[10px] font-medium"
                 style={{ backgroundColor: 'var(--bg-tertiary)', color: 'var(--text-muted)' }}
@@ -429,6 +430,7 @@ export default function History() {
                     onEditConfirm={() => handleOverride(p.id)}
                     onEditCancel={() => setEditingId(null)}
                     stripe={i % 2 === 1}
+                    model={TRACK_MODEL[modelFilter]}
                   />
                 ))}
               </tbody>

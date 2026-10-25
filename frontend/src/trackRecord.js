@@ -4,8 +4,9 @@
 const API = 'http://localhost:8000'
 const cache = new Map()
 
-export function fetchTrackRecord({ player, stat, league = 'NBA', before }) {
-  const qs = new URLSearchParams({ stat, league })
+// model: challenger | frozen | challenger_retro | all (challenger + frozen), as History's filter
+export function fetchTrackRecord({ player, stat, league = 'NBA', before, model = 'all' }) {
+  const qs = new URLSearchParams({ stat, league, model })
   if (before != null) qs.set('before', String(before))
   const url = `${API}/players/${encodeURIComponent(player)}/track-record?${qs}`
   if (!cache.has(url)) {
@@ -30,3 +31,7 @@ export const rangeStr = (tr) =>
   tr?.raw_rate_ci95
     ? `${Math.round(tr.raw_rate_ci95[0] * 100)}–${Math.round(tr.raw_rate_ci95[1] * 100)}%`
     : '—'
+
+// History's model filter label -> the track record's model parameter
+export const TRACK_MODEL = { Challenger: 'challenger', Frozen: 'frozen', 'Challenger retro': 'challenger_retro',
+                             All: 'all' }

@@ -375,14 +375,19 @@ def get_player_track_record(
     stat: str = Query(default="Points"),
     league: str = Query(default="NBA"),
     before: str | None = Query(default=None, description="prediction id or ISO timestamp"),
+    model: str = Query(default="all", description="challenger | frozen | challenger_retro | all"),
 ):
     """
     The app's own record on this player and stat, from the predictions table only
-    (never paper_predictions). Display-only: it does not feed the model. With
-    `before`, only picks whose game was on an earlier ET date than that prediction.
+    (never paper_predictions), over the rows History's stats cards count (current,
+    not limited-data, resolved) for `model` (all = challenger + frozen). Display-only:
+    it does not feed the model. With `before`, only picks whose game was on an earlier
+    ET date than that prediction.
     """
+    if model not in database.TRACK_RECORD_MODELS:
+        raise HTTPException(status_code=422, detail=f"model must be one of {sorted(database.TRACK_RECORD_MODELS)}")
     try:
-        return database.player_track_record(player_name, stat, league, before)
+        return database.player_track_record(player_name, stat, league, before, model)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail=str(exc).strip("'"))
     except ValueError:

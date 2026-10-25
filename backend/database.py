@@ -289,34 +289,38 @@ def _track_record_cutoff(conn, before: str | None) -> str | None:
     return ts.astimezone(ZoneInfo("America/New_York")).date().isoformat()
 
 
+# History's model filter: which predictions.model values each choice covers ('all' = the live
+# picks, challenger + frozen; retro rows only under their own choice).
+TRACK_RECORD_MODELS = {"challenger": ("challenger",), "frozen": ("frozen",),
+                       "challenger_retro": ("challenger_retro",), "all": ("challenger", "frozen")}
+
+
 def player_track_record(player_name: str, stat_type: str = "Points", league: str = "NBA",
-                        before: str | None = None) -> dict:
+                        before: str | None = None, model: str = "all") -> dict:
     """
-    The app's own record on this player and stat: resolved picks only (actual_result
-    OVER/UNDER; DNP and pending excluded), one row per (player, stat, line,
-    opponent, game date) — the latest id when duplicated — and, with `before`,
-    only games dated before the reference prediction's ET date. A pick wins when
-    predicted_outcome == actual_result. overall_rate uses the same filters for
-    every player; adjusted_rate shrinks raw_rate toward it with TRACK_RECORD_K.
+    The app's own record on this player and stat, over the rows History's stats cards count:
+    current (not superseded), not limited-data, resolved (actual_result OVER/UNDER; DNP and
+    pending excluded), for `model` (TRACK_RECORD_MODELS: challenger, frozen, challenger_retro,
+    or all = challenger + frozen). With `before`, only games dated before the reference
+    prediction's ET date. A pick wins when predicted_outcome == actual_result. overall_rate
+    uses the same filters for every player; adjusted_rate shrinks raw_rate toward it with
+    TRACK_RECORD_K. ValueError for an unknown model.
     """
+    if model not in TRACK_RECORD_MODELS:
+        raise ValueError(f"model must be one of {sorted(TRACK_RECORD_MODELS)}")
+    models = TRACK_RECORD_MODELS[model]
     conn = get_connection()
     try:
         cutoff = _track_record_cutoff(conn, before)
-        sql = """
-            SELECT player_name, predicted_outcome, actual_result FROM (
-                SELECT player_name, predicted_outcome, actual_result,
-                       ROW_NUMBER() OVER (
-                           PARTITION BY player_name, stat_type, stat_line, opponent_team,
-                                        COALESCE(game_date, substr(timestamp, 1, 10))
-                           ORDER BY id DESC) AS rn
-                FROM predictions
-                WHERE stat_type = ? AND COALESCE(league, 'NBA') = ?
-                  AND actual_result IN ('OVER', 'UNDER')
-                  AND COALESCE(model, 'frozen') != 'challenger_retro'
-                  AND (? IS NULL OR COALESCE(game_date, substr(timestamp, 1, 10)) < ?)
-            ) WHERE rn = 1
+        sql = f"""
+            SELECT player_name, predicted_outcome, actual_result FROM predictions
+            WHERE stat_type = ? AND COALESCE(league, 'NBA') = ?
+              AND actual_result IN ('OVER', 'UNDER')
+              AND COALESCE(is_current, 1) = 1 AND COALESCE(is_limited_data, 0) = 0
+              AND COALESCE(model, 'frozen') IN ({', '.join('?' * len(models))})
+              AND (? IS NULL OR COALESCE(game_date, substr(timestamp, 1, 10)) < ?)
         """
-        rows = conn.execute(sql, (stat_type, league, cutoff, cutoff)).fetchall()
+        rows = conn.execute(sql, (stat_type, league, *models, cutoff, cutoff)).fetchall()
     finally:
         conn.close()
 
@@ -329,7 +333,7 @@ def player_track_record(player_name: str, stat_type: str = "Points", league: str
     adjusted = (wins + TRACK_RECORD_K * overall) / (n + TRACK_RECORD_K) if overall is not None else None
     ci = _wilson_interval(wins, n)
     return {
-        "player_name": player_name, "stat_type": stat_type, "league": league,
+        "player_name": player_name, "stat_type": stat_type, "league": league, "model": model,
         "before_date": cutoff,
         "wins": wins, "losses": n - wins, "n": n,
         "raw_rate": wins / n if n else None,
