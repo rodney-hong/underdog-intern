@@ -139,6 +139,10 @@ def init_db():
         conn.execute("UPDATE predictions SET model = 'frozen' WHERE model IS NULL")
     if "is_current" not in existing_cols:
         conn.execute("ALTER TABLE predictions ADD COLUMN is_current INTEGER")
+    if "retro_of" not in existing_cols:
+        # model = 'challenger_retro' rows: the frozen app prediction they re-score
+        # (experiments/retro_challenger.py); exploratory, never in the default stats
+        conn.execute("ALTER TABLE predictions ADD COLUMN retro_of INTEGER")
     refresh_current(conn)          # recomputed for every row on each start (idempotent)
     conn.commit()
     try:   # display-only flag; a failure must never stop startup
@@ -308,6 +312,7 @@ def player_track_record(player_name: str, stat_type: str = "Points", league: str
                 FROM predictions
                 WHERE stat_type = ? AND COALESCE(league, 'NBA') = ?
                   AND actual_result IN ('OVER', 'UNDER')
+                  AND COALESCE(model, 'frozen') != 'challenger_retro'
                   AND (? IS NULL OR COALESCE(game_date, substr(timestamp, 1, 10)) < ?)
             ) WHERE rn = 1
         """
@@ -427,9 +432,12 @@ def _person_id(conn, player_name: str, index: tuple[dict, dict], day: tuple[str,
     full-name match wins; only a name with no exact match falls back to name_key.
     Several personIds under one name (two Jaylin Williams; stray players-table ids
     for Luka Doncic) narrow to the one who played the stored opponent that day,
-    else who played that day, else the only one with a box score in the year
-    before. Still more than one: ambiguous, never guessed.
+    else who played that day, else the only one with a counted game in the year
+    before, else the only one with any box score in the year before (stray ids
+    carry a single preseason exhibition row). Still more than one: ambiguous,
+    never guessed.
     """
+    import game_types
     import rosters
     exact, loose = index
     ids = exact.get(_ascii_normalize(player_name)) or loose.get(rosters.name_key(player_name))
@@ -441,10 +449,15 @@ def _person_id(conn, player_name: str, index: tuple[dict, dict], day: tuple[str,
     for cond, args in (
             ("gameDateTimeEst >= ? AND gameDateTimeEst < ? AND opponentteamName = ?", (*day, opp_nickname)),
             ("gameDateTimeEst >= ? AND gameDateTimeEst < ?", day),
+            (f"gameDateTimeEst >= date(?, '-365 days') AND gameDateTimeEst < ? "
+             f"AND gameType IN ({game_types.COUNTED_SQL})", (day[0], day[0])),
             ("gameDateTimeEst >= date(?, '-365 days') AND gameDateTimeEst < ?", (day[0], day[0]))):
-        found = {r[0] for r in conn.execute(
-            f"SELECT DISTINCT personId FROM player_stats WHERE personId IN ({marks}) AND {cond}",
-            (*ids, *args))}
+        try:
+            found = {r[0] for r in conn.execute(
+                f"SELECT DISTINCT personId FROM player_stats WHERE personId IN ({marks}) AND {cond}",
+                (*ids, *args))}
+        except sqlite3.OperationalError:          # a table without gameType: skip that step
+            continue
         if len(found) == 1:
             return found.pop(), None
         if found:
@@ -478,25 +491,42 @@ def _cached_person_index(conn) -> tuple[dict, dict]:
     return _person_index_cache[key]
 
 
+def _day_and_opponent(game_date: str | None, opponent_team: str) -> tuple[tuple[str, str], str]:
+    from zoneinfo import ZoneInfo
+    gd = game_date or datetime.now(ZoneInfo("America/New_York")).date().isoformat()
+    opp = (opponent_team or "").strip()
+    return ((gd, (date.fromisoformat(gd) + timedelta(days=1)).isoformat()),
+            "Trail Blazers" if "Blazers" in opp else (opp.split()[-1] if opp else ""))
+
+
+def resolve_person_id(conn, player_name: str, game_date: str | None = None,
+                      opponent_team: str = "") -> int | None:
+    """The one personId for a player name in a game (_person_id's rules), or None. Used by
+    /predict (player_data_counts), the screenshot table (range flag, person_id) and the
+    retro comparison, so all of them read the same player's history."""
+    day, opp_nickname = _day_and_opponent(game_date, opponent_team)
+    return _person_id(conn, player_name.strip(), _cached_person_index(conn), day, opp_nickname)[0]
+
+
 def player_data_counts(conn, player_name: str, game_date: str | None, opponent_team: str = "",
-                       index: tuple[dict, dict] | None = None) -> dict:
+                       index: tuple[dict, dict] | None = None, person_id: int | None = None) -> dict:
     """
     From player_stats, by personId (the resolver's exact-name mapping, _person_id):
       rs_total             regular-season games loaded, any date;
       rs_before_season     regular-season games before SEASON_2026_27_START;
       counted_before_game  counted games (game_types.COUNTED_SQL) before game_date.
     person_id None (name matches no player, or several and they can't be narrowed):
-    the before-counts are None and rs_total is the most any candidate has.
+    the before-counts are None and rs_total is the most any candidate has. A given
+    person_id (a player chosen by personId in the app) is used as is.
     """
     import game_types
     import rosters
     from zoneinfo import ZoneInfo
     index = index or _cached_person_index(conn)
-    gd = game_date or datetime.now(ZoneInfo("America/New_York")).date().isoformat()
-    day = (gd, (date.fromisoformat(gd) + timedelta(days=1)).isoformat())
-    opp = (opponent_team or "").strip()
-    opp_nickname = "Trail Blazers" if "Blazers" in opp else (opp.split()[-1] if opp else "")
-    person_id, _ = _person_id(conn, player_name.strip(), index, day, opp_nickname)
+    day, opp_nickname = _day_and_opponent(game_date, opponent_team)
+    gd = day[0]
+    if person_id is None:
+        person_id, _ = _person_id(conn, player_name.strip(), index, day, opp_nickname)
     rs = ", ".join(f"'{t}'" for t in REGULAR_SEASON_GAME_TYPES)
 
     def rs_total(pid):

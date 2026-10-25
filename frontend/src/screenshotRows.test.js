@@ -1,13 +1,15 @@
 // Run: node --test src/screenshotRows.test.js (from frontend/).
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { toEditable, isReady, predictBody } from './screenshotRows.js'
+import { toEditable, isReady, predictBody, selectPlayer, typePlayer } from './screenshotRows.js'
 
 const extracted = {
   player_name: 'Giannis Antetokounmpo', resolved_player: 'Giannis Antetokounmpo', stat: 'Points',
   line: 27.5, higher_multiplier: 1.03, lower_multiplier: 0.88, opponent_team: 'Charlotte Hornets',
-  is_home: false, is_back_to_back: true, game_date: '2026-10-24', flags: [],
+  is_home: false, is_back_to_back: true, game_date: '2026-10-24', flags: [], match: 'ok', person_id: 203507,
 }
+const unresolved = { ...extracted, resolved_player: '', match: 'not_found', person_id: null,
+                     opponent_team: '', is_home: false, is_back_to_back: false, game_date: null }
 
 test('a resolved row becomes the same body the manual form sends', () => {
   const r = toEditable(extracted, 0)
@@ -15,6 +17,7 @@ test('a resolved row becomes the same body the manual form sends', () => {
   assert.deepEqual(predictBody(r), {
     player_name: 'Giannis Antetokounmpo', opponent_team: 'Charlotte Hornets', stat_line: 27.5,
     stat_type: 'Points', is_home: false, is_back_to_back: true, game_date: '2026-10-24', league: 'NBA',
+    person_id: 203507,
   })
 })
 
@@ -25,10 +28,23 @@ test('unresolved player, unsupported stat or missing opponent is not ready', () 
   assert.equal(isReady({ ...toEditable(extracted, 0), stat_line: '0' }), false)
 })
 
-test('edits are what gets predicted', () => {
-  const r = { ...toEditable({ ...extracted, resolved_player: '' }, 0), player_name: ' Jalen Williams ', stat_line: '5.5' }
+test('an unresolved row is ready only once a player is picked in its search', () => {
+  const typed = typePlayer({ ...toEditable(unresolved, 0) }, 'Luka Don')
+  assert.equal(isReady(typed), false)
+  const team = { player_team: { full: 'Los Angeles Lakers' }, next_opponent: { full: 'Utah Jazz' },
+                 is_home: false, is_back_to_back: true, next_game_date: '2026-10-25' }
+  const r = selectPlayer(typed, 'Luka Doncic', { name: 'Luka Doncic', person_id: 1629029, team: 'LAL' }, team)
   assert.ok(isReady(r))
-  assert.equal(predictBody(r).player_name, 'Jalen Williams')
+  assert.deepEqual(predictBody(r), {
+    player_name: 'Luka Doncic', opponent_team: 'Utah Jazz', stat_line: 27.5, stat_type: 'Points',
+    is_home: false, is_back_to_back: true, game_date: '2026-10-25', league: 'NBA', person_id: 1629029,
+  })
+  assert.equal(isReady(typePlayer(r, 'Luka')), false)        // typing again un-picks
+})
+
+test('a resolved row keeps edits to line and stat', () => {
+  const r = { ...toEditable(extracted, 0), stat_line: '5.5' }
+  assert.ok(isReady(r))
   assert.equal(predictBody(r).stat_line, 5.5)
 })
 

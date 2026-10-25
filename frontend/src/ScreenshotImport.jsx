@@ -1,5 +1,6 @@
 import { useState } from 'react'
-import { SCREENSHOT_STATS, toEditable, isReady, predictBody } from './screenshotRows'
+import { SCREENSHOT_STATS, toEditable, isReady, predictBody, selectPlayer, typePlayer } from './screenshotRows'
+import PlayerSearch from './components/PlayerSearch'
 
 const API = 'http://localhost:8000'
 
@@ -43,6 +44,17 @@ export default function ScreenshotImport({ teams }) {
   const update = (key, field, value) =>
     setRows((rs) => rs.map((r) => (r.key === key ? { ...r, [field]: value } : r)))
   const remove = (key) => setRows((rs) => rs.filter((r) => r.key !== key))
+  const edit = (key, fn) => setRows((rs) => rs.map((r) => (r.key === key ? fn(r) : r)))
+
+  // An unresolved row's player picked in its search: the same team lookup the manual form makes
+  const pick = async (key, name, suggestion) => {
+    edit(key, (r) => selectPlayer(r, name, suggestion, null))
+    try {
+      const res = await fetch(`${API}/players/${encodeURIComponent(name)}/team`)
+      const team = res.ok ? await res.json() : null
+      edit(key, (r) => (r.player_name === name ? selectPlayer(r, name, suggestion, team) : r))
+    } catch {}
+  }
 
   const predictAll = async () => {
     setPredicting(true)
@@ -118,11 +130,18 @@ export default function ScreenshotImport({ teams }) {
                         style={{ backgroundColor: i % 2 ? 'var(--bg-stripe)' : 'transparent' }}>
                       <td className="px-2 py-2">
                         <div className="relative">
-                          <input className={`${cell} ${r.alerts.length ? 'pr-8' : ''}`} value={r.player_name}
-                                 placeholder={r.card_name}
-                                 onChange={(e) => update(r.key, 'player_name', e.target.value)} />
+                          {r.searchable ? (
+                            <PlayerSearch value={r.player_name} placeholder={r.card_name} label={null} compact
+                                          onChange={(q) => edit(r.key, (x) => typePlayer(x, q))}
+                                          onSelect={(name, s) => pick(r.key, name, s)}
+                                          onClear={() => edit(r.key, (x) => typePlayer(x, ''))} />
+                          ) : (
+                            <input className={`${cell} ${r.alerts.length ? 'pr-8' : ''}`} value={r.player_name}
+                                   placeholder={r.card_name}
+                                   onChange={(e) => edit(r.key, (x) => ({ ...x, player_name: e.target.value, person_id: null }))} />
+                          )}
                           {r.alerts.length > 0 && (
-                            <span className="absolute right-3 top-1/2 -translate-y-1/2 cursor-help"
+                            <span className={`absolute ${r.searchable ? 'right-9' : 'right-3'} top-1/2 -translate-y-1/2 cursor-help`}
                                   title={r.alerts.join('\n')} style={{ color: 'var(--warning)' }}>⚑</span>
                           )}
                         </div>

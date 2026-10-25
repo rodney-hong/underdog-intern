@@ -167,6 +167,7 @@ class PredictRequest(BaseModel):
     is_back_to_back: bool = False
     game_date: str | None = None
     league: str = "NBA"
+    person_id: int | None = None      # a player chosen by personId (screenshot table); else resolved by name
 
     @field_validator("stat_type")
     @classmethod
@@ -314,12 +315,15 @@ def predict_prop(req: PredictRequest):
     if req.league != "WNBA":
         conn = database.get_connection()
         try:
-            counts = database.player_data_counts(conn, req.player_name, req.game_date, req.opponent_team)
+            counts = database.player_data_counts(conn, req.player_name, req.game_date, req.opponent_team,
+                                                 person_id=req.person_id)
         finally:
             conn.close()
         if counts["rs_total"] == 0:
             raise HTTPException(status_code=422, detail="Not enough NBA games")
     if req.league != "WNBA" and req.stat_type in CHALLENGER_STATS:
+        if counts["person_id"] is None:     # several players share the name and none can be picked
+            raise HTTPException(status_code=422, detail="Several players match this name; pick one")
         result, model = _challenger_prediction(req, counts["person_id"]), "challenger"
     else:
         _predict_fn = predictor.predict_wnba if req.league == "WNBA" else predictor.predict

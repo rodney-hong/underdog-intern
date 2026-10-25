@@ -372,35 +372,22 @@ def resolve_player(conn, name: str, team: str | None) -> dict:
     return {"status": "ambiguous" if hits else "not_found"}
 
 
-def historical_range(conn, player_name: str, stat: str) -> dict | None:
-    """min / max of the stat over his last RANGE_GAMES counted games, or None if none."""
+def historical_range(conn, person_id: int | None, stat: str) -> dict | None:
+    """min / max of the stat over the player's last RANGE_GAMES counted games, or None if none.
+    person_id comes from database.resolve_person_id, the same resolver /predict uses."""
     import database
     import game_types
     cols = database._RESOLVE_STAT_COLS.get(stat)
-    if not cols or stat not in SUPPORTED_STATS:
-        return None
-    exact, loose = database._cached_person_index(conn)
-    import rosters
-    ids = exact.get(database._ascii_normalize(player_name)) or loose.get(rosters.name_key(player_name))
-    if not ids or len(ids) != 1:
+    if person_id is None or not cols or stat not in SUPPORTED_STATS:
         return None
     rows = conn.execute(
         f"SELECT {cols[0]} FROM player_stats WHERE personId = ? AND gameType IN ({game_types.COUNTED_SQL}) "
         f"AND {cols[0]} IS NOT NULL ORDER BY gameDateTimeEst DESC LIMIT ?",
-        (next(iter(ids)), RANGE_GAMES)).fetchall()
+        (int(person_id), RANGE_GAMES)).fetchall()
     if not rows:
         return None
     vals = [float(r[0]) for r in rows]
     return {"min": min(vals), "max": max(vals), "games": len(vals)}
-
-
-def _person_id(conn, player_name: str) -> int | None:
-    """personId for a resolved roster name: exact name, else name_key; only if unique."""
-    import database
-    import rosters
-    exact, loose = database._cached_person_index(conn)
-    ids = exact.get(database._ascii_normalize(player_name)) or loose.get(rosters.name_key(player_name))
-    return next(iter(ids)) if ids and len(ids) == 1 else None
 
 
 def logged_underdog_line(conn, player_name: str, team_name: str, stat: str,
@@ -531,15 +518,17 @@ def confirmation_rows(rows: list[dict], context_fn=None, record: bool = True) ->
                 row.update(opponent_team=ctx.get("next_opponent_full") or "",
                            is_home=bool(ctx.get("is_home")), is_back_to_back=bool(ctx.get("is_back_to_back")),
                            game_date=ctx.get("next_game_date"))
+                # the same personId /predict resolves from this row's name, game date and opponent
+                row["person_id"] = database.resolve_person_id(conn, who["player_name"], row["game_date"],
+                                                              row["opponent_team"])
                 if r["stat"]:
-                    rng = historical_range(conn, who["player_name"], r["stat"])
+                    rng = historical_range(conn, row["person_id"], r["stat"])
                     row["range"] = rng
                     if rng is None:
                         row["flags"].append("no game history for this stat")
                     elif not rng["min"] <= r["line"] <= rng["max"]:
                         row["flags"].append(f"line {r['line']:g} is outside his range "
                                             f"{rng['min']:g}–{rng['max']:g} (last {rng['games']} games)")
-                row["person_id"] = _person_id(conn, who["player_name"])
                 if r["stat"]:
                     row["logged_line"] = logged_underdog_line(conn, who["player_name"], who["team_name"],
                                                               r["stat"], today)

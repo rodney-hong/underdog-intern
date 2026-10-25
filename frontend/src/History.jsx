@@ -13,7 +13,11 @@ const ALL_STAT_TYPES = [
 const OUTCOME_FILTERS = ['All', 'Correct', 'Incorrect', 'Pending', 'DNP']
 const LEAGUE_FILTERS = ['All', 'NBA', 'NFL', 'WNBA']
 // Which model made the pick (predictions.model). Stats and table default to the challenger.
-const MODEL_FILTERS = ['Challenger', 'Frozen', 'All']
+// 'Challenger retro' rows re-score frozen picks after the fact (exploratory); 'All' is the
+// live picks only (challenger + frozen), so a retro row never double-counts a game.
+const MODEL_FILTERS = ['Challenger', 'Frozen', 'Challenger retro', 'All']
+const MODEL_KEYS = { Challenger: ['challenger'], Frozen: ['frozen'], 'Challenger retro': ['challenger_retro'],
+                     All: ['challenger', 'frozen'] }
 
 // ---------------------------------------------------------------------------
 // Summary cards
@@ -248,7 +252,7 @@ export default function History() {
 
   // Summary figures over the selected model's predictions (historyStats: DNP and
   // limited-data rows excluded)
-  const byModel = predictions.filter((p) => modelFilter === 'All' || (p.model ?? 'frozen') === modelFilter.toLowerCase())
+  const byModel = predictions.filter((p) => MODEL_KEYS[modelFilter].includes(p.model ?? 'frozen'))
   const summary = historySummary(byModel)
 
   // Filter pipeline

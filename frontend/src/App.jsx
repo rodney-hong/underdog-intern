@@ -1,7 +1,9 @@
-import { useState, useEffect, useRef, useCallback } from 'react'
+import { useState, useEffect } from 'react'
 import History from './History'
 import ScreenshotImport from './ScreenshotImport'
 import { fetchTrackRecord, pct, rangeStr } from './trackRecord'
+import { ClearButton, Label } from './components/fields'
+import PlayerSearch from './components/PlayerSearch'
 
 const API = 'http://localhost:8000'
 const STAT_TYPES = [
@@ -35,127 +37,10 @@ function MoonIcon() {
 // Utility components
 // ---------------------------------------------------------------------------
 
-function ClearButton({ onClick, visible }) {
-  if (!visible) return null
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      className="icon-btn absolute right-3 top-1/2 -translate-y-1/2 text-lg leading-none"
-      aria-label="Clear"
-    >
-      ×
-    </button>
-  )
-}
-
 function FieldWrapper({ children, visible }) {
   return (
     <div className={`transition-all duration-300 ${visible ? 'animate-slide-down opacity-100' : 'opacity-0 pointer-events-none h-0 overflow-hidden'}`}>
       {children}
-    </div>
-  )
-}
-
-function Label({ children }) {
-  return (
-    <label className="block text-xs font-semibold uppercase tracking-widest mb-1.5" style={{ color: 'var(--text-muted)' }}>
-      {children}
-    </label>
-  )
-}
-
-// ---------------------------------------------------------------------------
-// Player Search with autocomplete dropdown
-// ---------------------------------------------------------------------------
-
-function PlayerSearch({ value, onChange, onSelect, onClear, searchUrl, placeholder }) {
-  const [suggestions, setSuggestions] = useState([])
-  const [loading, setLoading] = useState(false)
-  const [open, setOpen] = useState(false)
-  const debounceRef = useRef(null)
-  const containerRef = useRef(null)
-
-  const fetchSuggestions = useCallback(async (q) => {
-    if (!q.trim()) { setSuggestions([]); setOpen(false); return }
-    setLoading(true)
-    try {
-      const url = searchUrl || `${API}/players/search`
-      const res = await fetch(`${url}?q=${encodeURIComponent(q)}`)
-      const data = await res.json()
-      setSuggestions(data)
-      setOpen(data.length > 0)
-    } catch {
-      setSuggestions([])
-    } finally {
-      setLoading(false)
-    }
-  }, [searchUrl])
-
-  const handleChange = (e) => {
-    const q = e.target.value
-    onChange(q)
-    clearTimeout(debounceRef.current)
-    debounceRef.current = setTimeout(() => fetchSuggestions(q), 300)
-  }
-
-  const handleSelect = (name) => {
-    setOpen(false)
-    setSuggestions([])
-    onSelect(name)
-  }
-
-  const handleClear = () => {
-    setSuggestions([])
-    setOpen(false)
-    onClear()
-  }
-
-  useEffect(() => {
-    const handler = (e) => {
-      if (containerRef.current && !containerRef.current.contains(e.target)) setOpen(false)
-    }
-    document.addEventListener('mousedown', handler)
-    return () => document.removeEventListener('mousedown', handler)
-  }, [])
-
-  return (
-    <div ref={containerRef} className="relative">
-      <Label>Player Search</Label>
-      <div className="relative">
-        <input
-          type="text"
-          value={value}
-          onChange={handleChange}
-          onFocus={() => suggestions.length > 0 && setOpen(true)}
-          placeholder={placeholder ?? 'Search players…'}
-          className="input-field w-full rounded-xl px-4 py-3 pr-10"
-        />
-        {loading && (
-          <span className="absolute right-3 top-1/2 -translate-y-1/2 text-sm" style={{ color: 'var(--text-muted)' }}>…</span>
-        )}
-        {!loading && <ClearButton visible={!!value} onClick={handleClear} />}
-      </div>
-      {open && (
-        <ul className="card absolute z-50 mt-1 w-full rounded-xl shadow-2xl overflow-hidden animate-slide-down">
-          {suggestions.map((s) => {
-            // NBA search returns {name, person_id, team}; WNBA search returns plain names.
-            const name = typeof s === 'string' ? s : s.name
-            return (
-              <li
-                key={typeof s === 'string' ? s : s.person_id}
-                onMouseDown={() => handleSelect(name)}
-                className="suggestion-item px-4 py-2.5 cursor-pointer text-sm"
-              >
-                {name}
-                {typeof s !== 'string' && s.team && (
-                  <span className="ml-2 text-xs" style={{ color: 'var(--text-muted)' }}>{s.team}</span>
-                )}
-              </li>
-            )
-          })}
-        </ul>
-      )}
     </div>
   )
 }
