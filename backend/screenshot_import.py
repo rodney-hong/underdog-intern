@@ -346,29 +346,47 @@ def normalize_row(r: dict) -> dict | None:
 # Resolving rows for the confirmation table (no prediction here)
 # ---------------------------------------------------------------------------
 
+# NBA-style abbreviations (what pick'em cards print) by nba_team_id, for the six teams whose
+# ESPN roster abbreviation differs (GS, NO, NY, SA, UTAH, WSH), plus common alternates.
+NBA_ABBREVS = {1610612744: {"GSW"}, 1610612740: {"NOP"}, 1610612752: {"NYK"}, 1610612759: {"SAS"},
+               1610612762: {"UTA"}, 1610612764: {"WAS"}, 1610612751: {"BRK"}, 1610612756: {"PHO"},
+               1610612766: {"CHO"}}
+
+
+def _team_names(h: dict) -> set:
+    """Every way a card can name this roster player's team."""
+    return ({str(h["team_abbrev"] or "").upper(), str(h["team_name"] or "").upper(),
+             f"{h['team_city']} {h['team_name']}".upper()} | NBA_ABBREVS.get(h.get("nba_team_id"), set())) - {""}
+
+
 def resolve_player(conn, name: str, team: str | None) -> dict:
     """
-    Exact name_key against the ESPN rosters, then the card's team (abbreviation or name)
-    if it shows one. Exactly one roster player left -> {"status": "ok", "player_name",
-    "team_abbrev", "team_name"}; none -> not_found; several -> ambiguous (left blank).
+    Exact name_key against the ESPN rosters, then the card's team (ESPN or NBA abbreviation,
+    nickname or full name) if it shows one. Exactly one roster player left -> {"status": "ok",
+    "player_name", "team_abbrev", "team_name"}; none -> not_found, or team_mismatch (the name
+    is on a roster, but not on the card's team; "roster_teams" lists where); several ->
+    ambiguous (left blank).
     """
     import rosters
     key = rosters.name_key(name)
-    try:
-        hits = [dict(r) for r in conn.execute(
-            "SELECT player_name, team_abbrev, team_city, team_name FROM rosters WHERE name_key = ?",
-            (key,)).fetchall()]
-    except Exception:
-        hits = []
+    hits = []
+    for cols in ("player_name, team_abbrev, team_city, team_name, nba_team_id",
+                 "player_name, team_abbrev, team_city, team_name"):          # older tables: no nba_team_id
+        try:
+            hits = [dict(r) for r in conn.execute(f"SELECT {cols} FROM rosters WHERE name_key = ?", (key,))]
+            break
+        except Exception:
+            continue
+    named = hits
     if team:
         t = team.upper()
-        hits = [h for h in hits if t in {str(h["team_abbrev"] or "").upper(),
-                                         str(h["team_name"] or "").upper(),
-                                         f"{h['team_city']} {h['team_name']}".upper()}]
+        hits = [h for h in hits if t in _team_names(h)]
     if len(hits) == 1:
         h = hits[0]
         return {"status": "ok", "player_name": h["player_name"], "team_abbrev": h["team_abbrev"],
                 "team_name": f"{h['team_city']} {h['team_name']}"}
+    if not hits and named:
+        return {"status": "team_mismatch", "roster_teams": sorted(f"{h['team_city']} {h['team_name']}" for h in named)}
     return {"status": "ambiguous" if hits else "not_found"}
 
 
@@ -533,8 +551,10 @@ def confirmation_rows(rows: list[dict], context_fn=None, record: bool = True) ->
                     row["logged_line"] = logged_underdog_line(conn, who["player_name"], who["team_name"],
                                                               r["stat"], today)
             else:
-                row["alerts"].append("player not resolved: " + (
-                    "several roster players match" if who["status"] == "ambiguous" else "no exact roster match"))
+                why = {"ambiguous": "several roster players match",
+                       "team_mismatch": f"the card's team {r['team']} is not his roster team "
+                                        f"({', '.join(who.get('roster_teams', []))})"}
+                row["alerts"].append("player not resolved: " + why.get(who["status"], "no exact roster match"))
             out.append(row)
         if record and out:
             record_line_checks(conn, out, checked_at.isoformat())

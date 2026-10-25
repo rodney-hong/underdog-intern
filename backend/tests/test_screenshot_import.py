@@ -208,10 +208,28 @@ def test_exact_name_and_team_resolves_one_player(db):
 
 
 def test_wrong_team_or_two_matches_stay_blank(db):
-    assert _resolve("Jalen Williams", "DEN") == {"status": "not_found"}
+    # on a roster, not on the card's team: still blank, with where he is for the flag tooltip
+    assert _resolve("Jalen Williams", "DEN") == {"status": "team_mismatch", "roster_teams": ["Oklahoma City Thunder"]}
     assert _resolve("Jalen Smith", None) == {"status": "ambiguous"}       # two Jalen Smiths, no team shown
     assert _resolve("Jalen Smith", "PHX")["status"] == "ok"               # the card's team settles it
     assert _resolve("Jalen Wiliams", "OKC") == {"status": "not_found"}    # no fuzzy matching
+
+
+def test_nba_style_card_abbreviations_match_espn_roster_abbreviations():
+    """ESPN rosters say UTAH / GS / NY / SA / NO / WSH; pick'em cards print UTA / GSW / NYK / ..."""
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.execute("CREATE TABLE rosters (player_name TEXT, name_key TEXT, team_abbrev TEXT, team_city TEXT, "
+                 "team_name TEXT, nba_team_id INTEGER)")
+    conn.executemany("INSERT INTO rosters VALUES (?,?,?,?,?,?)", [
+        ("Jaxson Hayes", "jaxson hayes", "UTAH", "Utah", "Jazz", 1610612762),
+        ("Stephen Curry", "stephen curry", "GS", "Golden State", "Warriors", 1610612744),
+        ("Jalen Brunson", "jalen brunson", "NY", "New York", "Knicks", 1610612752)])
+    for name, card in (("Jaxson Hayes", "UTA"), ("Jaxson Hayes", "UTAH"), ("Jaxson Hayes", "JAZZ"),
+                       ("Stephen Curry", "GSW"), ("Jalen Brunson", "NYK")):
+        assert si.resolve_player(conn, name, card)["status"] == "ok", (name, card)
+    assert si.resolve_player(conn, "Jaxson Hayes", "LAL") == {"status": "team_mismatch",
+                                                                             "roster_teams": ["Utah Jazz"]}
 
 
 def _context(name):
