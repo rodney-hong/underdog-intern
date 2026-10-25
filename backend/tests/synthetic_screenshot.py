@@ -92,3 +92,55 @@ def render(cards=CARDS, fmt: str = "PNG") -> bytes:
     buf = io.BytesIO()
     img.save(buf, format=fmt)
     return buf.getvalue()
+
+
+# Underdog's dark theme: outlined cards whose fill is almost the page colour (only the
+# outline and the buttons stand out), line arrows on some cards, and one or two pick buttons.
+VARIANT_CARDS = [
+    {"player_name": "Daniss Jenkins", "matchup": "DET @ PHI - 6:30PM", "stat": "3PM", "line": 0.5,
+     "arrows": True, "sides": "both", "higher": 1.55, "lower": 2.11},
+    {"player_name": "Paul Reed", "matchup": "DET @ PHI - 6:30PM", "stat": "3PM", "line": 0.5,
+     "arrows": True, "sides": "both", "higher": 2.55, "lower": 1.37},
+    {"player_name": "Ausar Thompson", "matchup": "DET @ PHI - 6:30PM", "stat": "3PM", "line": 0.5,
+     "arrows": False, "sides": "both", "higher": 4.44, "lower": 1.15},
+    {"player_name": "Adem Bona", "matchup": "PHI vs DET - 6:30PM", "stat": "3PM", "line": 0.5,
+     "arrows": False, "sides": "higher", "higher": 5.82, "lower": None},
+]
+
+
+def render_underdog(cards=VARIANT_CARDS, cols: int = 2, crop_top: int = 0) -> bytes:
+    """Cards as on Underdog's dark grid (crop_top cuts the first row's top, as a scrolled
+    screenshot does). sides: 'both', 'higher' (one wide Higher button) or 'lower'."""
+    cw, ch, gap, pad = 432, 154, 10, 8
+    rows = -(-len(cards) // cols)
+    W, H = pad + cols * (cw + gap), pad + rows * (ch + gap)
+    page, fill, outline, button = (4, 6, 10), (6, 8, 12), (44, 48, 60), (20, 23, 30)
+    img = Image.new("RGB", (W, H), page)
+    d = ImageDraw.Draw(img)
+    name, small, big = _font(14), _font(12), _font(15)
+    for i, c in enumerate(cards):
+        x, y = pad + (i % cols) * (cw + gap), pad + (i // cols) * (ch + gap)
+        d.rounded_rectangle([x, y, x + cw, y + ch], radius=12, fill=fill, outline=outline, width=2)
+        d.ellipse([x + 16, y + 16, x + 72, y + 72], fill=(60, 50, 50))
+        d.text((x + 88, y + 26), c["player_name"], font=name, fill=(245, 245, 245))
+        d.text((x + 88, y + 50), c["matchup"], font=small, fill=(200, 200, 205))
+        lx = x + 34 if c["arrows"] else x + 14
+        if c["arrows"]:
+            d.text((x + 14, y + 104), "^", font=small, fill=(220, 220, 220))
+            d.text((x + 14, y + 122), "v", font=small, fill=(220, 220, 220))
+        d.text((lx, y + 104), f"{c['line']:g}", font=big, fill=(245, 245, 245))
+        d.text((lx, y + 124), _STAT_LABEL[c["stat"]], font=small, fill=(170, 170, 180))
+        sides = ["Higher", "Lower"] if c["sides"] == "both" else [c["sides"].capitalize()]
+        bw = 96 if len(sides) == 2 else 196
+        for j, side in enumerate(sides):
+            bx = x + 232 + j * 100
+            d.rounded_rectangle([bx, y + 96, bx + bw, y + 144], radius=6, fill=button)
+            mult = c["higher" if side == "Higher" else "lower"]
+            d.text((bx + bw // 2 - 20, y + 102), side, font=small, fill=(240, 240, 240))
+            if mult is not None:
+                d.text((bx + bw // 2 - 14, y + 122), f"{mult:g}x", font=small, fill=(220, 220, 225))
+    if crop_top:
+        img = img.crop((0, crop_top, W, H))
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()

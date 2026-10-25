@@ -25,6 +25,7 @@ export default function ScreenshotImport({ teams }) {
       const res = await fetch(`${API}/screenshot/extract`, { method: 'POST', body: form })
       const data = await res.json()
       if (!res.ok) throw new Error(data.detail || 'Could not read the screenshot')
+      if (!data.rows?.length) throw new Error('No cards found')
       setRows(data.rows.map(toEditable))
     } catch (e) {
       setError(e.message || 'Could not read the screenshot')

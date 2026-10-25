@@ -43,6 +43,7 @@ READ_SCALES = (2, 3)           # each card is read twice, upscaled 2x and 3x
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
 MAX_IMAGE_SIDE = 2000          # longer side, px; larger screenshots are scaled down first
 SUPPORTED_STATS = ("Points", "Rebounds", "Assists", "3PM")
+CARD_MIN_HEIGHT = 0.1          # a card is at least this fraction of the image width tall
 RANGE_GAMES = 82               # "historical range": min..max over the last 82 played regular-season games
 RANGE_MIN_GAMES = 10           # fewer games in the window: never flag the line
 RANGE_HIGH, RANGE_LOW = 1.5, 0.5   # flag only lines above 1.5x the max or below half the min
@@ -154,26 +155,36 @@ def _extract_claude(png: bytes, media_type: str) -> list[dict]:
 
 CARD_PROMPT = (
     "This image is one player card from a sports pick'em app. Copy its raw text. Return JSON "
-    '{"player_name": ..., "stat_label": ..., "line": ...}: player_name exactly as written; '
-    "stat_label, the stat words exactly as written (for example 'Points' or '3-Pointers Made'); "
-    "line, the number shown with that stat, exactly as written. Ignore buttons, multipliers, "
+    '{"player_name": ..., "stat_label": ..., "line": ..., "buttons": [...]}: player_name exactly '
+    "as written; stat_label, the stat words exactly as written (for example 'Points' or "
+    "'3-Pointers Made'); line, the number shown with that stat, exactly as written (some cards "
+    "show small up/down arrows beside it, some don't); buttons, the labels of the pick buttons "
+    "shown, from 'Higher' and 'Lower' (a card may show both or only one). Ignore multipliers, "
     "teams and game times. Use null for anything not visible. Do not guess."
 )
 SHEET_PROMPT = (
     "This is a screenshot of player cards from a sports pick'em app. For every card copy its "
-    'raw text. Return JSON {"cards": [{"player_name": ..., "stat_label": ..., "line": ...}]}: '
-    "player_name and stat_label exactly as written, line the number shown with that stat. "
-    "Ignore buttons, multipliers, teams and game times. Do not guess."
+    'raw text. Return JSON {"cards": [{"player_name": ..., "stat_label": ..., "line": ..., '
+    '"buttons": [...]}]}: player_name and stat_label exactly as written, line the number shown '
+    "with that stat (with or without arrows beside it), buttons the pick-button labels shown "
+    "('Higher', 'Lower', or just one of them). Ignore multipliers, teams and game times. Do not guess."
 )
+UNREADABLE = "couldn't read this card"
 
 
 def detect_cards(img) -> list[tuple[int, int, int, int]]:
     """
     Boxes (x0, y0, x1, y1) of the cards in a pick'em screenshot, in reading order, or []
-    when no grid of cards is found. A card is a solid filled panel standing out from the
-    page background: threshold against the border colour, open away thin separators,
-    label connected regions, then keep the ones that are mostly filled, card-sized, and
-    of the grid's common size (drops headers, nav bars and stray text).
+    when no grid of cards is found.
+      cards     a card is a panel set off from the page by its fill or its outline: pixels
+                that differ from the border colour, holes filled (so an outlined card whose
+                fill matches the page, as in Underdog's dark theme, becomes one solid region
+                and its buttons merge into it), thin separators opened away; kept when mostly
+                filled, at least CARD_MIN_HEIGHT x the image width tall (a lone Higher button
+                is not a card), not a bar, and of the grid's common size
+      grid      the cards found give the card size, columns and row pitch; the grid is then
+                tiled over the whole image, so cards whose outline is cut by the image edge or
+                merges with a neighbour are still cropped; empty grid cells are skipped
     """
     import numpy as np
     from scipy import ndimage
@@ -185,15 +196,15 @@ def detect_cards(img) -> list[tuple[int, int, int, int]]:
                              a[:, :3].reshape(-1, 3), a[:, -3:].reshape(-1, 3)])
     bg = np.median(border, axis=0)
     mask = np.abs(a - bg).max(axis=2) > 6
-    mask = ndimage.binary_opening(mask, structure=np.ones((5, 5)))
-    labels, _ = ndimage.label(mask)
+    solid = ndimage.binary_opening(ndimage.binary_fill_holes(mask), structure=np.ones((9, 9)))
+    labels, _ = ndimage.label(solid)
     boxes = []
     for i, sl in enumerate(ndimage.find_objects(labels), start=1):
         if sl is None:
             continue
         y0, y1, x0, x1 = sl[0].start, sl[0].stop, sl[1].start, sl[1].stop
         bw, bh = x1 - x0, y1 - y0
-        if bw < 0.12 * w or bh < 0.05 * h or (bw > 0.98 * w and bh > 0.9 * h):
+        if bw < 0.12 * w or bh < CARD_MIN_HEIGHT * w or (bw > 0.98 * w and bh > 0.9 * h):
             continue
         if bw > 6 * bh or bh > 4 * bw:         # bars and strips, not cards
             continue
@@ -205,10 +216,55 @@ def detect_cards(img) -> list[tuple[int, int, int, int]]:
     areas = sorted((b[2] - b[0]) * (b[3] - b[1]) for b in boxes)
     med = areas[len(areas) // 2]
     boxes = [b for b in boxes if 0.5 * med <= (b[2] - b[0]) * (b[3] - b[1]) <= 2 * med]
-    row_h = min(b[3] - b[1] for b in boxes)
-    boxes.sort(key=lambda b: (round(b[1] / (row_h / 2)), b[0]))
+    tiles = _tile_grid(boxes, mask, w, h)
     inv = 1 / scale
-    return [(int(x0 * inv), int(y0 * inv), int(x1 * inv), int(y1 * inv)) for x0, y0, x1, y1 in boxes]
+    return [(int(x0 * inv), int(y0 * inv), int(x1 * inv), int(y1 * inv)) for x0, y0, x1, y1 in tiles]
+
+
+def _tile_grid(boxes, mask, w, h) -> list[tuple[int, int, int, int]]:
+    """The grid the detected cards sit on, tiled over the image (see detect_cards)."""
+    import numpy as np
+    cw = int(np.median([b[2] - b[0] for b in boxes]))
+    ch = int(np.median([b[3] - b[1] for b in boxes]))
+
+    def axis(starts, size, limit):
+        starts = sorted(starts)
+        merged = [starts[0]]
+        for v in starts[1:]:
+            if v - merged[-1] > size // 2:
+                merged.append(v)
+        gaps = [b - a for a, b in zip(merged, merged[1:])]
+        pitch = min(gaps) if gaps else size + max(4, size // 18)
+        v = merged[0]
+        while v - pitch > -0.4 * size:                 # cells before the first card found
+            v -= pitch
+        out = []
+        while v + 0.6 * size < limit:                  # and after the last
+            out.append(v)
+            v += pitch
+        return out
+
+    tiles = []
+    for y in axis([b[1] for b in boxes], ch, h):
+        for x in axis([b[0] for b in boxes], cw, w):
+            t = (max(0, x), max(0, y), min(w, x + cw), min(h, y + ch))
+            cell = mask[t[1]:t[3], t[0]:t[2]]
+            if cell.size and cell.mean() > 0.03:       # an empty grid cell has nothing on it
+                tiles.append(t)
+    return tiles
+
+
+GPU_MEMORY_MESSAGE = "Not enough GPU memory: close other apps"
+
+
+def _out_of_memory(resp) -> bool:
+    """Ollama's model-load failures when VRAM / memory runs out."""
+    try:
+        text = resp.text.lower()
+    except Exception:
+        return False
+    return any(k in text for k in ("out of memory", "requires more system memory", "cudamalloc",
+                                   "unable to allocate", "insufficient memory", "not enough memory"))
 
 
 def _ollama_json(img, prompt: str) -> dict:
@@ -226,6 +282,8 @@ def _ollama_json(img, prompt: str) -> dict:
             break
         except httpx.HTTPStatusError as exc:
             if attempt == 2 or exc.response.status_code < 500:
+                if _out_of_memory(exc.response):
+                    raise ExtractorUnavailable(GPU_MEMORY_MESSAGE) from exc
                 raise ExtractorUnavailable(f"Ollama ({OLLAMA_URL}, {OLLAMA_MODEL}) failed: {exc}") from exc
             time.sleep(2)
         except httpx.HTTPError as exc:
@@ -242,16 +300,40 @@ def _read_key(r: dict) -> tuple:
             _number(r.get("line")))
 
 
+def sides_offered(buttons) -> str | None:
+    """'both' / 'higher' / 'lower' from the pick-button labels a read saw, None if unknown."""
+    if isinstance(buttons, str):
+        buttons = [buttons]
+    seen = {str(x).strip().lower() for x in (buttons or [])}
+    hi = any("higher" in x for x in seen)
+    lo = any("lower" in x for x in seen)
+    return "both" if hi and lo else "higher" if hi else "lower" if lo else None
+
+
+def _readable(r) -> bool:
+    return (isinstance(r, dict) and bool(str(r.get("player_name") or "").strip())
+            and _number(r.get("line")) is not None)
+
+
 def _two_reads(first: dict, second: dict) -> dict:
     """One raw row from two reads of the same card: the first read's text (the second's
     if the first has no name or line), with alerts where they disagree on name, stat or line."""
     a, b = _read_key(first), _read_key(second)
     alerts = [f"two reads disagree on {what}: {x!r} vs {y!r}"
               for what, x, y in zip(("name", "stat", "line"), a, b) if x != y]
-    base = first if first.get("player_name") and _number(first.get("line")) is not None else second
+    base = first if _readable(first) else second
+    other = second if base is first else first
     return {"player_name": base.get("player_name"), "team": None, "stat": base.get("stat_label"),
             "line": base.get("line"), "higher_multiplier": None, "lower_multiplier": None,
+            "sides_offered": sides_offered(base.get("buttons")) or sides_offered(other.get("buttons")),
             "reads_agree": not alerts, "alerts": alerts}
+
+
+def unreadable_row() -> dict:
+    """A card that was found but couldn't be read: kept as an unresolved row with a flag."""
+    return {"player_name": "", "team": None, "stat": None, "line": None, "higher_multiplier": None,
+            "lower_multiplier": None, "sides_offered": None, "reads_agree": None,
+            "alerts": [UNREADABLE], "unreadable": True}
 
 
 def _upscale(img, factor: float):
@@ -280,10 +362,29 @@ def _extract_ollama(png: bytes, media_type: str) -> list[dict]:
     for x0, y0, x1, y1 in boxes:
         card = img.crop((max(0, x0 - 4), max(0, y0 - 4), min(img.width, x1 + 4), min(img.height, y1 + 4)))
         jobs += [_upscale(card, f) for f in READ_SCALES]
+
+    def read(im):   # one card read never fails the image: its error is kept for that card
+        try:
+            return _ollama_json(im, CARD_PROMPT)
+        except Exception as exc:
+            return exc
+
     with ThreadPoolExecutor(max_workers=max(1, OLLAMA_PARALLEL)) as ex:
-        results = list(ex.map(lambda im: _ollama_json(im, CARD_PROMPT), jobs))
-    n = len(READ_SCALES)
-    return [_two_reads(results[i], results[i + 1]) for i in range(0, len(results), n)]
+        results = list(ex.map(read, jobs))
+    errors = [r for r in results if isinstance(r, Exception)]
+    if errors and len(errors) == len(results):          # nothing read at all: say why
+        first = next((e for e in errors if isinstance(e, ExtractorUnavailable)), errors[0])
+        if isinstance(first, ExtractorUnavailable):
+            raise first
+        raise ExtractorUnavailable(f"could not read any card ({first!r})"[:300])
+    n, rows = len(READ_SCALES), []
+    for i in range(0, len(results), n):
+        reads = [r if isinstance(r, dict) else {} for r in results[i:i + n]]
+        if not any(_readable(r) for r in reads):
+            rows.append(unreadable_row())
+            continue
+        rows.append(_two_reads(reads[0], reads[1] if len(reads) > 1 else {}))
+    return rows
 
 
 _EXTRACT = {"claude": _extract_claude, "ollama": _extract_ollama}
@@ -332,7 +433,12 @@ def _number(v) -> float | None:
 
 
 def normalize_row(r: dict) -> dict | None:
-    """One extracted card in a fixed shape; None when it has no name or no line."""
+    """One extracted card in a fixed shape; None when it has no name or no line, except a
+    card that was found but couldn't be read (unreadable_row), which is kept with its flag."""
+    if r.get("unreadable"):
+        return {"player_name": "", "team": None, "stat_text": "", "stat": None, "line": None,
+                "higher_multiplier": None, "lower_multiplier": None, "sides_offered": None,
+                "reads_agree": None, "alerts": list(r.get("alerts") or [UNREADABLE]), "unreadable": True}
     name = re.sub(r"\s+", " ", str(r.get("player_name") or "")).strip()
     line = _number(r.get("line"))
     if not name or line is None:
@@ -342,7 +448,15 @@ def normalize_row(r: dict) -> dict | None:
             "stat": normalize_stat(r.get("stat")), "line": line,
             "higher_multiplier": _number(r.get("higher_multiplier")),
             "lower_multiplier": _number(r.get("lower_multiplier")),
+            "sides_offered": r.get("sides_offered") or _sides_from_multipliers(r),
             "reads_agree": r.get("reads_agree"), "alerts": list(r.get("alerts") or [])}
+
+
+def _sides_from_multipliers(r: dict) -> str | None:
+    """Claude path: a Higher / Lower multiplier read means that button is shown."""
+    hi = _number(r.get("higher_multiplier")) is not None
+    lo = _number(r.get("lower_multiplier")) is not None
+    return "both" if hi and lo else "higher" if hi else "lower" if lo else None
 
 
 # ---------------------------------------------------------------------------
@@ -500,7 +614,8 @@ _LINE_CHECKS_DDL = """
         line_diff          REAL             -- screenshot_line - logged_line
     )"""
 _LINE_CHECKS_ADDED = (("is_rung", "INTEGER"), ("logged_market_key", "TEXT"), ("logged_over_price", "REAL"),
-                      ("logged_under_price", "REAL"), ("line_diff", "REAL"))
+                      ("logged_under_price", "REAL"), ("line_diff", "REAL"),
+                      ("sides_offered", "TEXT"))      # both / higher / lower: the card's pick buttons
 
 
 def record_line_checks(conn, rows: list[dict], checked_at: str) -> int:
@@ -513,6 +628,8 @@ def record_line_checks(conn, rows: list[dict], checked_at: str) -> int:
             conn.execute(f"ALTER TABLE line_checks ADD COLUMN {col} {kind}")
     data = []
     for r in rows:
+        if r.get("line") is None:          # a card that couldn't be read has no line to record
+            continue
         logged = r.get("logged_line") or {}
         diff = None if not logged else round(r["line"] - logged["line"], 4)
         match = None if diff is None else int(abs(diff) < 1e-9)
@@ -520,11 +637,12 @@ def record_line_checks(conn, rows: list[dict], checked_at: str) -> int:
         data.append((checked_at, r.get("person_id"), r.get("stat"), r["line"],
                      logged.get("line"), logged.get("captured_at"), logged.get("pull_phase"), match,
                      None if agree is None else int(agree), int(is_rung(r["line"])),
-                     logged.get("market_key"), logged.get("over_price"), logged.get("under_price"), diff))
+                     logged.get("market_key"), logged.get("over_price"), logged.get("under_price"), diff,
+                     r.get("sides_offered")))
     conn.executemany("INSERT INTO line_checks (checked_at, person_id, stat_type, screenshot_line, "
                      "logged_line, logged_captured_at, logged_pull_phase, matches, reads_agree, is_rung, "
-                     "logged_market_key, logged_over_price, logged_under_price, line_diff) "
-                     "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)", data)
+                     "logged_market_key, logged_over_price, logged_under_price, line_diff, sides_offered) "
+                     "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", data)
     conn.commit()
     return len(data)
 
@@ -554,6 +672,12 @@ def confirmation_rows(rows: list[dict], context_fn=None, record: bool = True) ->
         player_aliases.init_table(conn)
         out = []
         for r in rows:
+            if r.get("unreadable"):        # found but not read: an unresolved row with its flag
+                out.append({**r, "resolved_player": "", "match": "unreadable", "opponent_team": "",
+                            "is_home": False, "is_back_to_back": False, "game_date": None, "range": None,
+                            "flags": [], "alerts": list(r.get("alerts") or [UNREADABLE]),
+                            "logged_line": None, "person_id": None})
+                continue
             who = resolve_player(conn, r["player_name"], r["team"])
             row = {**r, "resolved_player": who.get("player_name", ""), "match": who["status"],
                    "opponent_team": "", "is_home": False, "is_back_to_back": False,
