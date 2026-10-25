@@ -53,3 +53,10 @@ test('alerts (read disagreements, unresolved player) are kept for the flag toolt
   assert.deepEqual(toEditable({ ...extracted, alerts }, 0).alerts, alerts)
   assert.deepEqual(toEditable(extracted, 0).alerts, [])
 })
+
+test('the no-history notice is hidden; other flags stay', () => {
+  const range = 'line 75.5 is far outside the range 18–44 (last 82 games)'
+  assert.deepEqual(toEditable({ ...extracted, flags: ['no game history for this stat'] }, 0).flags, [])
+  assert.deepEqual(toEditable({ ...extracted, flags: ['no game history for this stat', range] }, 0).flags, [range])
+  assert.deepEqual(toEditable({ ...extracted, flags: undefined }, 0).flags, [])
+})

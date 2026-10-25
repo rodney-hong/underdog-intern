@@ -3,6 +3,10 @@
 
 export const SCREENSHOT_STATS = ['Points', 'Rebounds', 'Assists', '3PM']
 
+// Server notices the table doesn't show: a player with no history gets "Not enough NBA games"
+// as the row's result after Predict.
+const HIDDEN_FLAGS = new Set(['no game history for this stat'])
+
 // Editable state for one extracted row (the resolved player is blank unless it matched).
 // matched: the server resolved the card to one roster player, or the user picked one in the
 // row's player search; person_id is that player's personId (sent to /predict).
@@ -22,7 +26,7 @@ export function toEditable(row, i) {
     game_date: row.game_date || null,
     higher: row.higher_multiplier ?? null,
     lower: row.lower_multiplier ?? null,
-    flags: row.flags || [],
+    flags: (row.flags || []).filter((f) => !HIDDEN_FLAGS.has(f)),
     alerts: row.alerts || [],          // two reads disagree / player not resolved: the flag icon's tooltip
     logged_line: row.logged_line ?? null,
   }
