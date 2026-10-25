@@ -25,6 +25,7 @@ import io
 import json
 import os
 import re
+import sqlite3
 import time
 
 import httpx
@@ -42,7 +43,9 @@ READ_SCALES = (2, 3)           # each card is read twice, upscaled 2x and 3x
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
 MAX_IMAGE_SIDE = 2000          # longer side, px; larger screenshots are scaled down first
 SUPPORTED_STATS = ("Points", "Rebounds", "Assists", "3PM")
-RANGE_GAMES = 82               # "historical range": min..max over his last 82 counted games
+RANGE_GAMES = 82               # "historical range": min..max over the last 82 played regular-season games
+RANGE_MIN_GAMES = 10           # fewer games in the window: never flag the line
+RANGE_HIGH, RANGE_LOW = 1.5, 0.5   # flag only lines above 1.5x the max or below half the min
 
 PROMPT = (
     "This is a screenshot of player prop cards from a pick'em app. Transcribe every card. "
@@ -391,21 +394,40 @@ def resolve_player(conn, name: str, team: str | None) -> dict:
 
 
 def historical_range(conn, person_id: int | None, stat: str) -> dict | None:
-    """min / max of the stat over the player's last RANGE_GAMES counted games, or None if none.
-    person_id comes from database.resolve_person_id, the same resolver /predict uses."""
+    """
+    min / max of the stat over the player's last RANGE_GAMES played regular-season games
+    ("Regular Season" and the 2023 "NBA Emirates Cup" label; playoffs, play-in and DNP rows
+    excluded), across seasons, or None if he has none. person_id comes from
+    database.resolve_person_id, the same resolver /predict uses.
+    """
     import database
-    import game_types
     cols = database._RESOLVE_STAT_COLS.get(stat)
     if person_id is None or not cols or stat not in SUPPORTED_STATS:
         return None
-    rows = conn.execute(
-        f"SELECT {cols[0]} FROM player_stats WHERE personId = ? AND gameType IN ({game_types.COUNTED_SQL}) "
-        f"AND {cols[0]} IS NOT NULL ORDER BY gameDateTimeEst DESC LIMIT ?",
-        (int(person_id), RANGE_GAMES)).fetchall()
+    rs = ", ".join(f"'{t}'" for t in database.REGULAR_SEASON_GAME_TYPES)
+    played = ("(COALESCE(numMinutes, 0) > 0 OR "
+              + " OR ".join(f"COALESCE({c}, 0) > 0" for c in database.DNP_COUNTING_COLS) + ")")
+    rows = None
+    for cond in (f"AND {played}", ""):            # tables without numMinutes / counting columns: no DNP filter
+        try:
+            rows = conn.execute(
+                f"SELECT {cols[0]} FROM player_stats WHERE personId = ? AND gameType IN ({rs}) "
+                f"AND {cols[0]} IS NOT NULL {cond} ORDER BY gameDateTimeEst DESC LIMIT ?",
+                (int(person_id), RANGE_GAMES)).fetchall()
+            break
+        except sqlite3.OperationalError:
+            continue
     if not rows:
         return None
     vals = [float(r[0]) for r in rows]
     return {"min": min(vals), "max": max(vals), "games": len(vals)}
+
+
+def implausible_line(line: float, rng: dict | None) -> bool:
+    """Only with RANGE_MIN_GAMES+ games in the window, and only far outside it: above
+    RANGE_HIGH x the max or below RANGE_LOW x the min."""
+    return (rng is not None and rng["games"] >= RANGE_MIN_GAMES
+            and (line > RANGE_HIGH * rng["max"] or line < RANGE_LOW * rng["min"]))
 
 
 def logged_underdog_line(conn, player_name: str, team_name: str, stat: str,
@@ -544,8 +566,8 @@ def confirmation_rows(rows: list[dict], context_fn=None, record: bool = True) ->
                     row["range"] = rng
                     if rng is None:
                         row["flags"].append("no game history for this stat")
-                    elif not rng["min"] <= r["line"] <= rng["max"]:
-                        row["flags"].append(f"line {r['line']:g} is outside his range "
+                    elif implausible_line(r["line"], rng):
+                        row["flags"].append(f"line {r['line']:g} is far outside the range "
                                             f"{rng['min']:g}–{rng['max']:g} (last {rng['games']} games)")
                 if r["stat"]:
                     row["logged_line"] = logged_underdog_line(conn, who["player_name"], who["team_name"],

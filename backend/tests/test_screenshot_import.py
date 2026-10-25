@@ -232,6 +232,56 @@ def test_nba_style_card_abbreviations_match_espn_roster_abbreviations():
                                                                              "roster_teams": ["Utah Jazz"]}
 
 
+def _range_db(rows):
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE player_stats (personId INTEGER, gameDateTimeEst TEXT, gameType TEXT, numMinutes REAL, "
+                 "points REAL, reboundsTotal REAL, assists REAL, threePointersMade REAL, blocks REAL, steals REAL, "
+                 "turnovers REAL)")
+    conn.executemany("INSERT INTO player_stats VALUES (?,?,?,?,?,?,?,?,?,?,?)", rows)
+    return conn
+
+
+def _g(date, pts, gtype="Regular Season", minutes=30.0, pid=1):
+    return (pid, f"{date} 19:30:00", gtype, minutes, pts, 5, 3, 1, 0, 1, 2)
+
+
+def test_range_window_spans_seasons_regular_season_played_games_only():
+    rows = [_g(f"2024-{1 + i % 4:02d}-{1 + i % 28:02d}", 10 + i % 5) for i in range(40)]       # 2023-24
+    rows += [_g(f"2025-0{1 + i % 3}-{1 + i % 28:02d}", 20 + i % 5) for i in range(30)]         # 2024-25
+    rows += [_g(f"2026-10-{20 + i}", 30) for i in range(3)]                                     # 2026-27
+    rows += [_g("2025-05-01", 60, "Playoffs"), _g("2025-04-16", 55, "Play-in Tournament"),      # not regular season
+             _g("2026-10-23", 0, minutes=0.0), _g("2023-11-14", 12, "NBA Emirates Cup")]
+    rows[-2] = (1, "2026-10-23 19:30:00", "Regular Season", 0.0, 0, 0, 0, 0, 0, 0, 0)            # a DNP row
+    rng = si.historical_range(_range_db(rows), 1, "Points")
+    assert rng["games"] == 74                     # 40 + 30 + 3 + the 2023 Cup game; no playoffs, play-in or DNP
+    assert rng["max"] == 30.0 and rng["min"] == 10.0
+    many = [_g(f"20{20 + i // 60}-{1 + i % 12:02d}-{1 + i % 28:02d}", i) for i in range(200)]
+    assert si.historical_range(_range_db(many), 1, "Points")["games"] == si.RANGE_GAMES       # last 82, any season
+
+
+def test_line_flag_needs_ten_games_and_an_implausible_line():
+    nine = {"min": 10.0, "max": 20.0, "games": 9}
+    ten = {**nine, "games": 10}
+    assert not si.implausible_line(99.5, nine)                    # fewer than 10 games: never
+    assert si.implausible_line(30.5, ten)                         # above 1.5 x 20
+    assert not si.implausible_line(29.5, ten)                     # outside the range, but plausible
+    assert not si.implausible_line(5.5, ten)                      # half the min exactly: not below it
+    assert si.implausible_line(4.5, ten)                          # below 0.5 x 10
+    assert not si.implausible_line(15.5, None)
+
+
+def test_confirmation_rows_skip_the_flag_for_a_thin_history(db):
+    conn = sqlite3.connect(database.DB_PATH)
+    conn.execute("DELETE FROM player_stats WHERE personId = 20 AND rowid NOT IN "
+                 "(SELECT rowid FROM player_stats WHERE personId = 20 LIMIT 9)")       # Brandon Miller: 9 games
+    conn.commit()
+    conn.close()
+    rows = [si.normalize_row(r) for r in RAW]
+    rows[1]["line"] = 99.5
+    b = si.confirmation_rows(rows, context_fn=_context)[1]
+    assert b["resolved_player"] == "Brandon Miller" and b["range"]["games"] == 9 and b["flags"] == []
+
+
 def _context(name):
     return {"next_opponent_full": {"Giannis Antetokounmpo": "Charlotte Hornets"}.get(name, "Miami Heat"),
             "is_home": False, "is_back_to_back": True, "next_game_date": "2026-10-24"}
@@ -239,13 +289,13 @@ def _context(name):
 
 def test_confirmation_rows_resolve_fill_context_and_flag_ranges(db):
     rows = [si.normalize_row(r) for r in RAW]
-    rows[0]["line"] = 75.5                                               # misread: outside his range
+    rows[0]["line"] = 75.5                                               # misread: > 1.5x his max (44)
     out = si.confirmation_rows(rows + [si.normalize_row({"player_name": "Jalen Smith", "stat": "Points",
                                                          "line": 9.5})], context_fn=_context)
     g, b, j, c, js = out
     assert g["resolved_player"] == "Giannis Antetokounmpo" and g["opponent_team"] == "Charlotte Hornets"
     assert g["game_date"] == "2026-10-24" and g["is_back_to_back"] is True
-    assert any("outside his range" in f for f in g["flags"]) and g["range"]["games"] == 82
+    assert any("far outside the range" in f for f in g["flags"]) and g["range"]["games"] == 82
     assert b["flags"] == [] and j["flags"] == []                         # lines inside their ranges
     assert c["resolved_player"] == "Cade Cunningham" and c["flags"] == ["no game history for this stat"]
     assert js["resolved_player"] == "" and js["match"] == "ambiguous" and js["opponent_team"] == ""
