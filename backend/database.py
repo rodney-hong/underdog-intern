@@ -132,6 +132,11 @@ def init_db():
         conn.execute("UPDATE predictions SET league = 'NBA' WHERE league IS NULL")
     if "is_limited_data" not in existing_cols:
         conn.execute("ALTER TABLE predictions ADD COLUMN is_limited_data INTEGER")
+    if "model" not in existing_cols:
+        # Which model made the pick: 'challenger' (from Stage 3, challenger/live.py) or
+        # 'frozen' (the 2026-27 XGBoost / heuristic path). Every earlier row is 'frozen'.
+        conn.execute("ALTER TABLE predictions ADD COLUMN model TEXT")
+        conn.execute("UPDATE predictions SET model = 'frozen' WHERE model IS NULL")
     conn.commit()
     try:   # display-only flag; a failure must never stop startup
         out = backfill_limited_data(conn)
@@ -151,6 +156,7 @@ def log_prediction(
     explanation: str,
     game_date: str | None = None,
     league: str = "NBA",
+    model: str = "frozen",
 ) -> int:
     conn = get_connection()
     try:   # display-only flag (is_limited_data); never blocks logging
@@ -162,10 +168,10 @@ def log_prediction(
         """
         SELECT id, confidence FROM predictions
         WHERE player_name = ? AND stat_type = ? AND stat_line = ? AND opponent_team = ?
-          AND COALESCE(game_date, '') = COALESCE(?, '')
+          AND COALESCE(game_date, '') = COALESCE(?, '') AND COALESCE(model, 'frozen') = ?
         ORDER BY timestamp DESC LIMIT 1
         """,
-        (player_name, stat_type, stat_line, opponent_team, game_date),
+        (player_name, stat_type, stat_line, opponent_team, game_date, model),
     ).fetchone()
     if existing:
         conn.execute(
@@ -181,8 +187,8 @@ def log_prediction(
         INSERT INTO predictions
             (timestamp, player_name, stat_type, stat_line, opponent_team,
              predicted_outcome, confidence, explanation, actual_result, game_date, league,
-             is_limited_data)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)
+             is_limited_data, model)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?)
         """,
         (
             datetime.utcnow().isoformat(),
@@ -196,6 +202,7 @@ def log_prediction(
             game_date,
             league,
             limited,
+            model,
         ),
     )
     row_id = cursor.lastrowid

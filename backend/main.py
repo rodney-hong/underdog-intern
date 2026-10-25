@@ -5,6 +5,7 @@ Run with: uvicorn main:app --reload --port 8000
 """
 
 import concurrent.futures
+import datetime as dt
 import sys
 import threading
 
@@ -257,14 +258,59 @@ def get_player_context_endpoint(player_name: str):
     return {"injury_status": injury_status, "news": news}
 
 
+def _app_tip(player_team: str, opponent_team: str, game_date: str | None) -> str:
+    """Feature cutoff for an app prediction (ET): the scheduled tip of the game between the
+    two teams on game_date (else the start of game_date); with no game_date, their next
+    scheduled game (else now)."""
+    from zoneinfo import ZoneInfo
+    now = dt.datetime.now(ZoneInfo("America/New_York")).replace(tzinfo=None)
+    start = game_date or now.strftime("%Y-%m-%d %H:%M:%S")
+    tip = data_fetcher.scheduled_tip(player_team, opponent_team, start)
+    if tip is not None and (game_date is None or tip.strftime("%Y-%m-%d") == game_date):
+        return tip.strftime("%Y-%m-%d %H:%M:%S")
+    return f"{game_date} 00:00:00" if game_date else now.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _challenger_prediction(req: "PredictRequest", person_id: int) -> dict:
+    """The challenger's pick and P(over) at the entered line (challenger/live.py; frozen file,
+    hash and fingerprint checked). 422 'Not enough NBA games' with fewer than 5 earlier games."""
+    from challenger import live
+    ctx = data_fetcher.get_player_context(req.player_name)
+    if ctx is None:
+        raise HTTPException(status_code=404, detail=f"Player '{req.player_name}' has no current team")
+    team = ctx["player_team_full"]
+    conn = database.get_connection()
+    try:
+        r = live.predict(conn, person_id, team, req.opponent_team, req.is_home,
+                         _app_tip(team, req.opponent_team, req.game_date), req.stat_type, [req.stat_line])
+    except live.FrozenModelError as exc:
+        print(f"[predict] challenger refused: {exc}")
+        raise HTTPException(status_code=503, detail="Challenger model file failed its integrity check")
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    finally:
+        conn.close()
+    if r["status"] == "insufficient_history":
+        raise HTTPException(status_code=422, detail="Not enough NBA games")
+    p = r["p_over"][float(req.stat_line)]
+    return {"outcome": "OVER" if p > 0.5 else "UNDER", "confidence": round(max(p, 1 - p), 4),
+            "explanation": live.explanation(req.player_name, req.stat_type, req.stat_line, r, req.opponent_team),
+            "p_over": p, "projected_mean": r["mu"]}
+
+
 @app.post("/predict")
 def predict_prop(req: PredictRequest):
     """
     Predict OVER or UNDER for a player prop line.
-    Returns: { outcome, confidence, explanation }
-    Logs every prediction to predictions.db. NBA: a player with no counted regular-season
-    game in player_stats gets no prediction (422 "Not enough NBA games") and no row.
+    Returns: { outcome, confidence, explanation, model, ... }
+    Logs every prediction to predictions.db with the model that made it. NBA Points,
+    Rebounds, Assists and 3PM use the challenger (from Stage 3, pre-registered entry
+    a760c8c); other stats and WNBA keep the frozen/heuristic path. NBA: a player with no
+    counted regular-season game, or (challenger stats) fewer than 5 earlier games, gets no
+    prediction (422 "Not enough NBA games") and no row.
     """
+    from challenger.live import STATS as CHALLENGER_STATS
+    counts = None
     if req.league != "WNBA":
         conn = database.get_connection()
         try:
@@ -273,15 +319,19 @@ def predict_prop(req: PredictRequest):
             conn.close()
         if counts["rs_total"] == 0:
             raise HTTPException(status_code=422, detail="Not enough NBA games")
-    _predict_fn = predictor.predict_wnba if req.league == "WNBA" else predictor.predict
-    result = _predict_fn(
-        player_name=req.player_name,
-        opponent_team=req.opponent_team,
-        stat_line=req.stat_line,
-        stat_type=req.stat_type,
-        is_home=req.is_home,
-        is_back_to_back=req.is_back_to_back,
-    )
+    if req.league != "WNBA" and req.stat_type in CHALLENGER_STATS:
+        result, model = _challenger_prediction(req, counts["person_id"]), "challenger"
+    else:
+        _predict_fn = predictor.predict_wnba if req.league == "WNBA" else predictor.predict
+        result = _predict_fn(
+            player_name=req.player_name,
+            opponent_team=req.opponent_team,
+            stat_line=req.stat_line,
+            stat_type=req.stat_type,
+            is_home=req.is_home,
+            is_back_to_back=req.is_back_to_back,
+        )
+        model = "frozen"
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
         opp_inj_fut = ex.submit(data_fetcher.get_opponent_injuries, req.opponent_team)
@@ -300,12 +350,16 @@ def predict_prop(req: PredictRequest):
         explanation=result["explanation"],
         game_date=req.game_date,
         league=req.league,
+        model=model,
     )
 
     return {
         "outcome": result["outcome"],
         "confidence": round(result["confidence"] * 100, 1),
         "explanation": result["explanation"],
+        "model": model,
+        "p_over": result.get("p_over"),
+        "projected_mean": result.get("projected_mean"),
         "opponent_injuries": opponent_injuries,
         "prediction_id": prediction_id,   # lets the UI ask for the track record before this pick
     }
@@ -338,7 +392,7 @@ def get_prediction_history():
     rows = conn.execute(
         """SELECT id, timestamp, player_name, stat_type, stat_line, opponent_team,
                   predicted_outcome, confidence, explanation, actual_result, game_date, league,
-                  is_limited_data
+                  is_limited_data, COALESCE(model, 'frozen') AS model
            FROM predictions
            ORDER BY timestamp DESC"""
     ).fetchall()
@@ -389,7 +443,7 @@ def update_prediction_result(pred_id: int, req: ActualResultRequest):
     row = conn.execute(
         """SELECT id, timestamp, player_name, stat_type, stat_line, opponent_team,
                   predicted_outcome, confidence, explanation, actual_result, game_date, league,
-                  is_limited_data
+                  is_limited_data, COALESCE(model, 'frozen') AS model
            FROM predictions WHERE id = ?""",
         (pred_id,),
     ).fetchone()

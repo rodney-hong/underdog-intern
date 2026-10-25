@@ -781,6 +781,19 @@ def _log_paper_predictions(game_id: str) -> None:
         print(f"[line_logger] paper predictions FAILED for {game_id}: {exc!r}")
 
 
+def _log_challenger_predictions(game_id: str) -> None:
+    """Challenger rows for this pre-tip pull (challenger_log.py), after the paper rows and
+    inside the pre-tip lock. Reads the database only; never allowed to break line logging."""
+    if os.getenv("CHALLENGER_PREDICTIONS_ENABLED", "1") != "1":
+        return
+    try:
+        import challenger_log
+        res = challenger_log.log_for_pull(game_id)
+        print(f"[line_logger] challenger predictions for {game_id}: {res}")
+    except Exception as exc:
+        print(f"[line_logger] challenger predictions FAILED for {game_id}: {exc!r}")
+
+
 # One pre-tip job (pull + paper predictions) at a time in this process. log_for_pull
 # holds a write transaction for ~25-30 s per game; with several games sharing a tip
 # time, concurrent jobs hit the 30 s busy timeout ("database is locked") and lost
@@ -816,6 +829,7 @@ def _run_pretip_pull(event: dict, attempt: int = 1):
 
     if _already_pulled(event["id"], "pretip", game_date):
         _log_paper_predictions(event["id"])
+        _log_challenger_predictions(event["id"])
 
     # One retry, only when the call itself failed. A success (even with no Underdog
     # lines) or a refusal by the cap/reserve is final: retrying would spend or be refused.
@@ -1156,7 +1170,8 @@ def _resolved_app_count() -> int:
 
 
 def _resolve_all(out: dict, app_before: int, tag: str) -> None:
-    """App predictions (database) then paper predictions; counts into out. Never raises."""
+    """App predictions (database), paper predictions, then challenger rows; counts into out.
+    Never raises."""
     import database
     try:
         database.resolve_pending_predictions()
@@ -1171,7 +1186,14 @@ def _resolve_all(out: dict, app_before: int, tag: str) -> None:
     except Exception as exc:
         out["paper_resolved"] = out["resolve"] = f"FAILED: {exc!r}"
         print(f"{tag} paper predictions resolve FAILED: {exc!r}")
-    print(f"{tag} 5/5 resolved: {out['app_resolved']} app + {out['paper_resolved']} paper predictions")
+    try:
+        import challenger_log
+        out["challenger_resolved"] = challenger_log.resolve_challenger_predictions()
+    except Exception as exc:
+        out["challenger_resolved"] = f"FAILED: {exc!r}"
+        print(f"{tag} challenger predictions resolve FAILED: {exc!r}")
+    print(f"{tag} 5/5 resolved: {out['app_resolved']} app + {out['paper_resolved']} paper predictions"
+          f" + {out['challenger_resolved']} challenger rows")
 
 
 def run_sync(scheduler=None, trigger: str = "manual", refresh_rosters: bool = True,

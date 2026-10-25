@@ -12,6 +12,8 @@ const ALL_STAT_TYPES = [
 ]
 const OUTCOME_FILTERS = ['All', 'Correct', 'Incorrect', 'Pending', 'DNP']
 const LEAGUE_FILTERS = ['All', 'NBA', 'NFL', 'WNBA']
+// Which model made the pick (predictions.model). Stats and table default to the challenger.
+const MODEL_FILTERS = ['Challenger', 'Frozen', 'All']
 
 // ---------------------------------------------------------------------------
 // Summary cards
@@ -189,6 +191,7 @@ export default function History() {
   const [statFilter, setStatFilter] = useState('All')
   const [outcomeFilter, setOutcomeFilter] = useState('All')
   const [leagueFilter, setLeagueFilter] = useState('All')
+  const [modelFilter, setModelFilter] = useState('Challenger')
   const [searchQuery, setSearchQuery] = useState('')
   const [page, setPage] = useState(1)
   const [pageSize, setPageSize] = useState(10)
@@ -212,7 +215,7 @@ export default function History() {
   useEffect(() => { fetchHistory() }, [fetchHistory])
 
   // Reset to page 1 whenever filters, search, page size, or sort change
-  useEffect(() => { setPage(1) }, [statFilter, outcomeFilter, leagueFilter, searchQuery, pageSize, sortConfig])
+  useEffect(() => { setPage(1) }, [statFilter, outcomeFilter, leagueFilter, modelFilter, searchQuery, pageSize, sortConfig])
 
   const handleOverride = async (id) => {
     try {
@@ -243,11 +246,13 @@ export default function History() {
     finally { setCleaning(false) }
   }
 
-  // Summary figures over the full dataset (historyStats: DNP and limited-data rows excluded)
-  const summary = historySummary(predictions)
+  // Summary figures over the selected model's predictions (historyStats: DNP and
+  // limited-data rows excluded)
+  const byModel = predictions.filter((p) => modelFilter === 'All' || (p.model ?? 'frozen') === modelFilter.toLowerCase())
+  const summary = historySummary(byModel)
 
   // Filter pipeline
-  const filtered = predictions.filter((p) => {
+  const filtered = byModel.filter((p) => {
     if (leagueFilter !== 'All' && (p.league ?? 'NBA') !== leagueFilter) return false
     if (statFilter !== 'All' && p.stat_type !== statFilter) return false
     if (outcomeFilter === 'Pending') return p.actual_result === null
@@ -313,6 +318,7 @@ export default function History() {
       {/* Filters row */}
       <div className="flex flex-wrap items-center gap-2 mb-4">
         <span className="text-xs uppercase tracking-widest" style={{ color: 'var(--text-muted)' }}>Filter:</span>
+        <FilterSelect value={modelFilter} onChange={setModelFilter} options={MODEL_FILTERS} />
         <FilterSelect value={leagueFilter} onChange={setLeagueFilter} options={LEAGUE_FILTERS} />
         <FilterSelect value={statFilter} onChange={setStatFilter} options={ALL_STAT_TYPES} />
         <FilterSelect value={outcomeFilter} onChange={setOutcomeFilter} options={OUTCOME_FILTERS} />

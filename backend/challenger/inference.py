@@ -76,10 +76,21 @@ def _rows(conn, where: str, params: tuple) -> pd.DataFrame:
 
 
 def features_before_tip(conn, person_id: int, game_id: int) -> tuple[pd.DataFrame, dict]:
-    """The target game's feature row, built from rows that tipped before it."""
+    """The target game's feature row, built from rows that tipped before it (guarded)."""
     ctx = game_context(conn, game_id, person_id)
-    tip = ctx["tip"]
-    assert_dev_tip(tip)
+    assert_dev_tip(ctx["tip"])
+    return features_for_context(conn, person_id, {**ctx, "game_id": int(game_id)})
+
+
+def features_for_context(conn, person_id: int, ctx: dict) -> tuple[pd.DataFrame, dict]:
+    """
+    The feature row for player person_id in a game described by ctx: tip ('YYYY-MM-DD
+    HH:MM:SS', ET), home (0/1), team and opp (team ids), game_id. Reads only rows that
+    tipped before ctx["tip"]. Applies no season guard itself: features_before_tip (research)
+    guards; challenger/live.py (live inference, from Stage 3) passes the context of the
+    upcoming game.
+    """
+    tip, game_id = ctx["tip"], ctx.get("game_id", 0)
     hist = _rows(conn, "personId = ? AND gameDateTimeEst < ?", (int(person_id), tip))
     times = sorted(hist["gameDateTimeEst"])
     team_from = times[-11] if len(times) >= 11 else "0000"
@@ -106,7 +117,7 @@ def features_before_tip(conn, person_id: int, game_id: int) -> tuple[pd.DataFram
     for c in ("personId", "gameId", "home", "playerteamId", "opponentteamId"):
         target[c] = target[c].astype("int64")
     F = build_features(hist, target, team_games_of(team_rows), allowed_table(league))
-    ctx["data_as_of"] = str(hist["t"].max()) if len(hist) else None
+    ctx = {**ctx, "data_as_of": str(hist["t"].max()) if len(hist) else None}
     return F, ctx
 
 

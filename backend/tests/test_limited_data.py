@@ -173,6 +173,9 @@ def client(db, monkeypatch):
     monkeypatch.setattr(predictor, "predict", lambda **kw: {"outcome": "OVER", "confidence": 0.61,
                                                             "explanation": "model"})
     monkeypatch.setattr(data_fetcher, "get_opponent_injuries", lambda team: [])
+    # Points goes to the challenger from Stage 3; these tests are about the flag, not the model
+    monkeypatch.setattr(main, "_challenger_prediction", lambda req, pid: {"outcome": "OVER", "confidence": 0.61,
+                                                                          "explanation": "model"})
     return TestClient(main.app)
 
 
