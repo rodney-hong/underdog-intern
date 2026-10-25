@@ -100,39 +100,91 @@ def get_team_names() -> list[str]:
 # Players
 # ---------------------------------------------------------------------------
 
+# NBA franchise ids (player_stats.playerteamId / rosters.nba_team_id): 1610612737..1610612766.
+NBA_TEAM_ID_MIN, NBA_TEAM_ID_MAX = 1610612737, 1610612766
+SEARCH_RECENT_DAYS = 365          # an NBA regular-season game this recently keeps a player searchable
+SEARCH_MINUTES_DAYS = 30          # ranking: minutes played over this window
+
+
 def search_players(query: str, limit: int = 10) -> list[dict]:
     """
-    Up to `limit` players whose full name contains `query` (case-insensitive), as
-    {"name", "person_id", "team"} so same-named players can be told apart. team: the
-    current roster team (rosters.current_team), else the latest box-score team.
+    Up to `limit` current NBA players matching `query` (case-insensitive substring of the
+    name, an ESPN roster name or a player_aliases alias, e.g. "deuce" -> Miles McBride), as
+    {"name", "person_id", "team"} so same-named players can be told apart.
+      current   on a current ESPN NBA roster (espn_person_map), or at least one NBA
+                regular-season game in the last SEARCH_RECENT_DAYS; players with only
+                preseason/exhibition rows or a non-NBA team (Melbourne United) are left out
+      ranking   roster players first; then a first- or last-name prefix match before a
+                substring-only match; then minutes over the last SEARCH_MINUTES_DAYS days
+      team      the current roster team (rosters.current_team), else the latest NBA
+                regular-season box-score team
+    App path only (manual form, screenshot table); get_player_id is unchanged.
     """
-    q = query.strip()
+    import datetime as dt
+    q = query.strip().lower()
     if not q:
         return []
+    like = f"%{q}%"
+    today = dt.date.today()
+    recent = (today - dt.timedelta(days=SEARCH_RECENT_DAYS)).isoformat()
+    month = (today - dt.timedelta(days=SEARCH_MINUTES_DAYS)).isoformat()
+    rs = "gameType IN ('Regular Season', 'NBA Emirates Cup')"
+    nba = f"playerteamId BETWEEN {NBA_TEAM_ID_MIN} AND {NBA_TEAM_ID_MAX}"
     conn = get_db()
-    rows = conn.execute(
-        """
-        SELECT DISTINCT p.personId, p.firstName, p.lastName,
-               (SELECT ps.playerteamCity || ' ' || ps.playerteamName FROM player_stats ps
-                 WHERE ps.personId = p.personId ORDER BY ps.gameDateTimeEst DESC LIMIT 1) AS box_team
-        FROM players p
-        WHERE (p.firstName || ' ' || p.lastName) LIKE ?
-          AND EXISTS (
-              SELECT 1 FROM player_stats ps
-              WHERE ps.personId = p.personId
-                AND ps.gameDateTimeEst >= '2025-10-01'
-          )
-        LIMIT ?
-        """,
-        (f"%{q}%", limit),
-    ).fetchall()
-    conn.close()
+    try:
+        names = {}                                   # person_id -> names it can be matched by
+        for pid, first, last in conn.execute(
+                "SELECT personId, firstName, lastName FROM players WHERE LOWER(firstName || ' ' || lastName) LIKE ?",
+                (like,)):
+            names.setdefault(int(pid), set()).add(f"{first} {last}")
+        on_roster = {}                               # person_id -> roster display name
+        try:
+            for pid, rname in conn.execute(
+                    f"SELECT m.person_id, r.player_name FROM espn_person_map m JOIN rosters r "
+                    f"ON r.athlete_id = m.athlete_id WHERE m.status = 'ok' AND r.nba_team_id BETWEEN "
+                    f"{NBA_TEAM_ID_MIN} AND {NBA_TEAM_ID_MAX}"):
+                on_roster[int(pid)] = rname
+                if q in rname.lower():
+                    names.setdefault(int(pid), set()).add(rname)
+        except sqlite3.OperationalError:             # no rosters / espn_person_map yet
+            pass
+        try:
+            for pid, alias in conn.execute("SELECT person_id, alias_name FROM player_aliases WHERE "
+                                           "LOWER(alias_name) LIKE ?", (like,)):
+                names.setdefault(int(pid), set()).add(alias)
+        except sqlite3.OperationalError:             # no alias table yet
+            pass
+        if not names:
+            return []
+        marks = ",".join("?" * len(names))
+        ids = list(names)
+        active = {r[0]: r[1] for r in conn.execute(
+            f"SELECT personId, MAX(gameDateTimeEst) FROM player_stats WHERE personId IN ({marks}) AND {rs} "
+            f"AND {nba} AND gameDateTimeEst >= ? GROUP BY personId", (*ids, recent))}
+        minutes = {r[0]: r[1] or 0.0 for r in conn.execute(
+            f"SELECT personId, SUM(numMinutes) FROM player_stats WHERE personId IN ({marks}) AND {rs} "
+            f"AND {nba} AND gameDateTimeEst >= ? GROUP BY personId", (*ids, month))}
+        current = [pid for pid in ids if pid in on_roster or pid in active]
+        display = {r[0]: (r[1], r[2]) for r in conn.execute(
+            f"SELECT personId, firstName, lastName FROM players WHERE personId IN ({marks})", ids)}
+        box_team = {}
+        for pid in current:
+            r = conn.execute(f"SELECT playerteamCity || ' ' || playerteamName FROM player_stats WHERE personId = ? "
+                             f"AND {rs} AND {nba} ORDER BY gameDateTimeEst DESC LIMIT 1", (pid,)).fetchone()
+            box_team[pid] = r[0] if r else None
+    finally:
+        conn.close()
+
+    def prefix(pid):
+        return any(part.startswith(q) for n in names[pid] for part in n.lower().split())
+
+    current.sort(key=lambda pid: (pid not in on_roster, not prefix(pid), -minutes.get(pid, 0.0)))
     out = []
-    for r in rows:
-        name = f"{r['firstName']} {r['lastName']}"
-        roster = rosters.current_team(name, int(r["personId"]))
-        out.append({"name": name, "person_id": int(r["personId"]),
-                    "team": roster["team_full"] if roster else r["box_team"]})
+    for pid in current[:limit]:
+        first_last = display.get(pid)
+        name = f"{first_last[0]} {first_last[1]}" if first_last else on_roster[pid]
+        roster = rosters.current_team(name, pid)
+        out.append({"name": name, "person_id": pid, "team": roster["team_full"] if roster else box_team.get(pid)})
     return out
 
 

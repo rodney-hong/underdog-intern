@@ -199,6 +199,66 @@ def test_search_returns_person_id_and_team(league):
     assert by_id[1631119] == {"name": "Jaylin Williams", "person_id": 1631119, "team": "Oklahoma City Thunder"}
 
 
+def _add_players(path, rows):
+    """rows: (personId, first, last, date, gameType, (teamId, city, name), minutes)."""
+    conn = sqlite3.connect(path)
+    for pid, first, last, date, gtype, team, mins in rows:
+        conn.execute("INSERT OR IGNORE INTO players SELECT ?, ?, ? WHERE NOT EXISTS "
+                     "(SELECT 1 FROM players WHERE personId = ?)", (pid, first, last, pid))
+        conn.execute("INSERT INTO player_stats VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                     (pid, first, last, f"{date} 19:00:00", gtype, *team, mins))
+    conn.commit()
+    conn.close()
+
+
+def _days_ago(n):
+    return (dt.date.today() - dt.timedelta(days=n)).isoformat()
+
+
+def test_search_leaves_out_exhibition_only_and_non_nba_players(league):
+    united = (15019, "Melbourne", "United")
+    _add_players(league, [
+        (1628495, "Milton", "Doyle", _days_ago(20), "Preseason", united, 25),       # NBL, exhibition vs an NBA team
+        (1643575, "Duke", "Miles", _days_ago(15), "Preseason", (1610612755, "Philadelphia", "76ers"), 12),
+        (1600001, "Mila", "Old", "2024-01-10", "Regular Season", NETS, 20)])         # last NBA game > 365 days ago
+    names = [r["name"] for r in data_fetcher.search_players("mil")]
+    assert "Milton Doyle" not in names and "Duke Miles" not in names and "Mila Old" not in names
+
+
+def test_search_ranks_prefix_matches_above_substring_only(league):
+    knicks, suns = (1610612752, "New York", "Knicks"), (1610612756, "Phoenix", "Suns")
+    _add_players(league, [
+        (1630540, "Miles", "McBride", _days_ago(3), "Regular Season", knicks, 20),
+        (1628970, "Miles", "Bridges", _days_ago(3), "Regular Season", suns, 25),
+        (1600002, "Jamil", "Wilson", _days_ago(3), "Regular Season", NETS, 40),      # more minutes, substring only
+        (1600003, "Kamila", "Stone", _days_ago(2), "Regular Season", BULLS, 38)])
+    names = [r["name"] for r in data_fetcher.search_players("mil")]
+    assert names.index("Miles Bridges") < names.index("Miles McBride")            # same tier: more minutes first
+    assert max(names.index("Miles Bridges"), names.index("Miles McBride")) <         min(names.index("Jamil Wilson"), names.index("Kamila Stone"))
+    out = {r["name"]: r for r in data_fetcher.search_players("miles")}
+    assert out["Miles McBride"] == {"name": "Miles McBride", "person_id": 1630540, "team": "New York Knicks"}
+
+
+def test_roster_players_rank_first(league):
+    _add_players(league, [(1600004, "Jaylin", "Williamson", _days_ago(1), "Regular Season", NETS, 48)])
+    names = [r["name"] for r in data_fetcher.search_players("will")]
+    # the three Thunder Williamses are on the ESPN roster (no minutes in the last 30 days);
+    # Williamson isn't, so he comes after them despite 48 recent minutes
+    assert set(names[:3]) == {"Jalen Williams", "Jaylin Williams", "Kenrich Williams"}
+    assert names[3] == "Jaylin Williamson"
+
+
+def test_search_finds_players_by_alias(league):
+    import player_aliases
+    _add_players(league, [(1630540, "Miles", "McBride", _days_ago(3), "Regular Season",
+                           (1610612752, "New York", "Knicks"), 20)])
+    conn = sqlite3.connect(league)
+    player_aliases.init_table(conn)                             # seeds "Deuce McBride" -> 1630540
+    conn.close()
+    assert [r["person_id"] for r in data_fetcher.search_players("deuce")] == [1630540]
+    assert data_fetcher.search_players("deu")[0]["name"] == "Miles McBride"
+
+
 def test_espn_items_store_athlete_id(espn):
     items = news_ingest.espn_items(espn)
     assert [i["athlete_id"] for i in items] == ["4432823", "4397227"]
