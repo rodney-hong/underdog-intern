@@ -366,8 +366,9 @@ def resolve_player(conn, name: str, team: str | None) -> dict:
     """
     Exact name_key against the ESPN rosters, then the card's team (ESPN or NBA abbreviation,
     nickname or full name) if it shows one. Exactly one roster player left -> {"status": "ok",
-    "player_name", "team_abbrev", "team_name"}; none -> not_found, or team_mismatch (the name
-    is on a roster, but not on the card's team; "roster_teams" lists where); several ->
+    "player_name", "team_abbrev", "team_name"}. None left: a player_aliases alias whose player is
+    on the card's team (adds "person_id", "via": "alias"), else not_found, or team_mismatch (the
+    name is on a roster, but not on the card's team; "roster_teams" lists where). Several ->
     ambiguous (left blank).
     """
     import rosters
@@ -388,6 +389,11 @@ def resolve_player(conn, name: str, team: str | None) -> dict:
         h = hits[0]
         return {"status": "ok", "player_name": h["player_name"], "team_abbrev": h["team_abbrev"],
                 "team_name": f"{h['team_city']} {h['team_name']}"}
+    if not hits:                     # no exact roster match on the card's team: an alias may (app path only)
+        import player_aliases
+        via = player_aliases.resolve(conn, name, team)
+        if via:
+            return via
     if not hits and named:
         return {"status": "team_mismatch", "roster_teams": sorted(f"{h['team_city']} {h['team_name']}" for h in named)}
     return {"status": "ambiguous" if hits else "not_found"}
@@ -544,6 +550,8 @@ def confirmation_rows(rows: list[dict], context_fn=None, record: bool = True) ->
     today = checked_at.astimezone(ZoneInfo("America/New_York")).date().isoformat()
     conn = database.get_connection()
     try:
+        import player_aliases
+        player_aliases.init_table(conn)
         out = []
         for r in rows:
             who = resolve_player(conn, r["player_name"], r["team"])
@@ -559,8 +567,8 @@ def confirmation_rows(rows: list[dict], context_fn=None, record: bool = True) ->
                            is_home=bool(ctx.get("is_home")), is_back_to_back=bool(ctx.get("is_back_to_back")),
                            game_date=ctx.get("next_game_date"))
                 # the same personId /predict resolves from this row's name, game date and opponent
-                row["person_id"] = database.resolve_person_id(conn, who["player_name"], row["game_date"],
-                                                              row["opponent_team"])
+                row["person_id"] = who.get("person_id") or database.resolve_person_id(
+                    conn, who["player_name"], row["game_date"], row["opponent_team"])
                 if r["stat"]:
                     rng = historical_range(conn, row["person_id"], r["stat"])
                     row["range"] = rng

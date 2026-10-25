@@ -79,6 +79,10 @@ describe('screenshot table, last row, unresolved player', () => {
     await screen.findByText('Predict 3 rows')
     expect(screen.queryByRole('listbox')).toBeNull()
     expect(globalThis.fetch).toHaveBeenCalledWith(expect.stringContaining('/players/Jaxson%20Hayes/team'))
+    // the pick is remembered for next time: card name -> personId
+    const alias = globalThis.fetch.mock.calls.find(([url]) => url.includes('/screenshot/alias'))
+    expect(alias[1].method).toBe('POST')
+    expect(JSON.parse(alias[1].body)).toEqual({ screenshot_name: 'Jaxson Hayes', person_id: 1629637 })
     const table = screen.getByRole('table')
     expect(within(table).getByDisplayValue('Los Angeles Lakers')).toBeTruthy()   // opponent filled
   })

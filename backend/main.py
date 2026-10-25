@@ -771,6 +771,38 @@ async def screenshot_extract(request: Request, file: UploadFile = File(...)):
     return {"extractor": name, "rows": await run_in_threadpool(si.confirmation_rows, rows)}
 
 
+class AliasRequest(BaseModel):
+    screenshot_name: str          # the card's name, as extracted
+    person_id: int                # the player picked in the row's search
+
+
+@app.post("/screenshot/alias")
+def learn_alias(req: AliasRequest, request: Request):
+    """An unmatched screenshot row resolved by picking a player: remember card name -> personId
+    (player_aliases, source 'user') unless the name collides or is a roster name."""
+    import player_aliases
+    _require_local(request)
+    conn = database.get_connection()
+    try:
+        player_aliases.init_table(conn)
+        return player_aliases.learn(conn, req.screenshot_name, req.person_id)
+    finally:
+        conn.close()
+
+
+@app.delete("/screenshot/alias")
+def delete_alias(request: Request, name: str = Query(..., min_length=1), person_id: int | None = Query(default=None)):
+    """Remove a wrong alias (all of the name's aliases, or only the one for person_id)."""
+    import player_aliases
+    _require_local(request)
+    conn = database.get_connection()
+    try:
+        player_aliases.init_table(conn)
+        return {"deleted": player_aliases.delete(conn, name, person_id)}
+    finally:
+        conn.close()
+
+
 @app.get("/sync")
 def last_sync(request: Request):
     """The latest finished sync's result in this backend process (null before the first)."""

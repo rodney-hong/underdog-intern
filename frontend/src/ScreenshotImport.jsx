@@ -49,6 +49,15 @@ export default function ScreenshotImport({ teams }) {
   // An unresolved row's player picked in its search: the same team lookup the manual form makes
   const pick = async (key, name, suggestion) => {
     edit(key, (r) => selectPlayer(r, name, suggestion, null))
+    // Remember the card's name for this player (the server skips collision and roster names)
+    const card = rows.find((r) => r.key === key)?.card_name
+    if (card && suggestion?.person_id) {
+      fetch(`${API}/screenshot/alias`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ screenshot_name: card, person_id: suggestion.person_id }),
+      }).catch(() => {})
+    }
     try {
       const res = await fetch(`${API}/players/${encodeURIComponent(name)}/team`)
       const team = res.ok ? await res.json() : null
