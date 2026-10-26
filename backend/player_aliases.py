@@ -28,7 +28,8 @@ from rosters import name_key
 # in line_snapshots: the only unresolved ones, each with exactly one same-team candidate).
 SEEDS = [("Deuce McBride", 1630540, "Knicks"),        # Miles McBride
          ("Herb Jones", 1630529, "Pelicans"),          # Herbert Jones
-         ("Ron Holland", 1641842, "Pistons")]          # Ronald Holland II
+         ("Ron Holland", 1641842, "Pistons"),          # Ronald Holland II
+         ("Lu Dort", 1629652, "Hawks")]                # Luguentz Dort (added 2026-10-26)
 
 _DDL = """
     CREATE TABLE IF NOT EXISTS player_aliases (
