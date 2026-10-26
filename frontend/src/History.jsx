@@ -413,7 +413,7 @@ export default function History() {
   const replaced = summary.all - summary.current
 
   return (
-    <div className="w-full">
+    <div className="history-fit w-full">
       {/* Title row: the screen's name, what the figures leave out, the one clean-up action */}
       <div className="flex flex-wrap items-start justify-between gap-x-6 gap-y-3 mb-6">
         <div className="min-w-0">
@@ -462,7 +462,7 @@ export default function History() {
         />
       )}
 
-      <section className="card" aria-label="Predictions table">
+      <section className="card history-table" aria-label="Predictions table">
         {/* Filters: a two-column grid on phones, one row on wider screens */}
         <div className="grid grid-cols-2 sm:flex sm:flex-wrap items-end gap-3 p-4" style={{ borderBottom: '1px solid var(--border)' }}>
           <FilterSelect value={modelFilter} onChange={setModelFilter} options={MODEL_FILTERS} label="Model" className="w-full sm:w-auto" />
@@ -502,7 +502,8 @@ export default function History() {
           </div>
         </div>
 
-        {/* Table (desktop) or rows (phones). No inner scroll: the page scrolls and the header row sticks. */}
+        {/* Table (desktop) or rows (phones). From 768 px the table scrolls in its own area under a sticky header;
+            below that the page scrolls. */}
         {loading ? (
           <div className="px-4 py-16 text-sm" style={{ color: 'var(--text-muted)' }}>Loading…</div>
         ) : loadError ? (
@@ -523,7 +524,7 @@ export default function History() {
                 ))}
               </ul>
             ) : (
-              <div className="px-2">
+              <div className="history-scroll px-2">
                 <table className="data-table w-full text-sm" style={{ tableLayout: 'fixed' }}>
                   <colgroup>
                     <col style={{ width: '12%' }} />

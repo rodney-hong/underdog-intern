@@ -328,6 +328,43 @@
   border-top: 1px solid var(--rule);
 }
 
+/* History from 768 px: the screen fills the viewport and the table scrolls inside its card, so
+   rows per page never lengthens the page; filters and the pager stay in view. The height is the
+   viewport less the shell around <main>: the 57 px top bar plus 24 + 48 px padding below 1024 px,
+   32 + 48 px padding beside the sidebar from 1024 px. Phones keep normal page scrolling. */
+@media (min-width: 768px) {
+  .history-fit {
+    display: flex;
+    flex-direction: column;
+    height: calc(100vh - 129px);
+    height: calc(100dvh - 129px);
+    min-height: 480px;
+  }
+  .history-fit > * {
+    flex: none;
+  }
+  .history-fit > .history-table {
+    flex: 1 1 auto;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+  }
+  .history-table > * {
+    flex: none;
+  }
+  .history-table > .history-scroll {
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow-y: auto;
+  }
+}
+@media (min-width: 1024px) {
+  .history-fit {
+    height: calc(100vh - 80px);
+    height: calc(100dvh - 80px);
+  }
+}
+
 .sort-header {
   cursor: pointer;
   user-select: none;
