@@ -8,6 +8,7 @@ import datetime as dt
 import gzip
 import os
 import sqlite3
+import subprocess
 import sys
 
 import pytest
@@ -16,8 +17,10 @@ BACKEND = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, BACKEND)
 
 import database          # noqa: E402
+import deploy_guard      # noqa: E402
 import offsite_backup    # noqa: E402
 
+ET = deploy_guard.EASTERN
 
 
 # --- 0.5 Kaggle cache pruning ----------------------------------------------------------
@@ -197,3 +200,67 @@ def test_backup_settings(monkeypatch):
     for k in offsite_backup.SETTINGS:
         monkeypatch.delenv(k, raising=False)
     assert not offsite_backup.configured() and offsite_backup.missing_settings() == list(offsite_backup.SETTINGS)
+
+
+# --- 0.8 deploy guard ----------------------------------------------------------------------
+
+@pytest.fixture
+def sched_db(tmp_path):
+    path = str(tmp_path / "s.db")
+    conn = sqlite3.connect(path)
+    conn.execute("CREATE TABLE schedule (gameId INTEGER, gameDateTimeEst TEXT)")
+    conn.executemany("INSERT INTO schedule VALUES (?, ?)", [(1, "2026-11-05 19:00:00"), (2, "2026-11-05 22:30:00"),
+                                                            (3, "2026-11-06 00:10:00")])
+    conn.commit()
+    conn.close()
+    return path
+
+
+def _at(day, hh, mm):
+    return dt.datetime.combine(dt.date.fromisoformat(day), dt.time(hh, mm), ET)
+
+
+@pytest.mark.parametrize("when, ok", [
+    (("2026-11-05", 9, 59), True),
+    (("2026-11-05", 10, 0), False),          # open pull
+    (("2026-11-05", 10, 4), False),
+    (("2026-11-05", 10, 5), True),
+    (("2026-11-05", 17, 44), True),          # pre-tip 18:30: guard 17:45-19:15
+    (("2026-11-05", 17, 45), False),
+    (("2026-11-05", 18, 30), False),
+    (("2026-11-05", 19, 15), False),
+    (("2026-11-05", 19, 16), True),
+    (("2026-11-05", 21, 20), False),         # pre-tip 22:00
+    (("2026-11-05", 23, 0), False),          # 00:10 tip next day: pre-tip 23:40
+    (("2026-11-06", 0, 26), True),
+])
+def test_deploy_guard_windows(sched_db, when, ok):
+    got, why = deploy_guard.check(_at(*when), sched_db, etl_lock_free=lambda: True)
+    assert got is ok, why
+
+
+def test_deploy_guard_refuses_while_the_etl_lock_is_held(sched_db):
+    ok, why = deploy_guard.check(_at("2026-11-05", 12, 0), sched_db, etl_lock_free=lambda: False)
+    assert not ok and "ETL lock" in why
+
+
+def test_deploy_guard_cli_exit_codes(sched_db, tmp_path):
+    """The command deploy.sh runs: exit 1 and a reason when refused (time pinned in the child)."""
+    code = ("import sys, datetime as dt; sys.path.insert(0, sys.argv[1]); import deploy_guard as g; "
+            "ok, why = g.check(dt.datetime(2026, 11, 5, 15, 0, tzinfo=dt.timezone.utc), sys.argv[2], lambda: True); "
+            "print(why); sys.exit(0 if ok else 1)")
+    r = subprocess.run([sys.executable, "-c", code, BACKEND, sched_db], capture_output=True, text=True, timeout=60)
+    assert r.returncode == 1 and "open-pull window" in r.stdout      # 15:00 UTC = 10:00 ET
+
+
+def test_deploy_sh_parses_and_runs_the_guard_twice():
+    sh = os.path.join(os.path.dirname(BACKEND), "deploy.sh")
+    text = open(sh, encoding="utf-8").read()
+    assert text.count("guard ||") + text.count("if ! guard") == 2
+    assert "--no-deps -r backend/requirements-lock.txt" in text and "VITE_API_BASE=/api" in text
+    bash = "bash"
+    try:
+        r = subprocess.run([bash, "-n"], input=text.encode(), capture_output=True, timeout=30)   # bytes: LF kept
+    except FileNotFoundError:
+        pytest.skip("no bash on this machine")
+    assert r.returncode == 0, r.stderr.decode()

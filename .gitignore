@@ -40,3 +40,6 @@ Thumbs.db
 
 # Cross-process lock files (backend/proc_lock.py)
 *.lock
+
+# deploy.sh: commit the server last restarted on (server only)
+.deployed
