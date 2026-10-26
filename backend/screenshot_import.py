@@ -6,8 +6,8 @@ The LLM only transcribes text from the image (player, team, stat, line, multipli
 It never predicts: predictions come from /predict after the user confirms each row.
 
 Extractor (SCREENSHOT_EXTRACTOR in .env):
-  ollama  (default) local Ollama vision model SCREENSHOT_OLLAMA_MODEL (default gemma4:12b)
-          at OLLAMA_URL. The screenshot's card grid is detected (detect_cards), each card
+  ollama  (default; development on the PC) local Ollama vision model SCREENSHOT_OLLAMA_MODEL
+          (default gemma4:12b) at OLLAMA_URL. The screenshot's card grid is detected (detect_cards), each card
           is cropped and upscaled and read on its own, twice (READ_SCALES), asking only
           for the raw text: name, stat label, line. Stat labels are mapped in code
           (normalize_stat). Multipliers are NOT read on this path, so the prices of
@@ -15,6 +15,14 @@ Extractor (SCREENSHOT_EXTRACTOR in .env):
           which OddsAPI doesn't carry) are not captured yet: line_checks records only that
           a line is on a rung (is_rung). Two reads that disagree flag the row.
           No cards detected: the whole image is read instead, also twice.
+  ollama_cloud  (the server) the same card reads through Ollama Cloud's API (OLLAMA_CLOUD_URL,
+          default https://ollama.com; key OLLAMA_API_KEY; model SCREENSHOT_OLLAMA_CLOUD_MODEL,
+          default gemma4:31b), SCREENSHOT_OLLAMA_CLOUD_PARALLEL reads at once (1: the Free
+          plan's concurrency). When Ollama Cloud fails, above all on a usage-limit / quota
+          error, the image is read again with gemini and the switch is logged; after a quota
+          error gemini is used directly for QUOTA_COOLDOWN_MINUTES.
+  gemini  the same card reads through the Gemini API (generateContent, key GEMINI_API_KEY, model
+          SCREENSHOT_GEMINI_MODEL, default gemma-4-31b-it), image sent inline (no file upload).
   claude  Claude API, key ANTHROPIC_API_KEY, model SCREENSHOT_CLAUDE_MODEL; whole image,
           one call, multipliers included.
 The image is held in memory only: nothing is written to disk.
@@ -33,12 +41,20 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-EXTRACTORS = ("claude", "ollama")
+EXTRACTORS = ("claude", "ollama", "ollama_cloud", "gemini")
 DEFAULT_EXTRACTOR = "ollama"
 CLAUDE_MODEL = os.getenv("SCREENSHOT_CLAUDE_MODEL", "claude-opus-5-5")
 OLLAMA_MODEL = os.getenv("SCREENSHOT_OLLAMA_MODEL", "gemma4:12b")
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
 OLLAMA_PARALLEL = int(os.getenv("SCREENSHOT_OLLAMA_PARALLEL", "6"))   # concurrent card reads (6: fastest measured, RTX 5070 Ti)
+OLLAMA_CLOUD_URL = os.getenv("OLLAMA_CLOUD_URL", "https://ollama.com")
+OLLAMA_CLOUD_MODEL = os.getenv("SCREENSHOT_OLLAMA_CLOUD_MODEL", "gemma4:31b")
+OLLAMA_CLOUD_PARALLEL = int(os.getenv("SCREENSHOT_OLLAMA_CLOUD_PARALLEL", "1"))   # Free plan: 1 concurrent request
+GEMINI_URL = os.getenv("GEMINI_URL", "https://generativelanguage.googleapis.com")
+GEMINI_MODEL = os.getenv("SCREENSHOT_GEMINI_MODEL", "gemma-4-31b-it")
+GEMINI_PARALLEL = int(os.getenv("SCREENSHOT_GEMINI_PARALLEL", "2"))
+FALLBACK = {"ollama_cloud": "gemini"}   # extractor -> the one used when it fails
+QUOTA_COOLDOWN_MINUTES = 60             # after a usage-limit error, skip that service this long
 READ_SCALES = (2, 3)           # each card is read twice, upscaled 2x and 3x
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
 MAX_IMAGE_SIDE = 2000          # longer side, px; larger screenshots are scaled down first
@@ -82,6 +98,10 @@ SCHEMA = {
 
 class ExtractorUnavailable(Exception):
     """The configured extractor can't run (no API key, Ollama down, unknown setting)."""
+
+
+class QuotaExceeded(ExtractorUnavailable):
+    """A hosted service refused because a usage limit, quota or rate limit was reached."""
 
 
 class BadImage(ValueError):
@@ -267,30 +287,113 @@ def _out_of_memory(resp) -> bool:
                                    "unable to allocate", "insufficient memory", "not enough memory"))
 
 
-def _ollama_json(img, prompt: str) -> dict:
-    """One Ollama call on a PIL image: temperature 0, thinking off, JSON mode."""
+_QUOTA_WORDS = ("usage limit", "quota", "limit reached", "limit exceeded", "rate limit", "too many requests",
+                "resource_exhausted", "resource exhausted", "out of credits", "insufficient credits",
+                "subscription", "upgrade")
+
+
+def _is_quota(resp) -> bool:
+    """A usage-limit / quota / rate-limit refusal: 429, 402, or a 4xx that says so."""
+    if resp.status_code in (402, 429):
+        return True
+    try:
+        text = resp.text.lower()
+    except Exception:
+        return False
+    return 400 <= resp.status_code < 500 and any(w in text for w in _QUOTA_WORDS)
+
+
+def _png_b64(img) -> str:
     buf = io.BytesIO()
     img.save(buf, format="PNG")
-    body = {"model": OLLAMA_MODEL, "stream": False, "format": "json", "think": False,
+    return base64.b64encode(buf.getvalue()).decode()
+
+
+def _json_text(text: str) -> dict:
+    """The JSON object in a model's reply: plain, fenced, or with words around it."""
+    text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text.strip())    # tolerate a fenced reply
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        i, j = text.find("{"), text.rfind("}")
+        if i < 0 or j <= i:
+            raise
+        return json.loads(text[i:j + 1])
+
+
+def _ollama_chat(img, prompt: str, url: str, model: str, label: str, headers: dict | None = None) -> dict:
+    """One Ollama /api/chat call on a PIL image: temperature 0, thinking off, JSON mode."""
+    body = {"model": model, "stream": False, "format": "json", "think": False,
             "options": {"temperature": 0},
-            "messages": [{"role": "user", "content": prompt,
-                          "images": [base64.b64encode(buf.getvalue()).decode()]}]}
+            "messages": [{"role": "user", "content": prompt, "images": [_png_b64(img)]}]}
+    kw = {"headers": headers} if headers else {}
     for attempt in (1, 2):   # one retry on a 5xx: a model load can fail once (CUDA init, VRAM)
         try:
-            resp = httpx.post(f"{OLLAMA_URL}/api/chat", timeout=300, json=body)
+            resp = httpx.post(f"{url}/api/chat", timeout=300, json=body, **kw)
             resp.raise_for_status()
             break
         except httpx.HTTPStatusError as exc:
+            if _is_quota(exc.response):
+                raise QuotaExceeded(f"{label} usage limit reached (HTTP {exc.response.status_code})") from exc
+            if exc.response.status_code in (401, 403):
+                raise ExtractorUnavailable(f"{label} refused the API key (HTTP {exc.response.status_code})") from exc
             if attempt == 2 or exc.response.status_code < 500:
                 if _out_of_memory(exc.response):
                     raise ExtractorUnavailable(GPU_MEMORY_MESSAGE) from exc
-                raise ExtractorUnavailable(f"Ollama ({OLLAMA_URL}, {OLLAMA_MODEL}) failed: {exc}") from exc
+                raise ExtractorUnavailable(f"{label} ({url}, {model}) failed: {exc}") from exc
             time.sleep(2)
         except httpx.HTTPError as exc:
-            raise ExtractorUnavailable(f"Ollama ({OLLAMA_URL}, {OLLAMA_MODEL}) failed: {exc}") from exc
-    text = resp.json()["message"]["content"].strip()
-    text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text)    # tolerate a fenced reply
-    return json.loads(text)
+            raise ExtractorUnavailable(f"{label} ({url}, {model}) failed: {exc}") from exc
+    return _json_text(resp.json()["message"]["content"])
+
+
+def _ollama_json(img, prompt: str) -> dict:
+    """Local Ollama (development on the PC)."""
+    return _ollama_chat(img, prompt, OLLAMA_URL, OLLAMA_MODEL, "Ollama")
+
+
+def _ollama_cloud_json(img, prompt: str) -> dict:
+    """Ollama Cloud: the same /api/chat on OLLAMA_CLOUD_URL with a Bearer OLLAMA_API_KEY."""
+    key = os.getenv("OLLAMA_API_KEY", "").strip()
+    if not key:
+        raise ExtractorUnavailable("OLLAMA_API_KEY is not set in backend/.env")
+    return _ollama_chat(img, prompt, OLLAMA_CLOUD_URL, OLLAMA_CLOUD_MODEL, "Ollama Cloud",
+                        headers={"Authorization": f"Bearer {key}"})
+
+
+def _gemini_json(img, prompt: str) -> dict:
+    """Gemini API generateContent: image inline (base64, never uploaded as a file), temperature 0.
+    No JSON mode (Gemma models on the Gemini API may not offer it): the prompt asks for JSON and
+    _json_text reads it. Thought parts, if any, are skipped."""
+    key = os.getenv("GEMINI_API_KEY", "").strip()
+    if not key:
+        raise ExtractorUnavailable("GEMINI_API_KEY is not set in backend/.env")
+    url = f"{GEMINI_URL}/v1beta/models/{GEMINI_MODEL}:generateContent"
+    body = {"contents": [{"role": "user", "parts": [
+                {"inline_data": {"mime_type": "image/png", "data": _png_b64(img)}}, {"text": prompt}]}],
+            "generationConfig": {"temperature": 0}}
+    for attempt in (1, 2):   # one retry on a 5xx
+        try:
+            resp = httpx.post(url, timeout=300, json=body, headers={"x-goog-api-key": key})
+            resp.raise_for_status()
+            break
+        except httpx.HTTPStatusError as exc:
+            if _is_quota(exc.response):
+                raise QuotaExceeded(f"Gemini usage limit reached (HTTP {exc.response.status_code})") from exc
+            if exc.response.status_code in (401, 403) or "api key not valid" in exc.response.text.lower():
+                raise ExtractorUnavailable(f"Gemini refused the API key (HTTP {exc.response.status_code})") from exc
+            if attempt == 2 or exc.response.status_code < 500:
+                raise ExtractorUnavailable(f"Gemini ({GEMINI_MODEL}) failed: {exc}") from exc
+            time.sleep(2)
+        except httpx.HTTPError as exc:
+            raise ExtractorUnavailable(f"Gemini ({GEMINI_MODEL}) failed: {exc}") from exc
+    data = resp.json()
+    cands = data.get("candidates") or []
+    if not cands:
+        reason = (data.get("promptFeedback") or {}).get("blockReason", "no candidates")
+        raise ExtractorUnavailable(f"Gemini returned no answer ({reason})")
+    parts = (cands[0].get("content") or {}).get("parts") or []
+    return _json_text("".join(p.get("text", "") for p in parts if not p.get("thought")))
 
 
 def _read_key(r: dict) -> tuple:
@@ -342,15 +445,28 @@ def _upscale(img, factor: float):
 
 
 def _extract_ollama(png: bytes, media_type: str) -> list[dict]:
-    """Cards detected: each card cropped and read at each of READ_SCALES (up to
-    OLLAMA_PARALLEL calls at once), one raw row per card. No cards: the whole image,
-    read twice (1x and 1.5x)."""
+    return _extract_cards(png, lambda im, prompt: _ollama_json(im, prompt), OLLAMA_PARALLEL)
+
+
+def _extract_ollama_cloud(png: bytes, media_type: str) -> list[dict]:
+    return _extract_cards(png, _ollama_cloud_json, OLLAMA_CLOUD_PARALLEL)
+
+
+def _extract_gemini(png: bytes, media_type: str) -> list[dict]:
+    return _extract_cards(png, _gemini_json, GEMINI_PARALLEL)
+
+
+def _extract_cards(png: bytes, read_json, parallel: int) -> list[dict]:
+    """Cards detected: each card cropped and read at each of READ_SCALES (up to `parallel`
+    calls at once) with read_json(image, prompt), one raw row per card. No cards: the whole
+    image, read twice (1x and 1.5x). A usage-limit error on any read fails the whole image
+    (QuotaExceeded), so a fallback service reads all of it again."""
     from concurrent.futures import ThreadPoolExecutor
     from PIL import Image
     img = Image.open(io.BytesIO(png)).convert("RGB")
     boxes = detect_cards(img)
     if not boxes:
-        first, second = [_ollama_json(_upscale(img, f) if f > 1 else img, SHEET_PROMPT).get("cards") or []
+        first, second = [read_json(_upscale(img, f) if f > 1 else img, SHEET_PROMPT).get("cards") or []
                          for f in (1, 1.5)]
         rows = [_two_reads(x, second[i] if i < len(second) else {}) for i, x in enumerate(first)]
         if len(second) != len(first):
@@ -365,13 +481,16 @@ def _extract_ollama(png: bytes, media_type: str) -> list[dict]:
 
     def read(im):   # one card read never fails the image: its error is kept for that card
         try:
-            return _ollama_json(im, CARD_PROMPT)
+            return read_json(im, CARD_PROMPT)
         except Exception as exc:
             return exc
 
-    with ThreadPoolExecutor(max_workers=max(1, OLLAMA_PARALLEL)) as ex:
+    with ThreadPoolExecutor(max_workers=max(1, parallel)) as ex:
         results = list(ex.map(read, jobs))
     errors = [r for r in results if isinstance(r, Exception)]
+    quota = next((e for e in errors if isinstance(e, QuotaExceeded)), None)
+    if quota is not None:
+        raise quota
     if errors and len(errors) == len(results):          # nothing read at all: say why
         first = next((e for e in errors if isinstance(e, ExtractorUnavailable)), errors[0])
         if isinstance(first, ExtractorUnavailable):
@@ -387,7 +506,10 @@ def _extract_ollama(png: bytes, media_type: str) -> list[dict]:
     return rows
 
 
-_EXTRACT = {"claude": _extract_claude, "ollama": _extract_ollama}
+_EXTRACT = {"claude": _extract_claude, "ollama": _extract_ollama, "ollama_cloud": _extract_ollama_cloud,
+            "gemini": _extract_gemini}
+_LABEL = {"claude": "Claude", "ollama": "Ollama", "ollama_cloud": "Ollama Cloud", "gemini": "Gemini"}
+_quota_until: dict[str, float] = {}     # extractor -> time.monotonic() until which it is skipped
 
 
 def extractor_name() -> str:
@@ -397,12 +519,39 @@ def extractor_name() -> str:
     return name
 
 
+def _read_with_fallback(name: str, png: bytes, media_type: str) -> tuple[str, list[dict]]:
+    """Run extractor `name`; if it fails and has a FALLBACK, run that and log the switch.
+    After a QuotaExceeded the primary is skipped for QUOTA_COOLDOWN_MINUTES. Both failing
+    raises one ExtractorUnavailable that says so (shown in the app)."""
+    fallback = FALLBACK.get(name)
+    if fallback is None:
+        return name, _EXTRACT[name](png, media_type)
+    first_error = None
+    if time.monotonic() < _quota_until.get(name, 0.0):
+        first_error = f"usage limit reached earlier; retried after {QUOTA_COOLDOWN_MINUTES} min"
+        print(f"[screenshot] {_LABEL[name]} usage limit reached recently: reading with {_LABEL[fallback]}")
+    else:
+        try:
+            return name, _EXTRACT[name](png, media_type)
+        except ExtractorUnavailable as exc:
+            first_error = str(exc)
+            if isinstance(exc, QuotaExceeded):
+                _quota_until[name] = time.monotonic() + QUOTA_COOLDOWN_MINUTES * 60
+            print(f"[screenshot] {_LABEL[name]} failed ({exc}); switching to {_LABEL[fallback]}")
+    try:
+        return fallback, _EXTRACT[fallback](png, media_type)
+    except ExtractorUnavailable as exc:
+        raise ExtractorUnavailable(
+            f"Screenshot reading is unavailable right now: {_LABEL[name]} ({first_error}) and "
+            f"{_LABEL[fallback]} ({exc}) both failed. Enter the lines by hand, or try again later.") from exc
+
+
 def extract_rows(image: bytes) -> tuple[str, list[dict]]:
     """(extractor used, normalized rows) for an uploaded image."""
     name = extractor_name()
     png, media_type = prepare_image(image)
-    raw = _EXTRACT[name](png, media_type)
-    return name, [r for r in (normalize_row(x) for x in raw if isinstance(x, dict)) if r]
+    used, raw = _read_with_fallback(name, png, media_type)
+    return used, [r for r in (normalize_row(x) for x in raw if isinstance(x, dict)) if r]
 
 
 # ---------------------------------------------------------------------------
