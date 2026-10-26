@@ -1,11 +1,12 @@
 import { useState, useEffect } from 'react'
 import History from './History'
+import Login from './Login'
 import ScreenshotImport from './ScreenshotImport'
+import { apiFetch, checkSession, logout, onUnauthorized } from './api'
 import { fetchTrackRecord, pct, rangeStr } from './trackRecord'
 import { ClearButton, Label } from './components/fields'
 import PlayerSearch from './components/PlayerSearch'
 
-const API = 'http://localhost:8000'
 const STAT_TYPES = [
   'Points', 'Assists', 'Rebounds', 'PRA', '3PM', 'PR', 'PA', 'RA',
   'Blocks', 'Steals', 'Blocks+Steals', 'Turnovers',
@@ -37,9 +38,12 @@ function MoonIcon() {
 // Utility components
 // ---------------------------------------------------------------------------
 
+// Hidden fields render nothing (a collapsed wrapper still took its share of the form's
+// spacing); they slide in when a player is chosen.
 function FieldWrapper({ children, visible }) {
+  if (!visible) return null
   return (
-    <div className={`transition-all duration-300 ${visible ? 'animate-slide-down opacity-100' : 'opacity-0 pointer-events-none h-0 overflow-hidden'}`}>
+    <div className="transition-all duration-300 animate-slide-down opacity-100">
       {children}
     </div>
   )
@@ -272,8 +276,8 @@ function TrackRecordLine({ player, stat, league, predictionId, model }) {
 function ResultCard({ result, player, stat, league }) {
   const isOver = result.outcome === 'OVER'
   return (
-    <div className="card animate-fade-in mt-6 rounded-2xl p-6 space-y-4">
-      <div className="flex items-center gap-4">
+    <div className="card animate-fade-in mt-6 rounded-2xl p-5 sm:p-6 space-y-4">
+      <div className="flex flex-wrap items-center gap-x-4 gap-y-3">
         <span className="text-4xl font-black tracking-tight" style={{ color: isOver ? 'var(--success)' : 'var(--danger)' }}>
           {result.outcome}
         </span>
@@ -281,7 +285,7 @@ function ResultCard({ result, player, stat, league }) {
           <span className="text-xs uppercase tracking-widest" style={{ color: 'var(--text-muted)' }}>Confidence</span>
           <span className="text-2xl font-bold" style={{ color: 'var(--text-primary)' }}>{result.confidence}%</span>
         </div>
-        <div className="flex-1 h-2 rounded-full overflow-hidden" style={{ backgroundColor: 'var(--bg-tertiary)' }}>
+        <div className="flex-1 min-w-[8rem] h-2 rounded-full overflow-hidden" style={{ backgroundColor: 'var(--bg-tertiary)' }}>
           <div
             className="h-full rounded-full transition-all duration-700"
             style={{ width: `${result.confidence}%`, backgroundColor: isOver ? 'var(--success)' : 'var(--danger)' }}
@@ -322,7 +326,7 @@ function SlipCard({ slip, onClear }) {
         </h2>
         <button
           onClick={onClear}
-          className="btn-ghost text-xs px-3 py-1.5 rounded-lg font-medium"
+          className="btn-ghost tap text-xs px-3 py-1.5 rounded-lg font-medium"
         >
           Clear
         </button>
@@ -377,11 +381,46 @@ function SlipCard({ slip, onClear }) {
 // Main App
 // ---------------------------------------------------------------------------
 
+function LogoutIcon() {
+  return (
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/>
+      <path d="M16 17l5-5-5-5M21 12H9"/>
+    </svg>
+  )
+}
+
+function Spinner() {
+  return (
+    <svg className="animate-spin h-4 w-4" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+      <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8z" />
+    </svg>
+  )
+}
+
+// Pill toggle (NBA / WNBA, slip legs): a 44 px tap target on phones, compact on desktop.
+function Pill({ active, onClick, children }) {
+  return (
+    <button
+      onClick={onClick}
+      className="pill tap px-4 py-1.5 rounded-full text-xs font-bold transition-all duration-150"
+      style={{
+        backgroundColor: active ? 'var(--accent)' : 'var(--bg-tertiary)',
+        color: active ? '#fff' : 'var(--text-muted)',
+      }}
+      aria-pressed={active}
+    >
+      {children}
+    </button>
+  )
+}
+
 export default function App() {
   // Initialise theme synchronously to avoid flash of wrong theme
   const [theme, setTheme] = useState(() => {
     const stored = localStorage.getItem('theme')
-    const preferred = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'
+    const preferred = window.matchMedia?.('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'
     const t = stored || preferred
     document.documentElement.setAttribute('data-theme', t)
     return t
@@ -394,6 +433,21 @@ export default function App() {
 
   const toggleTheme = () => setTheme((t) => (t === 'dark' ? 'light' : 'dark'))
 
+  // Session: 'checking' -> 'in' | 'out' | 'expired' (a 401 after being in) | 'offline'
+  const [auth, setAuth] = useState('checking')
+  const recheck = () => {
+    setAuth('checking')
+    checkSession().then((ok) => setAuth(ok === null ? 'offline' : ok ? 'in' : 'out'))
+  }
+  useEffect(recheck, [])
+  useEffect(() => onUnauthorized(() => setAuth((a) => (a === 'in' ? 'expired' : a === 'checking' ? 'out' : a))), [])
+  const loggedIn = auth === 'in'
+
+  const handleLogout = async () => {
+    await logout()
+    setAuth('out')
+  }
+
   const [sport, setSport] = useState('NBA')
   const sportPrefix = sport === 'WNBA' ? '/wnba' : ''
 
@@ -402,6 +456,7 @@ export default function App() {
   const [selectedPlayer, setSelectedPlayer] = useState('')
   const [playerTeam, setPlayerTeam] = useState('')
   const [allTeams, setAllTeams] = useState([])
+  const [wnbaOff, setWnbaOff] = useState(false)
   const [opponent, setOpponent] = useState('')
   const [statLine, setStatLine] = useState('')
   const [statType, setStatType] = useState('')
@@ -422,12 +477,20 @@ export default function App() {
   const showAdditionalFields = !!selectedPlayer
 
   useEffect(() => {
+    if (!loggedIn) return
     const prefix = sport === 'WNBA' ? '/wnba' : ''
-    fetch(`${API}${prefix}/teams`)
-      .then((r) => r.json())
+    setWnbaOff(false)
+    apiFetch(`${prefix}/teams`)
+      .then((r) => {
+        if (sport === 'WNBA' && r.status === 404) {   // WNBA_ENABLED=0 on the server
+          setWnbaOff(true)
+          return []
+        }
+        return r.ok ? r.json() : []
+      })
       .then(setAllTeams)
       .catch(() => {})
-  }, [sport])
+  }, [sport, loggedIn])
 
   useEffect(() => {
     if (!selectedPlayer) return
@@ -438,7 +501,7 @@ export default function App() {
     setPlayerContext(null)
     setGameDate('')
     const prefix = sport === 'WNBA' ? '/wnba' : ''
-    fetch(`${API}${prefix}/players/${encodeURIComponent(selectedPlayer)}/team`)
+    apiFetch(`${prefix}/players/${encodeURIComponent(selectedPlayer)}/team`)
       .then((r) => r.json())
       .then((data) => {
         setPlayerTeam(data.player_team?.full || '')
@@ -448,7 +511,7 @@ export default function App() {
         if (data.next_game_date) setGameDate(data.next_game_date)
       })
       .catch(() => { setPlayerTeam('') })
-    fetch(`${API}${prefix}/players/${encodeURIComponent(selectedPlayer)}/context`)
+    apiFetch(`${prefix}/players/${encodeURIComponent(selectedPlayer)}/context`)
       .then((r) => r.json())
       .then(setPlayerContext)
       .catch(() => {})
@@ -464,7 +527,7 @@ export default function App() {
     setLineLoading(true)
     setLineSource(null)
     const prefix = sport === 'WNBA' ? '/wnba' : ''
-    fetch(`${API}${prefix}/lines/${encodeURIComponent(selectedPlayer)}/${encodeURIComponent(statType)}`)
+    apiFetch(`${prefix}/lines/${encodeURIComponent(selectedPlayer)}/${encodeURIComponent(statType)}`)
       .then((r) => r.json())
       .then((data) => {
         if (!active) return
@@ -483,7 +546,7 @@ export default function App() {
     setSlipLoading(true)
     setSlipResult(null)
     try {
-      const res = await fetch(`${API}/slip?size=${slipSize}`)
+      const res = await apiFetch(`/slip?size=${slipSize}`)
       if (!res.ok) throw new Error('slip fetch failed')
       setSlipResult(await res.json())
     } catch {
@@ -521,21 +584,7 @@ export default function App() {
   const handleSportChange = (newSport) => {
     if (newSport === sport) return
     setSport(newSport)
-    setPlayerQuery('')
-    setSelectedPlayer('')
-    setPlayerTeam('')
-    setOpponent('')
-    setStatLine('')
-    setStatType('')
-    setIsHome(false)
-    setIsBackToBack(false)
-    setPlayerContext(null)
-    setOpponentInjuries([])
-    setResult(null)
-    setError('')
-    setLineSource(null)
-    setLineLoading(false)
-    setGameDate('')
+    resetAll()
   }
 
   const canPredict =
@@ -547,7 +596,7 @@ export default function App() {
     setError('')
     setResult(null)
     try {
-      const res = await fetch(`${API}/predict`, {
+      const res = await apiFetch('/predict', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -576,70 +625,91 @@ export default function App() {
   }
 
   return (
-    <div className="min-h-screen flex flex-col items-center px-4 py-16" style={{ backgroundColor: 'var(--bg-primary)' }}>
+    <div className="app-shell min-h-screen flex flex-col items-center px-4 pt-8 pb-12 sm:py-16" style={{ backgroundColor: 'var(--bg-primary)' }}>
       {/* Header */}
-      <div className="text-center mb-8">
-        {/* <div className="text-5xl mb-3">🏀</div> */}
+      <div className="text-center mb-6 sm:mb-8">
         <h1 className="text-3xl font-black tracking-tight" style={{ color: 'var(--text-primary)' }}>Sports Bettr</h1>
         <p className="mt-1 text-sm" style={{ color: 'var(--text-muted)' }}>AI-powered over/under predictions using real game data</p>
       </div>
 
       {/* Nav bar */}
-      <div className="card flex items-center gap-1 rounded-xl p-1 mb-8">
-        {['predict', 'history'].map((page) => (
+      <div className="card flex items-center gap-1 rounded-xl p-1 mb-6 sm:mb-8">
+        {loggedIn && ['predict', 'history'].map((page) => (
           <button
             key={page}
             onClick={() => setCurrentPage(page)}
-            className={`px-5 py-2 rounded-lg text-sm font-semibold capitalize transition-all duration-200 ${
+            className={`tap px-5 py-2 rounded-lg text-sm font-semibold capitalize transition-all duration-200 ${
               currentPage === page ? 'nav-tab-active' : 'nav-tab'
             }`}
+            aria-current={currentPage === page ? 'page' : undefined}
           >
             {page === 'predict' ? 'Predict' : 'History'}
           </button>
         ))}
         <button
           onClick={toggleTheme}
-          className="theme-toggle ml-2 p-2 rounded-lg"
+          className={`theme-toggle tap ${loggedIn ? 'ml-2' : ''} p-2 rounded-lg flex items-center justify-center`}
           aria-label={theme === 'dark' ? 'Switch to light mode' : 'Switch to dark mode'}
           title={theme === 'dark' ? 'Switch to light mode' : 'Switch to dark mode'}
         >
           {theme === 'dark' ? <SunIcon /> : <MoonIcon />}
         </button>
+        {loggedIn && (
+          <button
+            onClick={handleLogout}
+            className="theme-toggle tap ml-1 p-2 rounded-lg flex items-center justify-center"
+            aria-label="Log out"
+            title="Log out"
+          >
+            <LogoutIcon />
+          </button>
+        )}
       </div>
 
-      {currentPage === 'history' && <History />}
+      {auth === 'checking' && (
+        <div className="flex items-center gap-2 py-16 text-sm" style={{ color: 'var(--text-muted)' }}>
+          <Spinner /> Loading…
+        </div>
+      )}
 
-      {currentPage === 'predict' && <>
+      {auth === 'offline' && (
+        <div className="card w-full max-w-sm rounded-2xl p-6 space-y-4 text-center">
+          <p className="text-sm" style={{ color: 'var(--text-secondary)' }}>Can’t reach the server.</p>
+          <button onClick={recheck} className="btn-ghost tap w-full py-3 rounded-xl text-sm font-medium">Try again</button>
+        </div>
+      )}
+
+      {(auth === 'out' || auth === 'expired') && <Login expired={auth === 'expired'} onLoggedIn={() => setAuth('in')} />}
+
+      {loggedIn && currentPage === 'history' && <History />}
+
+      {loggedIn && currentPage === 'predict' && <>
         {/* Main entry: screenshot -> confirm -> predict (manual form below) */}
         {sport === 'NBA' && <ScreenshotImport teams={allTeams} />}
 
         {/* Form card */}
-        <div className="card w-full max-w-lg rounded-2xl p-6 shadow-2xl space-y-4">
+        <div className="card w-full max-w-lg rounded-2xl p-5 sm:p-6 shadow-2xl space-y-4">
           {/* Sport toggle */}
           <div className="flex gap-2">
             {['NBA', 'WNBA'].map((s) => (
-              <button
-                key={s}
-                onClick={() => handleSportChange(s)}
-                className="px-4 py-1.5 rounded-full text-xs font-bold transition-all duration-150"
-                style={{
-                  backgroundColor: sport === s ? 'var(--accent)' : 'var(--bg-tertiary)',
-                  color: sport === s ? '#fff' : 'var(--text-muted)',
-                }}
-              >
-                {s}
-              </button>
+              <Pill key={s} active={sport === s} onClick={() => handleSportChange(s)}>{s}</Pill>
             ))}
           </div>
 
-          <PlayerSearch
-            value={playerQuery}
-            onChange={setPlayerQuery}
-            onSelect={handlePlayerSelect}
-            onClear={resetAll}
-            searchUrl={`${API}${sportPrefix}/players/search`}
-            placeholder={`Search ${sport} players…`}
-          />
+          {wnbaOff ? (
+            <div className="status-neutral border rounded-xl px-4 py-3 text-sm">
+              WNBA is turned off on this server.
+            </div>
+          ) : (
+            <PlayerSearch
+              value={playerQuery}
+              onChange={setPlayerQuery}
+              onSelect={handlePlayerSelect}
+              onClear={resetAll}
+              searchPath={`${sportPrefix}/players/search`}
+              placeholder={`Search ${sport} players…`}
+            />
+          )}
 
           {playerContext?.injury_status && (
             <InjuryBanner
@@ -683,10 +753,7 @@ export default function App() {
             >
               {predicting ? (
                 <span className="flex items-center justify-center gap-2">
-                  <svg className="animate-spin h-4 w-4" viewBox="0 0 24 24" fill="none">
-                    <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-                    <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8z" />
-                  </svg>
+                  <Spinner />
                   Analyzing…
                 </span>
               ) : (
@@ -696,7 +763,7 @@ export default function App() {
           </FieldWrapper>
 
           {error && (
-            <div className="animate-fade-in status-out border rounded-xl px-4 py-3 text-sm">
+            <div role="alert" className="animate-fade-in status-out border rounded-xl px-4 py-3 text-sm">
               {error}
             </div>
           )}
@@ -705,22 +772,12 @@ export default function App() {
         {sport === 'NBA' && (
           <>
             <div className="w-full max-w-lg mt-4 space-y-2">
-              <div className="flex items-center gap-2">
+              <div className="flex flex-wrap items-center gap-2">
                 <span className="text-xs font-semibold uppercase tracking-widest" style={{ color: 'var(--text-muted)' }}>
                   Legs
                 </span>
                 {[2, 3, 4, 5].map((n) => (
-                  <button
-                    key={n}
-                    onClick={() => setSlipSize(n)}
-                    className="px-3 py-1 rounded-full text-xs font-bold transition-all duration-150"
-                    style={{
-                      backgroundColor: slipSize === n ? 'var(--accent)' : 'var(--bg-tertiary)',
-                      color: slipSize === n ? '#fff' : 'var(--text-muted)',
-                    }}
-                  >
-                    {n}
-                  </button>
+                  <Pill key={n} active={slipSize === n} onClick={() => setSlipSize(n)}>{n}</Pill>
                 ))}
               </div>
               <button

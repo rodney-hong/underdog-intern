@@ -2,7 +2,7 @@
 // leave out limited-data rows.
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { historySummary } from './historyStats.js'
+import { duplicateCount, historySummary } from './historyStats.js'
 
 const row = (confidence, predicted, actual, limited = 0) =>
   ({ confidence, predicted_outcome: predicted, actual_result: actual, is_limited_data: limited })
@@ -51,4 +51,23 @@ test('superseded rows are excluded from Total, Accuracy and every bucket', () =>
   assert.equal(s.accuracy, '100.0%')
   assert.deepEqual(s.tiers.map((t) => t.sub), ['0 games', '1 game', '1 game'])
   assert.equal(s.limitedCount, 0)
+})
+
+test('duplicateCount follows the backend rule: n rows per group lose n - 1', () => {
+  const p = (player, line, extra = {}) => ({ player_name: player, stat_type: 'Points', stat_line: line,
+    opponent_team: 'Utah Jazz', game_date: '2026-10-25', model: 'challenger', ...extra })
+  assert.equal(duplicateCount([]), 0)
+  assert.equal(duplicateCount([p('A', 20.5), p('A', 21.5), p('B', 20.5)]), 0)
+  assert.equal(duplicateCount([p('A', 20.5), p('A', 20.5), p('A', 20.5), p('B', 9.5), p('B', 9.5)]), 3)
+  // a challenger row never removes a frozen one; NULL model is 'frozen', NULL game date is ''
+  assert.equal(duplicateCount([p('A', 20.5), p('A', 20.5, { model: 'frozen' })]), 0)
+  assert.equal(duplicateCount([p('A', 20.5, { model: null }), p('A', 20.5, { model: 'frozen' })]), 1)
+  assert.equal(duplicateCount([p('A', 20.5, { game_date: null }), p('A', 20.5, { game_date: null })]), 1)
+  assert.equal(duplicateCount([p('A', 20.5, { game_date: null }), p('A', 20.5)]), 0)
+})
+
+test('the summary separates current picks from every row', () => {
+  const s = historySummary([{ ...row(0.6, 'OVER', null), is_current: 1 }, { ...row(0.6, 'OVER', null), is_current: 0 },
+                            { ...row(0.6, 'OVER', null), is_current: 1, is_limited_data: 1 }])
+  assert.deepEqual([s.total, s.current, s.all], [1, 2, 3])
 })

@@ -186,7 +186,7 @@ npm install
 npm run dev
 ```
 
-Open http://localhost:5173.
+Open http://localhost:5173 and log in with the admin password. The app calls `/api/...` (`VITE_API_BASE`, default `/api`) in dev and in production: the Vite dev server (and `vite preview`) forwards `/api` to the backend at http://localhost:8000 (`API_PROXY_TARGET` overrides it), as Caddy does on the server, so the browser stays on one origin and the backend needs no CORS. Build with `VITE_API_BASE=/api npm run build`; in Git Bash on Windows add `MSYS_NO_PATHCONV=1`, or it rewrites `/api` into a Windows path (the app then falls back to `/api` anyway).
 
 ### Environment variables (`backend/.env`)
 

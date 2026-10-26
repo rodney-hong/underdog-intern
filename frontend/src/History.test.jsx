@@ -3,7 +3,7 @@
 // challenger_retro, All -> all.
 import { afterEach, beforeEach, expect, it, vi } from 'vitest'
 import { cleanup, fireEvent, render, screen } from '@testing-library/react'
-import History from './History'
+import History, { rowCountLabel } from './History'
 
 const pred = (id, player, model) => ({
   id, timestamp: `2026-10-2${id}T12:00:00`, player_name: player, stat_type: 'Points', stat_line: 20.5,
@@ -36,4 +36,44 @@ it('the tooltip asks for the model the filter shows', async () => {
     expect(trackCalls().at(-1)).toContain(model)
     expect(trackCalls().at(-1)).toContain('stat=Points')
   }
+})
+
+it('Clean Duplicates asks first, says how many, and Cancel deletes nothing', async () => {
+  const dupes = [...HISTORY, { ...HISTORY[0], id: 9 }, { ...HISTORY[0], id: 10 }]   // 2 extra copies of one pick
+  globalThis.fetch = vi.fn(async (url) => ({ ok: true, status: 200,
+    json: async () => (url.includes('/predictions/history') ? dupes : url.includes('/duplicates') ? { deleted: 2 } : TR) }))
+  render(<History />)
+  await screen.findAllByText('Cee Player')
+  const deletes = () => globalThis.fetch.mock.calls.filter(([, o]) => o?.method === 'DELETE')
+
+  fireEvent.click(screen.getByRole('button', { name: 'Clean Duplicates' }))
+  const dialog = screen.getByRole('alertdialog')
+  expect(dialog.textContent).toContain('permanently removes 2 duplicate predictions')
+  expect(document.activeElement.textContent).toBe('Cancel')              // Cancel is the default
+  fireEvent.click(screen.getByRole('button', { name: 'Cancel' }))
+  expect(screen.queryByRole('alertdialog')).toBeNull()
+  expect(deletes()).toHaveLength(0)
+
+  fireEvent.click(screen.getByRole('button', { name: 'Clean Duplicates' }))
+  fireEvent.keyDown(document, { key: 'Escape' })                           // Escape cancels too
+  expect(deletes()).toHaveLength(0)
+
+  fireEvent.click(screen.getByRole('button', { name: 'Clean Duplicates' }))
+  fireEvent.click(screen.getByRole('button', { name: 'Remove 2' }))
+  expect(deletes()).toHaveLength(1)
+})
+
+it('with nothing to remove it says so and offers only OK', async () => {
+  render(<History />)
+  await screen.findAllByText('Cee Player')
+  fireEvent.click(screen.getByRole('button', { name: 'Clean Duplicates' }))
+  expect(screen.getByRole('alertdialog').textContent).toContain('no duplicate predictions')
+  expect(screen.queryByRole('button', { name: /^Remove/ })).toBeNull()
+  fireEvent.click(screen.getByRole('button', { name: 'OK' }))
+  expect(globalThis.fetch.mock.calls.some(([, o]) => o?.method === 'DELETE')).toBe(false)
+})
+
+it('the row count separates current picks from replaced ones', () => {
+  expect(rowCountLabel([{ is_current: 1 }, { is_current: 1 }])).toBe('2 rows')
+  expect(rowCountLabel([{ is_current: 1 }, { is_current: 0 }, { is_current: 1 }])).toBe('2 current · 3 total')
 })

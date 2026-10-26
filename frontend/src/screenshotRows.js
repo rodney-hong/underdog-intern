@@ -15,6 +15,7 @@ export function toEditable(row, i) {
     key: i,
     card_name: row.player_name,
     player_name: row.resolved_player || '',
+    match: row.match,                  // ok / not_found / ambiguous / team_mismatch / unreadable
     matched: row.match === 'ok',
     searchable: row.match !== 'ok',    // unresolved card: the player cell is a player search
     person_id: row.person_id ?? null,
@@ -31,6 +32,21 @@ export function toEditable(row, i) {
     logged_line: row.logged_line ?? null,
   }
 }
+
+// The note under an unresolved row's player, until a player is picked (null once matched).
+const UNRESOLVED_NOTES = {
+  not_found: 'Player not found: pick from the search',
+  ambiguous: 'Several players match: pick the right one from the search',
+  team_mismatch: 'Not on the card’s team: pick from the search',
+  unreadable: 'Couldn’t read this card: search the player and enter the line',
+}
+export function unresolvedNote(r) {
+  if (r.matched) return null
+  return UNRESOLVED_NOTES[r.match] ?? 'Pick the player from the search'
+}
+
+// The opponent select's empty option: what the row still needs.
+export const opponentPlaceholder = (r) => (r.matched ? 'Choose the opponent' : 'Opponent: pick the player first')
 
 // Ready for /predict: a matched player, a supported stat, a positive line and an opponent.
 export function isReady(r) {

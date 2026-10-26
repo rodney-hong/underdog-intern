@@ -14,7 +14,7 @@ export function ClearButton({ onClick, visible }) {
     <button
       type="button"
       onClick={onClick}
-      className="icon-btn absolute right-3 top-1/2 -translate-y-1/2 text-lg leading-none"
+      className="icon-btn absolute right-1 w-11 h-11 flex items-center justify-center sm:right-3 sm:w-auto sm:h-auto top-1/2 -translate-y-1/2 text-lg leading-none"
       aria-label="Clear"
     >
       ×

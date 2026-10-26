@@ -1,16 +1,17 @@
 // Per-player model track record (GET /players/{name}/track-record).
 // Display-only: it is shown next to a prediction and never changes it.
 
-const API = 'http://localhost:8000'
+import { apiFetch } from './api'
+
 const cache = new Map()
 
 // model: challenger | frozen | challenger_retro | all (challenger + frozen), as History's filter
 export function fetchTrackRecord({ player, stat, league = 'NBA', before, model = 'all' }) {
   const qs = new URLSearchParams({ stat, league, model })
   if (before != null) qs.set('before', String(before))
-  const url = `${API}/players/${encodeURIComponent(player)}/track-record?${qs}`
+  const url = `/players/${encodeURIComponent(player)}/track-record?${qs}`
   if (!cache.has(url)) {
-    const req = fetch(url)
+    const req = apiFetch(url)
       .then((r) => {
         if (!r.ok) throw new Error(`track record ${r.status}`)
         return r.json()

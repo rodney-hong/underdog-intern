@@ -244,6 +244,63 @@
 }
 
 /* ============================================================
+   Phones (below Tailwind's sm breakpoint, 640 px). Desktop is unchanged.
+   ============================================================ */
+
+/* The screenshot table's Predict button stays on screen while the rows scroll by. */
+.sticky-action {
+  position: sticky;
+  bottom: 0;
+  z-index: 10;
+  margin: 0 -0.25rem;
+  padding: 0.5rem 0.25rem calc(0.5rem + env(safe-area-inset-bottom));
+  background: linear-gradient(to bottom, transparent, var(--bg-secondary) 0.5rem);
+}
+
+@media (max-width: 639px) {
+  /* When a field is focused (or the keyboard opens) the browser scrolls it into view clear of
+     the pinned Predict bar (.sticky-action: 3.5rem button + padding + safe area). */
+  html {
+    scroll-padding-bottom: calc(6rem + env(safe-area-inset-bottom));
+  }
+
+  /* Notched phones: keep content clear of the notch and the home indicator
+     (index.html sets viewport-fit=cover). */
+  .app-shell {
+    padding-top: max(2rem, calc(env(safe-area-inset-top) + 1rem));
+    padding-left: max(1rem, env(safe-area-inset-left));
+    padding-right: max(1rem, env(safe-area-inset-right));
+    padding-bottom: max(3rem, calc(env(safe-area-inset-bottom) + 1.5rem));
+  }
+
+  /* 16 px stops iOS Safari zooming into a focused field */
+  .input-field,
+  .input-field::placeholder {
+    font-size: 16px !important;
+  }
+  .input-field {
+    min-height: 44px;
+  }
+
+  /* Tap targets of at least 44 x 44 px */
+  .tap {
+    min-height: 44px;
+    min-width: 44px;
+  }
+  .tap-row {
+    min-height: 44px;
+    display: flex;
+    align-items: center;
+  }
+  /* inline text that opens something (History's player name): 44 px tall, still inline */
+  .tap-inline {
+    min-height: 44px;
+    display: inline-flex;
+    align-items: center;
+  }
+}
+
+/* ============================================================
    Animations
    ============================================================ */
 

@@ -1,7 +1,7 @@
 // Run: node --test src/screenshotRows.test.js (from frontend/).
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { toEditable, isReady, predictBody, selectPlayer, typePlayer } from './screenshotRows.js'
+import { toEditable, isReady, predictBody, selectPlayer, typePlayer, unresolvedNote, opponentPlaceholder } from './screenshotRows.js'
 
 const extracted = {
   player_name: 'Giannis Antetokounmpo', resolved_player: 'Giannis Antetokounmpo', stat: 'Points',
@@ -59,4 +59,16 @@ test('the no-history notice is hidden; other flags stay', () => {
   assert.deepEqual(toEditable({ ...extracted, flags: ['no game history for this stat'] }, 0).flags, [])
   assert.deepEqual(toEditable({ ...extracted, flags: ['no game history for this stat', range] }, 0).flags, [range])
   assert.deepEqual(toEditable({ ...extracted, flags: undefined }, 0).flags, [])
+})
+
+test('an unresolved row says what it needs until a player is picked', () => {
+  const r = toEditable(unresolved, 0)
+  assert.equal(unresolvedNote(r), 'Player not found: pick from the search')
+  assert.equal(opponentPlaceholder(r), 'Opponent: pick the player first')
+  assert.equal(unresolvedNote(toEditable({ ...unresolved, match: 'ambiguous' }, 0)),
+               'Several players match: pick the right one from the search')
+  const picked = selectPlayer(r, 'Giannis Antetokounmpo', { person_id: 203507 }, null)
+  assert.equal(unresolvedNote(picked), null)
+  assert.equal(opponentPlaceholder(picked), 'Choose the opponent')
+  assert.equal(unresolvedNote(toEditable(extracted, 0)), null)
 })

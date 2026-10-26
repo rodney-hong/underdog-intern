@@ -1,17 +1,17 @@
 import { useState, useEffect, useLayoutEffect, useRef, useCallback, useId } from 'react'
 import { createPortal } from 'react-dom'
 import { ClearButton, Label } from './fields'
-import { menuPlacement } from './menuPlacement'
-
-const API = 'http://localhost:8000'
+import { menuPlacement, visibleArea } from './menuPlacement'
+import { apiFetch } from '../api'
 
 // Player search with an autocomplete dropdown: the manual Predict form and unresolved
 // screenshot rows. NBA search returns {name, person_id, team}; WNBA returns plain names.
-// The menu is rendered in a portal at fixed viewport coordinates (menuPlacement), so a
+// The menu is rendered in a portal on <body> at page coordinates (menuPlacement), so a
 // scrolling or rounded container (the screenshot table) never clips it; it opens upward
-// when there isn't room below. Keys: ArrowDown / ArrowUp move, Enter picks (the first
-// option when none is highlighted), Escape closes.
-export default function PlayerSearch({ value, onChange, onSelect, onClear, searchUrl, placeholder,
+// when there isn't room below in the visible area (short screens, the phone keyboard).
+// Keys: ArrowDown / ArrowUp move, Enter picks (the first option when none is highlighted),
+// Escape closes.
+export default function PlayerSearch({ value, onChange, onSelect, onClear, searchPath = '/players/search', placeholder,
                                       label = 'Player Search', compact = false }) {
   const [suggestions, setSuggestions] = useState([])
   const [loading, setLoading] = useState(false)
@@ -28,9 +28,8 @@ export default function PlayerSearch({ value, onChange, onSelect, onClear, searc
     if (!q.trim()) { setSuggestions([]); setOpen(false); return }
     setLoading(true)
     try {
-      const url = searchUrl || `${API}/players/search`
-      const res = await fetch(`${url}?q=${encodeURIComponent(q)}`)
-      const data = await res.json()
+      const res = await apiFetch(`${searchPath}?q=${encodeURIComponent(q)}`)
+      const data = res.ok === false ? [] : await res.json()
       setSuggestions(data)
       setActive(-1)
       setOpen(data.length > 0)
@@ -39,7 +38,7 @@ export default function PlayerSearch({ value, onChange, onSelect, onClear, searc
     } finally {
       setLoading(false)
     }
-  }, [searchUrl])
+  }, [searchPath])
 
   const handleChange = (e) => {
     const q = e.target.value
@@ -84,23 +83,37 @@ export default function PlayerSearch({ value, onChange, onSelect, onClear, searc
     }
   }
 
-  // Position the portal menu against the input; follow scrolling (any ancestor) and resizes.
+  // Position the portal menu against the input; follow scrolling (any ancestor), resizes, and
+  // the visual viewport (the phone keyboard opening or closing).
+  // The list's height comes from the data (options x row height), never from the menu as
+  // rendered, so placing it can't feed back into itself. The row height is measured from an
+  // option once the menu exists, else the CSS row (44 px on phones, 40 px otherwise).
+  const update = useCallback(() => {
+    if (!inputRef.current) return
+    const phone = window.matchMedia?.('(max-width: 639px)').matches
+    const row = menuRef.current?.querySelector('[role=option]')?.offsetHeight || (phone ? 44 : 40)
+    const next = menuPlacement(inputRef.current.getBoundingClientRect(), visibleArea(),
+                               { x: window.scrollX, y: window.scrollY }, suggestionCount.current * row, row)
+    setPlace((prev) => (prev && ['up', 'left', 'width', 'height', 'top'].every((k) => prev[k] === next[k]) ? prev : next))
+  }, [])
+  const suggestionCount = useRef(0)
+  suggestionCount.current = suggestions.length
+
   useLayoutEffect(() => {
     if (!open) return undefined
-    const update = () => {
-      if (inputRef.current) {
-        setPlace(menuPlacement(inputRef.current.getBoundingClientRect(), window.innerHeight,
-                               menuRef.current?.scrollHeight))
-      }
-    }
     update()
+    const vv = window.visualViewport
     window.addEventListener('scroll', update, true)
     window.addEventListener('resize', update)
+    vv?.addEventListener('resize', update)
+    vv?.addEventListener('scroll', update)
     return () => {
       window.removeEventListener('scroll', update, true)
       window.removeEventListener('resize', update)
+      vv?.removeEventListener('resize', update)
+      vv?.removeEventListener('scroll', update)
     }
-  }, [open, suggestions])
+  }, [open, suggestions, update])
 
   useEffect(() => {
     const handler = (e) => {
@@ -118,9 +131,10 @@ export default function PlayerSearch({ value, onChange, onSelect, onClear, searc
       ref={menuRef}
       id={listId}
       role="listbox"
-      className={`card fixed z-50 rounded-xl shadow-2xl overflow-y-auto ${place.up ? '' : 'animate-slide-down'}`}
-      style={{ left: place.left, width: place.width, maxHeight: place.maxHeight,
-               ...(place.up ? { bottom: place.bottom } : { top: place.top }) }}
+      data-placement={place.up ? 'up' : 'down'}
+      className="card z-50 rounded-xl shadow-2xl overflow-y-auto"
+      style={{ position: 'absolute', left: place.left, top: place.top, width: place.width,
+               height: place.height, overscrollBehavior: 'contain' }}
     >
       {suggestions.map((s, i) => (
         <li
@@ -130,7 +144,7 @@ export default function PlayerSearch({ value, onChange, onSelect, onClear, searc
           aria-selected={i === active}
           onMouseDown={(e) => { e.preventDefault(); handleSelect(s) }}
           onMouseEnter={() => setActive(i)}
-          className="suggestion-item px-4 py-2.5 cursor-pointer text-sm"
+          className="suggestion-item tap-row px-4 py-2.5 cursor-pointer text-sm"
           style={i === active ? { backgroundColor: 'var(--bg-tertiary)' } : undefined}
         >
           {nameOf(s)}

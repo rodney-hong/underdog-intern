@@ -58,13 +58,15 @@ describe('screenshot table, last row, unresolved player', () => {
     fireEvent.change(search, { target: { value: 'Jaxson Hayes' } })
     const option = await screen.findByRole('option', { name: /Jaxson Hayes/ })
     expect(option).toBeTruthy()
-    expect(globalThis.fetch).toHaveBeenCalledWith(expect.stringContaining('/players/search?q=Jaxson%20Hayes'))
+    expect(globalThis.fetch).toHaveBeenCalledWith(expect.stringContaining('/api/players/search?q=Jaxson%20Hayes'),
+                                                  expect.objectContaining({ credentials: 'include' }))
     const list = screen.getByRole('listbox')
     const scroller = container.querySelector('.overflow-x-auto')
     expect(scroller.contains(list)).toBe(false)                 // not clipped by the table container
-    expect(list.style.position === 'fixed' || list.className.includes('fixed')).toBe(true)
-    expect(list.style.bottom).not.toBe('')                      // no room below: opens upward
-    expect(list.style.top).toBe('')
+    expect(list.parentElement).toBe(document.body)               // portal on <body>, page coordinates
+    expect(list.style.position).toBe('absolute')
+    expect(list.dataset.placement).toBe('up')                   // no room below: opens upward
+    expect(parseFloat(list.style.top) + parseFloat(list.style.height)).toBeLessThanOrEqual(750)   // above the input
     expect(search.getAttribute('aria-expanded')).toBe('true')
   })
 
@@ -78,7 +80,8 @@ describe('screenshot table, last row, unresolved player', () => {
     fireEvent.keyDown(search, { key: 'Enter' })
     await screen.findByText('Predict 3 rows')
     expect(screen.queryByRole('listbox')).toBeNull()
-    expect(globalThis.fetch).toHaveBeenCalledWith(expect.stringContaining('/players/Jaxson%20Hayes/team'))
+    expect(globalThis.fetch).toHaveBeenCalledWith(expect.stringContaining('/api/players/Jaxson%20Hayes/team'),
+                                                  expect.objectContaining({ credentials: 'include' }))
     // the pick is remembered for next time: card name -> personId
     const alias = globalThis.fetch.mock.calls.find(([url]) => url.includes('/screenshot/alias'))
     expect(alias[1].method).toBe('POST')
@@ -119,9 +122,28 @@ describe('the same component in the manual Predict form', () => {
 })
 
 describe('menuPlacement', () => {
-  it('opens below with room, above near the bottom', () => {
-    const r = (top) => ({ top, bottom: top + 40, left: 10, width: 200 })
-    expect(menuPlacement(r(100), 800)).toMatchObject({ up: false, top: 144 })
-    expect(menuPlacement(r(750), 800)).toMatchObject({ up: true, bottom: 54, maxHeight: 240 })
+  const r = (top) => ({ top, bottom: top + 40, left: 10, width: 200 })
+  const screen844 = { top: 0, height: 844 }
+
+  it('opens below with room, above near the bottom, in page coordinates', () => {
+    expect(menuPlacement(r(100), screen844, { x: 0, y: 0 }, 176, 44)).toMatchObject({ up: false, top: 144, height: 178 })
+    expect(menuPlacement(r(100), screen844, { x: 0, y: 500 }, 200, 44)).toMatchObject({ up: false, top: 644 })
+    const up = menuPlacement(r(750), screen844, { x: 0, y: 0 }, 400, 44)
+    expect(up.up).toBe(true)
+    expect(up.top + up.height).toBe(746)                         // ends just above the input
+  })
+
+  it('the phone keyboard counts: little visible room below opens it upward', () => {
+    // 390x844 screen, keyboard covering the bottom 330 px: the visual viewport is 514 px tall
+    const p = menuPlacement(r(430), { top: 0, height: 514 }, { x: 0, y: 0 }, 300, 44)
+    expect(p.up).toBe(true)
+  })
+
+  it('shows whole rows only, never half an option (the 2 px of borders included)', () => {
+    for (const [top, rows] of [[100, 10], [300, 7], [700, 9], [760, 3]]) {
+      const p = menuPlacement(r(top), screen844, { x: 0, y: 0 }, rows * 44, 44)
+      expect((p.height - 2) % 44).toBe(0)
+      expect(p.height).toBeLessThanOrEqual(240)
+    }
   })
 })
