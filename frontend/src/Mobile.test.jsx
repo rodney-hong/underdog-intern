@@ -3,7 +3,7 @@
 // screenshots can be chosen at once and their rows land in one list of cards, with a failed
 // image named; the ⚑ on a flagged row opens its reasons on tap.
 import { afterEach, beforeEach, expect, it, vi } from 'vitest'
-import { cleanup, fireEvent, render, screen, within } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, within } from '@testing-library/react'
 import History from './History'
 import ScreenshotImport from './ScreenshotImport'
 
@@ -112,16 +112,26 @@ it('History on a phone: "Sort by" sorts the whole filtered set and shares the ta
   expect(names()).toEqual(['Zed Last', 'Amy First', 'Mo Middle'])
 })
 
-it('on desktop a header click and the "Sort by" select show the same sort', async () => {
-  phone(false)
+it('"Sort by" shows only with the phone list; the sort carries across the switch to the table', async () => {
+  // A matchMedia that can change, so the list / table switch happens as on a resize
+  let matches = true
+  const listeners = new Set()
+  window.matchMedia = vi.fn((q) => ({ get matches() { return matches }, media: q,
+    addEventListener: (_, fn) => listeners.add(fn), removeEventListener: (_, fn) => listeners.delete(fn) }))
+  const resize = (phoneNow) => act(() => { matches = phoneNow; listeners.forEach((fn) => fn()) })
   globalThis.fetch = vi.fn(async (url) => ({ ok: true, status: 200,
     json: async () => (url.includes('/predictions/history') ? [pred] : TR) }))
   render(<History />)
-  const table = await screen.findByRole('table')
-  fireEvent.click(within(table).getByText('Player'))
-  expect(screen.getByRole('combobox', { name: 'Sort by' }).value).toBe('player_name:asc')
-  fireEvent.click(within(table).getByText('Player'))
-  expect(screen.getByRole('combobox', { name: 'Sort by' }).value).toBe('player_name:desc')
+  await screen.findByRole('list', { name: 'Predictions' })
   fireEvent.change(screen.getByRole('combobox', { name: 'Sort by' }), { target: { value: 'stat_line:desc' } })
+
+  resize(false)                                                      // to the table
+  const table = await screen.findByRole('table')
+  expect(screen.queryByRole('combobox', { name: 'Sort by' })).toBeNull()
   expect(within(table).getByText('Line').closest('th').getAttribute('aria-sort')).toBe('descending')
+  fireEvent.click(within(table).getByText('Player'))
+
+  resize(true)                                                       // back to the list
+  await screen.findByRole('list', { name: 'Predictions' })
+  expect(screen.getByRole('combobox', { name: 'Sort by' }).value).toBe('player_name:asc')
 })

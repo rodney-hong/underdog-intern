@@ -24,8 +24,8 @@ const MODEL_KEYS = { Challenger: ['challenger'], Frozen: ['frozen'], 'Challenger
                      All: ['challenger', 'frozen'] }
 const TOOLTIP_WIDTH = 260
 
-// Below 768 px the column headers aren't there to click: a "Sort by" select offers the same sorts
-// (every sortable column, both ways) on the same sort state. "key:direction"; '' is the default
+// The phone list has no column headers to click: with it (and only with it: the same isPhone switch)
+// a "Sort by" select offers the same sorts (every sortable column, both ways) on the same sort state. "key:direction"; '' is the default
 // order (newest made first), which a sort on Made, newest first equals.
 const SORT_OPTIONS = [
   ['', 'Made, newest first'],
@@ -527,17 +527,19 @@ export default function History() {
             </button>
           )}
           <div className="col-span-2 sm:ml-auto flex flex-wrap items-center justify-end gap-x-2 gap-y-3 min-h-[34px]">
-            <label className="md:hidden w-full sm:w-auto flex items-center gap-2">
-              <span className="text-sm shrink-0" style={{ color: 'var(--text-muted)' }}>Sort by</span>
-              <select
-                value={sortOptionValue(sortConfig)}
-                onChange={(e) => setSortConfig(sortFromOption(e.target.value))}
-                aria-label="Sort by"
-                className="input-field h-[34px] px-2 text-sm cursor-pointer min-w-0 flex-1"
-              >
-                {SORT_OPTIONS.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
-              </select>
-            </label>
+            {isPhone && (
+              <label className="w-full flex items-center gap-2">
+                <span className="text-sm shrink-0" style={{ color: 'var(--text-muted)' }}>Sort by</span>
+                <select
+                  value={sortOptionValue(sortConfig)}
+                  onChange={(e) => setSortConfig(sortFromOption(e.target.value))}
+                  aria-label="Sort by"
+                  className="input-field h-[34px] px-2 text-sm cursor-pointer min-w-0 flex-1"
+                >
+                  {SORT_OPTIONS.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
+                </select>
+              </label>
+            )}
             <span className="text-sm num" style={{ color: 'var(--text-muted)' }}>{rowCountLabel(filtered)}</span>
             <span className="text-sm pl-2" style={{ color: 'var(--text-muted)' }}>Rows per page</span>
             <select
