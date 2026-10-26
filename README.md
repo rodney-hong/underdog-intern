@@ -152,7 +152,7 @@ After each pre-tip pull, `paper_predictions.py` records one row per Underdog lin
 
 ### Prerequisites
 
-- Python 3 (the frozen models were built on Python 3.14.4, xgboost 3.2.0, scikit-learn 1.8.0, pandas 2.3.3, numpy 2.4.4)
+- **Python 3.14.4** exactly (the frozen models were built on it, with xgboost 3.2.0, scikit-learn 1.8.0, pandas 2.3.3, numpy 2.4.4; `backend/requirements-lock.txt` pins every package)
 - Node.js and npm
 - A Kaggle account configured for `kagglehub` (box-score ETL)
 - An OddsAPI key for live lines; a separate historical-plan key only to rebuild `historical_player_props`
@@ -167,11 +167,14 @@ source .venv/bin/activate
 # Windows:
 .venv\Scripts\activate
 
-pip install -r requirements.txt
+pip install --no-deps -r requirements-lock.txt     # exact versions; never upgrade
+python auth.py set-password                         # once: the admin login (hash + session key into .env)
 uvicorn main:app --reload --port 8000
 ```
 
-Startup enables WAL, refreshes rosters, starts the line-logger and news schedulers, initializes the database, and checks that the frozen model files are present. As soon as startup completes, a data sync runs in the background (`line_logger.run_sync`, `[sync]` log lines): back up `predictions.db` (if today's backup doesn't exist), refresh rosters, check Kaggle for the newest Ready version, run the ETL if it is newer, then resolve app and paper predictions. If Kaggle has nothing newer, the version check repeats hourly while the server is up. The same sync runs daily at 07:00 ET and from the app's **Sync now** button (`POST /sync`, localhost only; `GET /sync` returns the last result).
+`SPORTSBETTR_MODE` in `.env` decides what the backend does on its own; only one machine may run in `prod` (it collects). `dev` (the default) runs nothing automatic: no sync, pulls, loggers, pollers or backups; the API still serves the app and scripts such as `backfill.py` run by hand. `dry` runs nothing either but logs every job `prod` would run, with its ET time (`[dry]` lines). Every API route needs the admin login except `POST /auth/login` and `/health`; `/docs` exists only with `API_DOCS_ENABLED=1`. `python daily_check.py` reports missed pulls and missing paper/challenger rows for a day; `deploy.sh` (server) refuses to restart within 45 minutes of a pre-tip pull or at 10:00-10:05 ET.
+
+In `prod`, startup enables WAL, refreshes rosters, starts the line-logger and news schedulers, initializes the database, and checks that the frozen model files are present. As soon as startup completes, a data sync runs in the background (`line_logger.run_sync`, `[sync]` log lines): back up `predictions.db` (if today's backup doesn't exist), refresh rosters, check Kaggle for the newest Ready version, run the ETL if it is newer, then resolve app and paper predictions. If Kaggle has nothing newer, the version check repeats hourly while the server is up. The same sync runs daily at 07:00 ET and from the app's **Sync now** button (`POST /sync`, `prod` only and without catch-up pulls, so a request never spends credits; `GET /sync` returns the last result). A self-check every 15 minutes re-adds any missing pre-tip job, and with the `SPACES_*` settings a nightly off-server backup runs at 04:30 ET (`offsite_backup.py`).
 
 ETL guards: the ETL never runs at the same time as a pre-tip job (it takes the pre-tip lock, waiting for a running job, and pre-tip jobs that come due queue behind it), and never starts within 10 minutes of a scheduled pull (open or pre-tip, from the scheduler and the `schedule` table); it is moved to the end of that window instead. That is enough because the load goes into staging tables and is swapped in with one short transaction, so readers only ever see the old tables or the new ones.
 
@@ -196,6 +199,15 @@ Open http://localhost:5173.
 | `LINE_LOG_SCHEDULE_HOUR_ET`, `LINE_LOG_OPEN_HOUR_ET`, `LINE_LOG_PRETIP_MINUTES`, `LINE_LOG_OPEN_PULL_ENABLED` | Line-logger schedule (defaults 6, 10, 30, 1) |
 | `NEWS_POLL_MINUTES`, `NBA_REPORT_CRON_MINUTES` | News polling (defaults 20 and `2,17,32,47`) |
 | `BALLDONTLIE_WNBA_KEY` | Optional, WNBA player lookup |
+| `SPORTSBETTR_MODE` | `prod` / `dry` / `dev` (default `dev`); only the collecting machine runs `prod` |
+| `WNBA_ENABLED` | `1` turns on the WNBA routes, startup data load and training (default `0`) |
+| `ADMIN_PASSWORD_HASH`, `SESSION_SECRET` | Admin login; set with `python auth.py set-password` |
+| `ALLOWED_HOSTS`, `API_DOCS_ENABLED` | Accepted Host headers (default `bettr.rodneyhong.com,localhost,127.0.0.1`); `1` serves `/docs` |
+| `KAGGLEHUB_CACHE` | Kaggle download cache (kagglehub default `~/.cache/kagglehub`); older versions are pruned after each ETL |
+| `SPACES_KEY`, `SPACES_SECRET`, `SPACES_BUCKET`, `SPACES_ENDPOINT`, `SPACES_REGION` | Off-server backup bucket (DigitalOcean Spaces) |
+| `SCREENSHOT_EXTRACTOR` | `ollama` (local, default), `ollama_cloud` (falls back to `gemini`), `gemini` or `claude` |
+| `OLLAMA_API_KEY`, `SCREENSHOT_OLLAMA_CLOUD_MODEL`, `SCREENSHOT_OLLAMA_CLOUD_PARALLEL` | Ollama Cloud (defaults `gemma4:31b`, 1) |
+| `GEMINI_API_KEY`, `SCREENSHOT_GEMINI_MODEL`, `SCREENSHOT_GEMINI_PARALLEL` | Gemini API fallback (defaults `gemma-4-31b-it`, 2) |
 
 ---
 
