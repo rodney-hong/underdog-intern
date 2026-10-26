@@ -178,6 +178,10 @@ def maintenance(db, tmp_path, monkeypatch):
 
     monkeypatch.setitem(sys.modules, "paper_predictions",
                         types.SimpleNamespace(resolve_paper_predictions=resolve))
+    # the real challenger_log binds DB_PATH at import: the live predictions.db if an earlier
+    # test imported it, so its resolver is stubbed like the paper one
+    monkeypatch.setitem(sys.modules, "challenger_log",
+                        types.SimpleNamespace(resolve_challenger_predictions=lambda: 0))
 
     def restore(path):
         calls["restore"] += 1

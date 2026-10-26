@@ -76,6 +76,10 @@ def jobs(tmp_path, monkeypatch):
 
     monkeypatch.setitem(sys.modules, "paper_predictions",
                         types.SimpleNamespace(log_for_pull=log_for_pull))
+    # challenger rows follow the paper rows inside the same lock; the real challenger_log binds
+    # DB_PATH at import (the live predictions.db if an earlier test imported it), so stub it
+    monkeypatch.setitem(sys.modules, "challenger_log",
+                        types.SimpleNamespace(log_for_pull=lambda game_id: {"logged": 0}))
 
     def run_all(n=5):
         def job(ev):

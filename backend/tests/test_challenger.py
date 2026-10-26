@@ -164,6 +164,7 @@ def test_rungs():
 
 @pytest.mark.skipif(not (os.path.exists(inference.DEV_MODEL) and os.path.exists(inference.DB)),
                     reason="needs predictions.db and the Stage 1 dev model file")
+@pytest.mark.live_db_readonly
 def test_challenger_predict_real_db():
     # the top scorer on 2025-01-15 (a 2024-25 regular-season game)
     conn = sqlite3.connect(f"file:{inference.DB}?mode=ro", uri=True)

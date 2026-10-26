@@ -24,6 +24,7 @@ import proc_lock
 ET = line_logger.EASTERN
 APP_PENDING = 47
 PAPER_RESOLVED = 120
+CHALLENGER_RESOLVED = 33
 
 
 def _version_files(tmp_path, n, tag):
@@ -59,7 +60,10 @@ def env(tmp_path, monkeypatch):
     """
     Temp DB with Kaggle v520 (3 player_stats rows) loaded by the real run_etl and
     APP_PENDING unresolved app predictions. Kaggle now offers v521 (5 rows). The app
-    resolver stub grades every pending row; the paper resolver reports PAPER_RESOLVED.
+    resolver stub grades every pending row; the paper and challenger resolvers report
+    PAPER_RESOLVED and CHALLENGER_RESOLVED. Both are stubbed as modules: challenger_log and
+    paper_predictions bind DB_PATH at import, so if an earlier test imported them, the real
+    ones would resolve against the live predictions.db.
     """
     path = str(tmp_path / "test.db")
     monkeypatch.setattr(database, "DB_PATH", path)
@@ -110,6 +114,8 @@ def env(tmp_path, monkeypatch):
                         lambda tag="": state.setdefault("catchup", []).append(tag) or {"pulled": []})
     monkeypatch.setitem(sys.modules, "paper_predictions",
                         types.SimpleNamespace(resolve_paper_predictions=lambda: PAPER_RESOLVED))
+    monkeypatch.setitem(sys.modules, "challenger_log",
+                        types.SimpleNamespace(resolve_challenger_predictions=lambda: CHALLENGER_RESOLVED))
     state["path"] = path
     return state
 
@@ -141,6 +147,7 @@ def test_startup_sync_loads_a_new_version_immediately(env, monkeypatch, capsys):
     assert out["version_loaded"] == 521 and _version(env["path"]) == 521
     assert out["rows_added"] == 2                          # 5 rows in v521, 3 in v520
     assert out["app_resolved"] == APP_PENDING and out["paper_resolved"] == PAPER_RESOLVED
+    assert out["challenger_resolved"] == CHALLENGER_RESOLVED
     assert len(env["etl_calls"]) == 1 and env["etl_calls"][0] - t0 < 10   # no 15-minute delay
     assert env["pretip_locked_during_etl"] is True         # pre-tip jobs queue behind the load
     assert out["rosters"] == "refreshed at startup"

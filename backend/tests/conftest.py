@@ -21,6 +21,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 def pytest_configure(config):
     config.addinivalue_line("markers", "real_auth: run with the real login check (no signed-in override)")
+    config.addinivalue_line("markers", "live_db_readonly: may open the real predictions.db, read-only "
+                                       "(file:...?mode=ro) connections only")
 
 
 _LOOPBACK = {"127.0.0.1", "::1", "localhost"}
@@ -50,6 +52,44 @@ def _no_network(monkeypatch):
     monkeypatch.setattr(socket.socket, "connect", connect)
     monkeypatch.setattr(socket, "getaddrinfo", getaddrinfo)
     yield
+
+
+_BACKEND = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_LIVE_DBS = {os.path.normcase(os.path.realpath(os.path.join(_BACKEND, n))) for n in ("predictions.db", "historical.db")}
+
+
+def _db_file(database) -> str:
+    """The file a sqlite3.connect target names ('file:...?mode=ro' URIs included)."""
+    path = os.fspath(database)
+    if path.startswith("file:"):
+        path = path[5:].split("?", 1)[0]
+    return os.path.normcase(os.path.realpath(path))
+
+
+@pytest.fixture(autouse=True)
+def _no_live_database(request, monkeypatch):
+    """No test opens the real predictions.db or historical.db. Modules that did
+    `from database import DB_PATH` at import keep the real path unless a test repoints them,
+    so a forgotten module would otherwise read (or write) the live database. A test marked
+    live_db_readonly may open it read-only (a 'file:...?mode=ro' URI) and nothing else."""
+    import sqlite3
+    real = sqlite3.connect
+    opened = []
+    readonly_ok = request.node.get_closest_marker("live_db_readonly") is not None
+
+    def connect(database, *a, **k):
+        target = os.fspath(database)
+        if readonly_ok and target.startswith("file:") and "mode=ro" in target.split("?", 1)[-1] and k.get("uri"):
+            return real(database, *a, **k)
+        if _db_file(database) in _LIVE_DBS:
+            opened.append(str(database))
+            raise AssertionError(f"test opened the live database {database}; repoint the module's DB_PATH")
+        return real(database, *a, **k)
+
+    monkeypatch.setattr(sqlite3, "connect", connect)
+    yield
+    if opened:        # also when the code under test caught the AssertionError
+        pytest.fail(f"opened the live database {len(opened)} time(s): {sorted(set(opened))}")
 
 
 @pytest.fixture(autouse=True)
