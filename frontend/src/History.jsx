@@ -25,28 +25,39 @@ const MODEL_KEYS = { Challenger: ['challenger'], Frozen: ['frozen'], 'Challenger
 const TOOLTIP_WIDTH = 260
 
 // The phone list has no column headers to click: with it (and only with it: the same isPhone switch)
-// a "Sort by" select offers the same sorts (every sortable column, both ways) on the same sort state. "key:direction"; '' is the default
-// order (newest made first), which a sort on Made, newest first equals.
+// a "Sort by" select offers three sorts on the table's sort state. "key:direction"; '' is the
+// default order (newest made first), which a sort on Made, newest first equals. "Actual" is its
+// own order (actual_graded: OVER, UNDER, DNP, then Pending), which no column header gives.
 const SORT_OPTIONS = [
-  ['', 'Made, newest first'],
-  ['timestamp:asc', 'Made, oldest first'],
-  ['game_date:desc', 'Game date, latest first'],
-  ['game_date:asc', 'Game date, earliest first'],
-  ['player_name:asc', 'Player, A to Z'],
-  ['player_name:desc', 'Player, Z to A'],
-  ['confidence:desc', 'Confidence, high to low'],
-  ['confidence:asc', 'Confidence, low to high'],
-  ['stat_line:desc', 'Line, high to low'],
-  ['stat_line:asc', 'Line, low to high'],
-  ['stat_type:asc', 'Stat, A to Z'],
-  ['stat_type:desc', 'Stat, Z to A'],
-  ['opponent_team:asc', 'Opponent, A to Z'],
-  ['opponent_team:desc', 'Opponent, Z to A'],
-  ['predicted_outcome:asc', 'Predicted, OVER first'],
-  ['predicted_outcome:desc', 'Predicted, UNDER first'],
-  ['actual_result:asc', 'Actual, DNP then OVER then UNDER'],
-  ['actual_result:desc', 'Actual, UNDER then OVER then DNP'],
+  ['', 'Newest'],
+  ['confidence:desc', 'Confidence'],
+  ['actual_graded:asc', 'Actual'],
 ]
+// A sort set from a desktop header that the phone doesn't offer is shown under its usual label
+// (an extra option) until another is picked, so the select never names the wrong order.
+const HEADER_SORT_LABELS = {
+  'timestamp:asc': 'Made, oldest first',
+  'game_date:desc': 'Game date, latest first',
+  'game_date:asc': 'Game date, earliest first',
+  'player_name:asc': 'Player, A to Z',
+  'player_name:desc': 'Player, Z to A',
+  'confidence:asc': 'Confidence, low to high',
+  'stat_line:desc': 'Line, high to low',
+  'stat_line:asc': 'Line, low to high',
+  'stat_type:asc': 'Stat, A to Z',
+  'stat_type:desc': 'Stat, Z to A',
+  'opponent_team:asc': 'Opponent, A to Z',
+  'opponent_team:desc': 'Opponent, Z to A',
+  'predicted_outcome:asc': 'Predicted, OVER first',
+  'predicted_outcome:desc': 'Predicted, UNDER first',
+  'actual_result:asc': 'Actual, DNP then OVER then UNDER',
+  'actual_result:desc': 'Actual, UNDER then OVER then DNP',
+}
+export function sortSelectOptions(value) {
+  if (SORT_OPTIONS.some(([v]) => v === value)) return SORT_OPTIONS
+  return [...SORT_OPTIONS, [value, HEADER_SORT_LABELS[value] ?? value]]
+}
+const ACTUAL_GRADED_RANK = { OVER: 0, UNDER: 1, DNP: 2 }   // Pending (null) after all of them
 
 // The select's value for a sort state, and the sort state for a select value
 export function sortOptionValue({ key, direction }) {
@@ -406,7 +417,9 @@ export default function History() {
 
   // Sort (after filter, before pagination)
   const NUMERIC_SORT_KEYS = new Set(['stat_line', 'confidence'])
-  const sorted = sortConfig.key
+  const sorted = sortConfig.key === 'actual_graded'
+    ? [...filtered].sort((a, b) => (ACTUAL_GRADED_RANK[a.actual_result] ?? 3) - (ACTUAL_GRADED_RANK[b.actual_result] ?? 3))
+    : sortConfig.key
     ? [...filtered].sort((a, b) => {
         let aVal = a[sortConfig.key]
         let bVal = b[sortConfig.key]
@@ -536,7 +549,9 @@ export default function History() {
                   aria-label="Sort by"
                   className="input-field h-[34px] px-2 text-sm cursor-pointer min-w-0 flex-1"
                 >
-                  {SORT_OPTIONS.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
+                  {sortSelectOptions(sortOptionValue(sortConfig)).map(([value, label]) => (
+                    <option key={value} value={value}>{label}</option>
+                  ))}
                 </select>
               </label>
             )}

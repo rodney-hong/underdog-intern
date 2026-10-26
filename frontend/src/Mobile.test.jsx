@@ -91,25 +91,24 @@ it('several screenshots at once: rows from each, a failed image is named', async
   expect(screen.getByText('Predict 3 rows').parentElement.className).toContain('sticky-action')
 })
 
-it('History on a phone: "Sort by" sorts the whole filtered set and shares the table\'s sort state', async () => {
-  const rows = [['Zed Last', 0.55], ['Amy First', 0.72], ['Mo Middle', 0.61]].map(([player_name, confidence], i) =>
-    ({ ...pred, id: i + 1, player_name, confidence }))
+it('History on a phone: "Sort by" offers Newest, Confidence and Actual over the whole filtered set', async () => {
+  const rows = [['Zed Last', 0.55, null], ['Amy First', 0.72, 'DNP'], ['Mo Middle', 0.61, 'UNDER'], ['Bo Fourth', 0.58, 'OVER']]
+    .map(([player_name, confidence, actual_result], i) => ({ ...pred, id: i + 1, player_name, confidence, actual_result }))
   globalThis.fetch = vi.fn(async (url) => ({ ok: true, status: 200,
     json: async () => (url.includes('/predictions/history') ? rows : TR) }))
   render(<History />)
   const cards = await screen.findByRole('list', { name: 'Predictions' })
-  const names = () => within(cards).getAllByRole('button', { name: /Last|First|Middle/ }).map((b) => b.textContent)
-  expect(names()).toEqual(['Zed Last', 'Amy First', 'Mo Middle'])          // default: the server's order
+  const names = () => within(cards).getAllByRole('button', { name: /Last|First|Middle|Fourth/ }).map((b) => b.textContent)
+  expect(names()).toEqual(['Zed Last', 'Amy First', 'Mo Middle', 'Bo Fourth'])     // Newest: the server's order
 
   const sortBy = screen.getByRole('combobox', { name: 'Sort by' })
-  fireEvent.change(sortBy, { target: { value: 'player_name:asc' } })
-  expect(names()).toEqual(['Amy First', 'Mo Middle', 'Zed Last'])
-  fireEvent.change(sortBy, { target: { value: 'confidence:desc' } })
-  expect(names()).toEqual(['Amy First', 'Mo Middle', 'Zed Last'])
-  fireEvent.change(sortBy, { target: { value: 'confidence:asc' } })
-  expect(names()).toEqual(['Zed Last', 'Mo Middle', 'Amy First'])
+  expect([...sortBy.options].map((o) => o.textContent)).toEqual(['Newest', 'Confidence', 'Actual'])
+  fireEvent.change(sortBy, { target: { value: 'confidence:desc' } })                // high to low
+  expect(names()).toEqual(['Amy First', 'Mo Middle', 'Bo Fourth', 'Zed Last'])
+  fireEvent.change(sortBy, { target: { value: 'actual_graded:asc' } })              // OVER, UNDER, DNP, Pending
+  expect(names()).toEqual(['Bo Fourth', 'Mo Middle', 'Amy First', 'Zed Last'])
   fireEvent.change(sortBy, { target: { value: '' } })
-  expect(names()).toEqual(['Zed Last', 'Amy First', 'Mo Middle'])
+  expect(names()).toEqual(['Zed Last', 'Amy First', 'Mo Middle', 'Bo Fourth'])
 })
 
 it('"Sort by" shows only with the phone list; the sort carries across the switch to the table', async () => {
@@ -123,15 +122,19 @@ it('"Sort by" shows only with the phone list; the sort carries across the switch
     json: async () => (url.includes('/predictions/history') ? [pred] : TR) }))
   render(<History />)
   await screen.findByRole('list', { name: 'Predictions' })
-  fireEvent.change(screen.getByRole('combobox', { name: 'Sort by' }), { target: { value: 'stat_line:desc' } })
+  fireEvent.change(screen.getByRole('combobox', { name: 'Sort by' }), { target: { value: 'confidence:desc' } })
 
   resize(false)                                                      // to the table
   const table = await screen.findByRole('table')
   expect(screen.queryByRole('combobox', { name: 'Sort by' })).toBeNull()
-  expect(within(table).getByText('Line').closest('th').getAttribute('aria-sort')).toBe('descending')
-  fireEvent.click(within(table).getByText('Player'))
+  expect(within(table).getByText('Conf.').closest('th').getAttribute('aria-sort')).toBe('descending')
+  fireEvent.click(within(table).getByText('Player'))                // a sort the phone doesn't offer
 
   resize(true)                                                       // back to the list
   await screen.findByRole('list', { name: 'Predictions' })
-  expect(screen.getByRole('combobox', { name: 'Sort by' }).value).toBe('player_name:asc')
+  const sortBy = screen.getByRole('combobox', { name: 'Sort by' })
+  expect(sortBy.value).toBe('player_name:asc')                       // shown under its own label, not mislabelled
+  expect(sortBy.selectedOptions[0].textContent).toBe('Player, A to Z')
+  fireEvent.change(sortBy, { target: { value: '' } })                // picking another drops the extra option
+  expect([...sortBy.options].map((o) => o.textContent)).toEqual(['Newest', 'Confidence', 'Actual'])
 })
