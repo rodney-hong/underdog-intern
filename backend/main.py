@@ -6,6 +6,7 @@ Run with: uvicorn main:app --reload --port 8000
 
 import concurrent.futures
 import datetime as dt
+import os
 import sys
 import threading
 
@@ -17,29 +18,45 @@ for _stream in (sys.stdout, sys.stderr):
         _stream.reconfigure(errors="replace")
     except (AttributeError, ValueError):
         pass
-from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile
+from fastapi import Depends, FastAPI, File, HTTPException, Query, Request, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from pydantic import BaseModel, field_validator
 from starlette.concurrency import run_in_threadpool
 
+import auth
 import data_fetcher
 import predictor
 import database
 import line_logger
 import news_ingest
+import runmode
 
-app = FastAPI(title="SportsBettr API", version="1.0.0")
+# Every route needs the admin session (auth.require_session) except auth.EXEMPT_PATHS.
+# /docs, /redoc and /openapi.json exist only with API_DOCS_ENABLED=1 (never on the server).
+_DOCS = os.getenv("API_DOCS_ENABLED", "0") == "1"
+app = FastAPI(title="SportsBettr API", version="1.0.0",
+              dependencies=[Depends(auth.require_session)],
+              docs_url="/docs" if _DOCS else None, redoc_url="/redoc" if _DOCS else None,
+              openapi_url="/openapi.json" if _DOCS else None)
 
-# Allow the Vite dev server to call us
+# Behind Caddy the Host header is the public name; anything else is refused (400).
+ALLOWED_HOSTS = [h.strip() for h in os.getenv(
+    "ALLOWED_HOSTS", "bettr.rodneyhong.com,localhost,127.0.0.1").split(",") if h.strip()]
+app.add_middleware(TrustedHostMiddleware, allowed_hosts=ALLOWED_HOSTS)
+
+# The Vite dev server (another origin) calls us only in dev; in production the built app
+# is served from the same origin by Caddy, so no CORS at all.
 ALLOWED_ORIGINS = ["http://localhost:5173", "http://127.0.0.1:5173"]
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+if runmode.mode() == "dev":
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=ALLOWED_ORIGINS,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 
-# Initialise DB on startup
 def _startup_step(name: str, fn, *args, **kwargs):
     """
     Run one startup step; on failure log the full traceback and carry on.
@@ -55,11 +72,35 @@ def _startup_step(name: str, fn, *args, **kwargs):
         return False, None
 
 
+def _check_challenger() -> str:
+    """Load the frozen challenger now (hash + fingerprint), so a missing or changed file is
+    loud at startup instead of a quiet 'challenger predictions FAILED' at the first pre-tip."""
+    from challenger import live
+    try:
+        live.load_frozen()
+    except live.FrozenModelError as exc:
+        print("!" * 78)
+        print(f"[startup] CHALLENGER FILE FAILED ITS CHECK: {exc}")
+        print("[startup] /predict returns 503 for Points/Rebounds/Assists/3PM and pre-tip pulls "
+              "log NO challenger rows until the pre-registered file is back.")
+        print("!" * 78)
+        raise
+    print(f"[startup] challenger file OK (sha256 {live.FROZEN['sha256'][:12]}..., fingerprint matches)")
+    return "ok"
+
+
 @app.on_event("startup")
 def startup_event():
-    import os
     import importlib
     import proc_lock
+
+    mode = runmode.mode()          # an unknown SPORTSBETTR_MODE stops startup here
+    print(runmode.banner(), flush=True)
+    if not auth.configured():
+        print("!" * 78)
+        print("[startup] LOGIN NOT SET UP: every route but /health refuses until "
+              "`python auth.py set-password` has been run and the backend restarted.")
+        print("!" * 78)
 
     # Single instance, before anything else: uvicorn runs this hook BEFORE binding the
     # port, so a second `uvicorn main:app` would otherwise start a second scheduler
@@ -74,8 +115,21 @@ def startup_event():
         raise RuntimeError(msg)
 
     # WAL first, before any scheduler thread opens a connection: readers no longer
-    # block on writers (ETL, scheduler, news poller, API). Persistent once set.
+    # block on writers (ETL, scheduler, news poller, API). Persistent once set, so in
+    # dev and dry this is a no-op on a database copied from the collecting machine.
     _startup_step("database.enable_wal", database.enable_wal)
+    challenger_ok = _startup_step("challenger.check", _check_challenger)[0]
+
+    if mode != "prod":
+        # dev / dry: no network, no writes, nothing automatic. Tables are created if missing
+        # (a no-op on a copied database); is_current / limited-data flags are not recomputed.
+        _startup_step("database.init_db", database.init_db, maintain_flags=False)
+        if mode == "dry":
+            _startup_step("dryrun.start", importlib.import_module("dryrun").start)
+        else:
+            print("[startup] dev: no sync, catch-up pulls, schedules, loggers, pollers or backups. "
+                  "backfill.py and the other scripts still run by hand.")
+        return
 
     # Current rosters (ESPN, free) before anything schedules a paper prediction:
     # player teams come from them, falling back to box scores.
@@ -99,7 +153,7 @@ def startup_event():
     # The 2026-27 models are frozen either way: startup never retrains them.
     if not ml_ok:
         print("[startup] ml_trainer import failed: skipping the frozen-model check and WNBA training.")
-        _startup_complete()
+        _startup_complete(challenger_ok)
         return
     missing = [st for st in ml_trainer.FROZEN_MODEL_TYPES
                if not os.path.exists(ml_trainer.model_path(st))]
@@ -109,6 +163,10 @@ def startup_event():
     else:
         print("NBA models frozen for 2026-27; not retraining.")
 
+    if not runmode.wnba_enabled():
+        print("[startup] WNBA off (WNBA_ENABLED=0): no WNBA data load, no WNBA training.")
+        _startup_complete(challenger_ok)
+        return
     wnba_ok, wnba_etl_ran = _startup_step("database.run_wnba_etl", database.run_wnba_etl)
     if wnba_ok and (wnba_etl_ran or not os.path.exists(ml_trainer.WNBA_MODEL_PATH)):
         print("Training WNBA XGBoost models…")
@@ -118,11 +176,14 @@ def startup_event():
         print("Skipping WNBA training: WNBA ETL failed; existing models kept.")
     else:
         print("WNBA models up to date, skipping training.")
-    _startup_complete()
+    _startup_complete(challenger_ok)
 
 
-def _startup_complete():
-    """Startup is done: sync the data now, in the background (line_logger.run_sync)."""
+def _startup_complete(challenger_ok: bool = True):
+    """Startup is done (prod): record it in startup_log, then sync the data now, in the
+    background (line_logger.run_sync)."""
+    _startup_step("database.log_startup", database.log_startup, mode=runmode.mode(),
+                  wnba_enabled=runmode.wnba_enabled(), challenger_ok=challenger_ok)
     _startup_step("line_logger.start_sync_in_background", line_logger.start_sync_in_background)
     print("[startup] complete; data sync running in the background ([sync] lines)")
 
@@ -130,8 +191,10 @@ def _startup_complete():
 @app.on_event("shutdown")
 def shutdown_event():
     import proc_lock
+    import dryrun
     line_logger.stop_scheduler()
     news_ingest.stop_scheduler()
+    dryrun.stop()
     if proc_lock.INSTANCE_LOCK.held:
         proc_lock.INSTANCE_LOCK.release()
 
@@ -182,6 +245,42 @@ class PredictRequest(BaseModel):
         if v <= 0:
             raise ValueError("stat_line must be a positive number")
         return v
+
+
+# ---------------------------------------------------------------------------
+# Login (auth.py). /auth/login and /health are the only routes without a session.
+# ---------------------------------------------------------------------------
+
+class LoginRequest(BaseModel):
+    password: str
+
+
+@app.post("/auth/login")
+def login(req: LoginRequest, request: Request, response: Response):
+    """Admin password -> 30-day session cookie. 5 failed tries per 15 min per IP, then 429."""
+    ip = auth.client_ip(request)
+    if not auth.configured():
+        raise HTTPException(status_code=503, detail="Login is not set up: run `python auth.py set-password`")
+    if auth.locked_out(ip):
+        raise HTTPException(status_code=429, detail="Too many failed logins; try again in 15 minutes")
+    if not auth.verify_password(req.password):
+        auth.record_failure(ip)
+        print(f"[auth] failed login from {ip}")
+        raise HTTPException(status_code=401, detail="Wrong password")
+    auth.set_session_cookie(response, auth.new_token())
+    return {"ok": True}
+
+
+@app.post("/auth/logout")
+def logout(response: Response):
+    auth.clear_session_cookie(response)
+    return {"ok": True}
+
+
+@app.get("/auth/me")
+def whoami():
+    """200 with a valid session (the app checks this on load), else 401 like every route."""
+    return {"ok": True}
 
 
 # ---------------------------------------------------------------------------
@@ -311,6 +410,8 @@ def predict_prop(req: PredictRequest):
     prediction (422 "Not enough NBA games") and no row.
     """
     from challenger.live import STATS as CHALLENGER_STATS
+    if req.league == "WNBA":
+        _wnba_on()
     counts = None
     if req.league != "WNBA":
         conn = database.get_connection()
@@ -657,22 +758,28 @@ def get_player_line(player_name: str, stat_type: str):
 
 
 # ---------------------------------------------------------------------------
-# WNBA endpoints
+# WNBA endpoints: 404 unless WNBA_ENABLED=1 (/wnba/lines spends OddsAPI credits outside
+# the monthly cap, so it must never be reachable on the server by default)
 # ---------------------------------------------------------------------------
 
-@app.get("/wnba/players/search")
+def _wnba_on() -> None:
+    if not runmode.wnba_enabled():
+        raise HTTPException(status_code=404, detail="WNBA is turned off (WNBA_ENABLED=0)")
+
+
+@app.get("/wnba/players/search", dependencies=[Depends(_wnba_on)])
 def search_wnba_players(q: str = Query(default="", min_length=1)):
     if not q.strip():
         return []
     return data_fetcher.search_wnba_players(q)
 
 
-@app.get("/wnba/teams")
+@app.get("/wnba/teams", dependencies=[Depends(_wnba_on)])
 def get_wnba_teams():
     return data_fetcher.get_wnba_team_names()
 
 
-@app.get("/wnba/players/{player_name}/team")
+@app.get("/wnba/players/{player_name}/team", dependencies=[Depends(_wnba_on)])
 def get_wnba_player_team(player_name: str):
     ctx = data_fetcher.get_wnba_player_context(player_name)
     if ctx is None:
@@ -700,7 +807,7 @@ def get_wnba_player_team(player_name: str):
     }
 
 
-@app.get("/wnba/players/{player_name}/context")
+@app.get("/wnba/players/{player_name}/context", dependencies=[Depends(_wnba_on)])
 def get_wnba_player_context_endpoint(player_name: str):
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
         injury_fut = ex.submit(data_fetcher.get_wnba_injury_status, player_name)
@@ -711,7 +818,7 @@ def get_wnba_player_context_endpoint(player_name: str):
     return {"injury_status": injury_status, "news": ""}
 
 
-@app.get("/wnba/lines/{player_name}/{stat_type}")
+@app.get("/wnba/lines/{player_name}/{stat_type}", dependencies=[Depends(_wnba_on)])
 def get_wnba_player_line(player_name: str, stat_type: str):
     line, source = data_fetcher.get_wnba_player_line(player_name, stat_type)
     return {"line": line, "source": source}
@@ -723,33 +830,28 @@ def health():
 
 
 # ---------------------------------------------------------------------------
-# Data sync (line_logger.run_sync), localhost only
+# Data sync (line_logger.run_sync). Behind the login like every route; prod only (in dev
+# and dry the machine doesn't collect, ground rule 1). A request never spends OddsAPI
+# credits: Sync now skips the catch-up pulls (startup and the 07:00 sync still run them).
 # ---------------------------------------------------------------------------
 
-LOCAL_HOSTS = {"127.0.0.1", "::1", "localhost"}
-
-
-def _require_local(request: Request) -> None:
-    """403 unless the caller is on this machine and, if a browser, is the app itself."""
-    host = request.client.host if request.client else None
-    origin = request.headers.get("origin")
-    if host not in LOCAL_HOSTS or (origin is not None and origin not in ALLOWED_ORIGINS):
-        raise HTTPException(status_code=403, detail="sync is available from this machine only")
-
-
 @app.post("/sync")
-def sync_now(request: Request):
+def sync_now():
     """
     Sync now: the same guarded routine as the startup and 07:00 syncs (backup ->
-    rosters -> Kaggle check -> ETL if newer -> resolve). Runs to completion (an ETL takes
-    minutes); returns {"status": "busy"} at once if another sync or ETL is running.
+    rosters -> Kaggle check -> ETL if newer -> resolve), without catch-up pulls. Runs to
+    completion (an ETL takes minutes); returns {"status": "busy"} at once if another sync
+    or ETL is running. 409 unless SPORTSBETTR_MODE=prod.
     """
-    _require_local(request)
-    return line_logger.run_sync(line_logger._scheduler, trigger="sync now", lock_wait_minutes=0)
+    if not runmode.is_prod():
+        raise HTTPException(status_code=409, detail=f"Sync runs only on the collecting machine "
+                                                    f"(SPORTSBETTR_MODE=prod; this one is {runmode.mode()})")
+    return line_logger.run_sync(line_logger._scheduler, trigger="sync now", lock_wait_minutes=0,
+                                catchup=False)
 
 
 @app.post("/screenshot/extract")
-async def screenshot_extract(request: Request, file: UploadFile = File(...)):
+async def screenshot_extract(file: UploadFile = File(...)):
     """
     Screenshot of player cards -> rows for the app's confirmation table. The extractor
     (screenshot_import.SCREENSHOT_EXTRACTOR) only transcribes the cards; nothing is
@@ -758,7 +860,6 @@ async def screenshot_extract(request: Request, file: UploadFile = File(...)):
     """
     import json
     import screenshot_import as si
-    _require_local(request)
     try:
         data = await file.read(si.MAX_IMAGE_BYTES + 1)
     finally:
@@ -782,11 +883,10 @@ class AliasRequest(BaseModel):
 
 
 @app.post("/screenshot/alias")
-def learn_alias(req: AliasRequest, request: Request):
+def learn_alias(req: AliasRequest):
     """An unmatched screenshot row resolved by picking a player: remember card name -> personId
     (player_aliases, source 'user') unless the name collides or is a roster name."""
     import player_aliases
-    _require_local(request)
     conn = database.get_connection()
     try:
         player_aliases.init_table(conn)
@@ -796,10 +896,9 @@ def learn_alias(req: AliasRequest, request: Request):
 
 
 @app.delete("/screenshot/alias")
-def delete_alias(request: Request, name: str = Query(..., min_length=1), person_id: int | None = Query(default=None)):
+def delete_alias(name: str = Query(..., min_length=1), person_id: int | None = Query(default=None)):
     """Remove a wrong alias (all of the name's aliases, or only the one for person_id)."""
     import player_aliases
-    _require_local(request)
     conn = database.get_connection()
     try:
         player_aliases.init_table(conn)
@@ -809,7 +908,6 @@ def delete_alias(request: Request, name: str = Query(..., min_length=1), person_
 
 
 @app.get("/sync")
-def last_sync(request: Request):
+def last_sync():
     """The latest finished sync's result in this backend process (null before the first)."""
-    _require_local(request)
     return {"last": line_logger.last_sync()}

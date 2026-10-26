@@ -552,6 +552,10 @@ def start_scheduler():
     global _scheduler
     if _scheduler is not None:
         return _scheduler
+    import runmode
+    if not runmode.is_prod():   # main.py only calls this in prod; refuse anyway (ground rule 1)
+        print(f"[news] poller NOT started: SPORTSBETTR_MODE={runmode.mode()}")
+        return None
     init_tables()
     if os.getenv("NEWS_INGEST_ENABLED", "1") != "1":
         print("[news] disabled via NEWS_INGEST_ENABLED")

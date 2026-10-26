@@ -150,7 +150,6 @@ def test_ollama_out_of_memory_maps_to_the_short_message(monkeypatch):
 def test_extract_endpoint_returns_the_message(fake, monkeypatch):
     from fastapi.testclient import TestClient
     import main
-    monkeypatch.setattr(main, "_require_local", lambda request: None)
     fake["fail"].update({i: "gpu" for i in range(4)})
     r = TestClient(main.app).post("/screenshot/extract", files={"file": ("s.png", fake["data"], "image/png")})
     assert r.status_code == 503 and r.json()["detail"] == "Not enough GPU memory: close other apps"

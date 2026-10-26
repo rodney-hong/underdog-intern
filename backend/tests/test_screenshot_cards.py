@@ -386,7 +386,6 @@ def test_endpoint_records_line_checks_and_predicts_nothing(db, fake_ollama, monk
     from fastapi.testclient import TestClient
     import data_fetcher
     import main
-    monkeypatch.setattr(main, "LOCAL_HOSTS", main.LOCAL_HOSTS | {"testclient"})
     monkeypatch.setattr(data_fetcher, "get_player_context", _ctx)
     r = TestClient(main.app).post("/screenshot/extract",
                                   files={"file": ("grid.png", fake_ollama["data"], "image/png")})

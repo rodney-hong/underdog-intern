@@ -104,7 +104,6 @@ def test_alias_for_the_wrong_team_does_not_resolve(db):
 def test_a_pick_in_an_unmatched_row_is_learned(db, monkeypatch):
     from fastapi.testclient import TestClient
     import main
-    monkeypatch.setattr(main, "_require_local", lambda request: None)
     assert _rows("KAT", "NYK")["match"] == "not_found"
     client = TestClient(main.app)
     assert client.post("/screenshot/alias", json={"screenshot_name": "KAT", "person_id": KAT}).json() == \

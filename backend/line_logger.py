@@ -602,6 +602,7 @@ def run_open_pull(phase: str = "open", scheduler=None) -> int:
     """
     init_tables()
     events, remaining = fetch_todays_events()
+    _remember_events(events)
     now = dt.datetime.now(dt.timezone.utc)
     total = 0
     for event in events:
@@ -657,6 +658,7 @@ def run_catchup_pulls(tag: str = "[line_logger]") -> dict:
     if all_events is None:
         print(f"{tag} catch-up pulls: none (events feed unavailable)")
         return {"skipped_all": "events feed unavailable"}
+    _remember_events(todays(all_events))
     now = dt.datetime.now(dt.timezone.utc)
     out: dict = {"pulled": [], "skipped": {}, "credits": 0}
     for event in todays(all_events):
@@ -746,6 +748,7 @@ def schedule_todays_pretips(scheduler=None) -> int:
         _retry_scheduling(scheduler, now)
         return -1
     events = todays(all_events)
+    _remember_events(events, slate_known=True)
     n = 0
     for event in events:
         if _commence(event) <= now:
@@ -804,15 +807,19 @@ _PRETIP_LOCK = threading.Lock()
 def run_pretip_pull(event: dict, attempt: int = 1):
     """_run_pretip_pull under _PRETIP_LOCK; logs how long it waited for another game's job."""
     label = f"{event.get('away_team')} @ {event.get('home_team')} ({event['id']})"
-    if not _PRETIP_LOCK.acquire(blocking=False):
-        t0 = time.monotonic()
-        print(f"[line_logger] pretip {label}: waiting for another pre-tip job")
-        _PRETIP_LOCK.acquire()
-        print(f"[line_logger] pretip {label}: waited {time.monotonic() - t0:.1f}s")
+    _running_pretips.add(event["id"])          # the self-check leaves a waiting/running job alone
     try:
-        return _run_pretip_pull(event, attempt)
+        if not _PRETIP_LOCK.acquire(blocking=False):
+            t0 = time.monotonic()
+            print(f"[line_logger] pretip {label}: waiting for another pre-tip job")
+            _PRETIP_LOCK.acquire()
+            print(f"[line_logger] pretip {label}: waited {time.monotonic() - t0:.1f}s")
+        try:
+            return _run_pretip_pull(event, attempt)
+        finally:
+            _PRETIP_LOCK.release()
     finally:
-        _PRETIP_LOCK.release()
+        _running_pretips.discard(event["id"])
 
 
 def _run_pretip_pull(event: dict, attempt: int = 1):
@@ -906,6 +913,84 @@ def _schedule_pretip(scheduler, event: dict) -> None:
         id=f"pretip:{event['id']}", replace_existing=True,
         misfire_grace_time=(PRETIP_MINUTES - 5) * 60,
     )
+
+
+# ---------------------------------------------------------------------------
+# Pre-tip self-check (every SELF_CHECK_MINUTES): pre-tip jobs live only in memory, and on an
+# always-on server nothing restarts to re-schedule a lost one. Checked against today's
+# events as last seen by a scheduling call; no API call unless today was never scheduled.
+# ---------------------------------------------------------------------------
+
+SELF_CHECK_MINUTES = 15
+_known_events: dict[str, dict] = {}     # ET date -> {event id: event}; key present = slate known
+_running_pretips: set[str] = set()      # event ids whose pre-tip job is waiting or running
+_selfcheck_schedule_calls: dict[str, float] = {}   # ET date -> monotonic time of the last re-schedule
+
+
+def _remember_events(events: list[dict] | None, slate_known: bool = False) -> None:
+    today = dt.datetime.now(EASTERN).date().isoformat()
+    for d in [d for d in _known_events if d < today]:
+        del _known_events[d]
+    if slate_known:
+        _known_events.setdefault(today, {})
+    for e in events or []:
+        day = _commence(e).astimezone(EASTERN).date().isoformat()
+        _known_events.setdefault(day, {})[e["id"]] = e
+
+
+def _pretip_attempted(game_id: str, game_date: str) -> bool:
+    """Any pre-tip attempt today (success, failure or refusal): the self-check never adds
+    another try for it; the pre-tip job's own one retry is the only retry."""
+    conn = get_db()
+    row = conn.execute("SELECT 1 FROM odds_pull_log WHERE endpoint = 'event_odds' AND pull_phase = 'pretip' "
+                       "AND game_id = ? AND game_date = ? LIMIT 1", (game_id, game_date)).fetchone()
+    conn.close()
+    return row is not None
+
+
+def pretip_self_check(scheduler=None) -> dict:
+    """
+    Re-add a missing pre-tip job (with a loud warning) for each of today's known games that
+    hasn't started, has no pending pre-tip or retry job, isn't running, and has no pre-tip
+    attempt in odds_pull_log. If today's slate was never scheduled (06:00 job and its retries
+    all failed) while the schedule table shows a game still to come, run the free scheduling
+    call again, at most once an hour. Returns {"readded": [...], "rescheduled": n | None}.
+    """
+    scheduler = scheduler or _scheduler
+    out: dict = {"readded": [], "rescheduled": None}
+    if scheduler is None:
+        return out
+    now = dt.datetime.now(dt.timezone.utc)
+    now_et = now.astimezone(EASTERN)
+    today = now_et.date().isoformat()
+    if today not in _known_events:
+        last_tip = _last_tip_today_utc()
+        recent = time.monotonic() - _selfcheck_schedule_calls.get(today, -1e9) < 3600
+        if (last_tip is not None and last_tip > now and now_et.hour >= SCHEDULE_HOUR_ET and not recent
+                and scheduler.get_job("line_pretip_scheduler_retry") is None):
+            print("!" * 78)
+            print("[self-check] WARNING: today's pre-tip pulls were never scheduled; scheduling now")
+            print("!" * 78)
+            _selfcheck_schedule_calls[today] = time.monotonic()
+            out["rescheduled"] = schedule_todays_pretips(scheduler)
+        return out
+    jobs = {j.id for j in scheduler.get_jobs()}
+    for eid, event in list(_known_events[today].items()):
+        if _commence(event) <= now or eid in _running_pretips:
+            continue
+        if f"pretip:{eid}" in jobs or f"pretip-retry:{eid}" in jobs:
+            continue
+        if _pretip_attempted(eid, today):
+            continue
+        _schedule_pretip(scheduler, event)
+        label = f"{event.get('away_team')} @ {event.get('home_team')}"
+        run_at = _commence(event) - dt.timedelta(minutes=PRETIP_MINUTES)
+        print("!" * 78)
+        print(f"[self-check] WARNING: pre-tip job for {label} ({eid}) was missing; re-added "
+              f"(pre-tip {run_at.astimezone(EASTERN):%H:%M} ET, or at once if that has passed)")
+        print("!" * 78)
+        out["readded"].append(label)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -1197,12 +1282,13 @@ def _resolve_all(out: dict, app_before: int, tag: str) -> None:
 
 
 def run_sync(scheduler=None, trigger: str = "manual", refresh_rosters: bool = True,
-             lock_wait_minutes: float | None = None) -> dict:
+             lock_wait_minutes: float | None = None, catchup: bool = True) -> dict:
     """
     _run_sync under proc_lock.ETL_LOCK (cross-process), so it never overlaps another
     sync, ETL or Kaggle retry, in this process or another. Waits up to
     lock_wait_minutes (default MAINTENANCE_LOCK_WAIT_MINUTES; 0 for Sync now), then
-    returns {"status": "busy"}.
+    returns {"status": "busy"}. catchup=False skips step 0 (Sync now: a request never
+    spends credits).
     """
     global _last_sync
     import proc_lock
@@ -1213,16 +1299,17 @@ def run_sync(scheduler=None, trigger: str = "manual", refresh_rosters: bool = Tr
         print(f"[sync] {trigger}: {summary}")
         return {"status": "busy", "trigger": trigger, "summary": summary, "skipped": "etl lock held"}
     try:
-        out = _run_sync(scheduler, trigger, refresh_rosters)
+        out = _run_sync(scheduler, trigger, refresh_rosters, catchup)
     finally:
         proc_lock.ETL_LOCK.release()
     _last_sync = out
     return out
 
 
-def _run_sync(scheduler, trigger: str, refresh_rosters: bool) -> dict:
+def _run_sync(scheduler, trigger: str, refresh_rosters: bool, catchup: bool = True) -> dict:
     """
-      0. catch-up pulls for today's games with no pull yet (run_catchup_pulls; never blocks sync);
+      0. catch-up pulls for today's games with no pull yet (run_catchup_pulls; never blocks sync;
+         skipped with catchup=False);
       1. back up predictions.db unless today's backup exists (_ensure_backup); abort on failure;
       2. refresh ESPN rosters and the player_match tables (a failure is logged, sync continues);
       3. ask Kaggle for the newest Ready version;
@@ -1257,7 +1344,11 @@ def _run_sync(scheduler, trigger: str, refresh_rosters: bool) -> dict:
         out["next_check"] = out["kaggle_retry"]
 
     try:   # lines first, so a late start gives the app lines before a long ETL
-        out["catchup"] = run_catchup_pulls(tag)
+        if catchup:
+            out["catchup"] = run_catchup_pulls(tag)
+        else:
+            out["catchup"] = {"skipped_all": "not run from a request (no credits spent)"}
+            print(f"{tag} catch-up pulls: not run ({trigger}: a request never spends credits)")
     except Exception as exc:
         out["catchup"] = f"FAILED: {exc!r}"
         print(f"{tag} catch-up pulls FAILED: {exc!r} (continuing)")
@@ -1515,6 +1606,10 @@ def start_scheduler():
     global _scheduler
     if _scheduler is not None:
         return _scheduler
+    import runmode
+    if not runmode.is_prod():   # main.py only calls this in prod; refuse anyway (ground rule 1)
+        print(f"[line_logger] scheduler NOT started: SPORTSBETTR_MODE={runmode.mode()}")
+        return None
     init_tables()  # odds_pull_log must exist for the slip path even if logging is disabled
     if os.getenv("LINE_LOGGER_ENABLED", "1") != "1":
         print("[line_logger] disabled via LINE_LOGGER_ENABLED")
@@ -1556,12 +1651,16 @@ def start_scheduler():
         id="morning_maintenance", replace_existing=True, misfire_grace_time=12 * 3600,
         coalesce=True, max_instances=1,
     )
+    # Missed-pull safety net: a lost pre-tip job is re-added within one cycle.
+    sched.add_job(pretip_self_check, "interval", minutes=SELF_CHECK_MINUTES, kwargs={"scheduler": sched},
+                  id="pretip_self_check", replace_existing=True, coalesce=True, max_instances=1)
     sched.start()
     _scheduler = sched
     print(f"[line_logger] scheduler started: open pull {'ON ' + str(OPEN_PULL_HOUR_ET) + ':00 ET' if OPEN_PULL_ENABLED else 'OFF'}, "
           f"pre-tip scheduling {SCHEDULE_HOUR_ET}:00 ET, "
           f"pretip T-{PRETIP_MINUTES}m, markets={MARKETS} (max {CREDITS_PER_PULL} credits/pull), "
-          f"cap {MONTHLY_CREDIT_CAP}/month, sync on startup + {MAINTENANCE_HOUR_ET}:00 ET")
+          f"cap {MONTHLY_CREDIT_CAP}/month, sync on startup + {MAINTENANCE_HOUR_ET}:00 ET, "
+          f"pre-tip self-check every {SELF_CHECK_MINUTES} min")
     _warn_if_cap_too_low()
     return sched
 

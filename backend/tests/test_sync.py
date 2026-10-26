@@ -156,6 +156,7 @@ def test_startup_sync_loads_a_new_version_immediately(env, monkeypatch, capsys):
 
 def test_startup_event_starts_the_sync_when_startup_completes(env, monkeypatch):
     import main
+    monkeypatch.setenv("SPORTSBETTR_MODE", "prod")
     steps = []
 
     def record(name, fn, *a, **kw):
@@ -276,7 +277,7 @@ def client(env, monkeypatch):
     from fastapi.testclient import TestClient
     import main
     monkeypatch.setattr(line_logger, "_scheduler", _FakeScheduler())
-    monkeypatch.setattr(main, "LOCAL_HOSTS", main.LOCAL_HOSTS | {"testclient"})
+    monkeypatch.setenv("SPORTSBETTR_MODE", "prod")
     return TestClient(main.app)                            # no `with`: startup does not run
 
 
@@ -322,11 +323,28 @@ def test_sync_now_is_busy_while_another_sync_runs(client, env):
     assert body["status"] == "busy" and env["etl_calls"] == []
 
 
-def test_sync_now_is_localhost_only(env, monkeypatch):
+def test_sync_now_runs_no_catchup_pulls(client, env):
+    """Catch-up pulls spend credits; Sync now (a request) skips them, startup and 07:00 don't."""
+    body = client.post("/sync").json()
+    assert body["status"] == "loaded" and env.get("catchup") is None
+    assert body["catchup"] == {"skipped_all": "not run from a request (no credits spent)"}
+
+
+def test_sync_now_only_on_the_collecting_machine(env, monkeypatch):
     from fastapi.testclient import TestClient
     import main
-    c = TestClient(main.app)                               # client host "testclient": not local
-    assert c.post("/sync").status_code == 403
-    monkeypatch.setattr(main, "LOCAL_HOSTS", main.LOCAL_HOSTS | {"testclient"})
-    assert c.post("/sync", headers={"Origin": "https://evil.example"}).status_code == 403
+    for mode in ("dev", "dry"):
+        monkeypatch.setenv("SPORTSBETTR_MODE", mode)
+        r = TestClient(main.app).post("/sync")
+        assert r.status_code == 409 and mode in r.json()["detail"]
+    assert env["etl_calls"] == [] and env.get("catchup") is None
+
+
+@pytest.mark.real_auth
+def test_sync_now_needs_the_login(env, monkeypatch):
+    from fastapi.testclient import TestClient
+    import main
+    monkeypatch.setenv("SPORTSBETTR_MODE", "prod")
+    c = TestClient(main.app, base_url="https://testserver")
+    assert c.post("/sync").status_code == 401 and c.get("/sync").status_code == 401
     assert env["etl_calls"] == []

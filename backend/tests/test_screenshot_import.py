@@ -314,7 +314,6 @@ def client(db, monkeypatch, tmp_path):
     from fastapi.testclient import TestClient
     import main
     import data_fetcher
-    monkeypatch.setattr(main, "LOCAL_HOSTS", main.LOCAL_HOSTS | {"testclient"})
     monkeypatch.setenv("SCREENSHOT_EXTRACTOR", "claude")
     monkeypatch.setitem(si._EXTRACT, "claude", lambda png, media: RAW)
     monkeypatch.setattr(data_fetcher, "get_player_context", _context)
@@ -372,11 +371,12 @@ def test_extract_errors(client, monkeypatch):
     assert _predictions() == 0
 
 
-def test_extract_is_localhost_only(db):
+@pytest.mark.real_auth
+def test_extract_needs_the_login(db):
     from fastapi.testclient import TestClient
     import main
     r = TestClient(main.app).post("/screenshot/extract", files={"file": ("c.png", ss.render(), "image/png")})
-    assert r.status_code == 403
+    assert r.status_code == 401
 
 
 # --- optional: the real extractor on the synthetic image ------------------------------------

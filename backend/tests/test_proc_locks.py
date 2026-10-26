@@ -136,6 +136,22 @@ def held_by_other_process(db, tmp_path):
         p.wait()
 
 
+@pytest.mark.parametrize("name", ["etl", "instance"])
+def test_a_crashed_holder_leaves_no_stale_lock(db, held_by_other_process, name):
+    """Killed (SIGKILL on Linux, TerminateProcess on Windows) while holding the lock: the
+    lock file stays behind, but the OS dropped the lock, so the next start gets it at once."""
+    lock = proc_lock.ETL_LOCK if name == "etl" else proc_lock.INSTANCE_LOCK
+    p = held_by_other_process(name)
+    assert not lock.acquire(timeout=0)                 # really held by the other process
+    p.kill()
+    p.wait()
+    assert os.path.exists(proc_lock.lock_path(name))   # the file is left behind...
+    t0 = time.monotonic()
+    assert lock.acquire(timeout=5)                     # ...and is not a stale lock
+    assert time.monotonic() - t0 < 2
+    lock.release()
+
+
 def test_maintenance_skips_while_another_process_holds_the_etl_lock(db, held_by_other_process,
                                                                      monkeypatch, capsys):
     held_by_other_process("etl")
@@ -197,8 +213,9 @@ def test_etl_lock_is_reentrant_for_maintenance_calling_run_etl(db, monkeypatch):
 
 @pytest.fixture
 def startup(db, monkeypatch):
-    """main.startup_event with every step recorded instead of run."""
+    """main.startup_event (prod) with every step recorded instead of run."""
     import main
+    monkeypatch.setenv("SPORTSBETTR_MODE", "prod")
     steps = []
 
     def record(name, fn, *a, **kw):

@@ -3,7 +3,7 @@ import os
 import time
 import unicodedata
 import pandas as pd
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, timedelta, timezone
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "predictions.db")
 
@@ -93,7 +93,9 @@ def enable_wal() -> str:
     return mode
 
 
-def init_db():
+def init_db(maintain_flags: bool = True):
+    """Create missing tables and columns. With maintain_flags (prod), also recompute
+    is_current and the limited-data flags; dev and dry only make sure the schema exists."""
     conn = get_connection()
     conn.execute("""
         CREATE TABLE IF NOT EXISTS predictions (
@@ -143,6 +145,10 @@ def init_db():
         # model = 'challenger_retro' rows: the frozen app prediction they re-score
         # (experiments/retro_challenger.py); exploratory, never in the default stats
         conn.execute("ALTER TABLE predictions ADD COLUMN retro_of INTEGER")
+    conn.commit()
+    if not maintain_flags:
+        conn.close()
+        return
     refresh_current(conn)          # recomputed for every row on each start (idempotent)
     conn.commit()
     try:   # display-only flag; a failure must never stop startup
@@ -151,6 +157,58 @@ def init_db():
     except Exception as exc:
         print(f"Limited-data backfill FAILED: {exc!r} (flags unchanged)")
     conn.close()
+
+
+def log_startup(mode: str, wnba_enabled: bool, challenger_ok: bool) -> int:
+    """One startup_log row per backend start in prod (dev and dry write nothing), so
+    daily_check.py can show restarts. Returns the row id."""
+    import socket
+    import sys
+    conn = get_connection()
+    try:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS startup_log (
+                id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                started_at     TEXT NOT NULL,   -- UTC ISO
+                mode           TEXT NOT NULL,
+                host           TEXT,
+                pid            INTEGER,
+                git_commit     TEXT,
+                python         TEXT,
+                wnba_enabled   INTEGER,
+                challenger_ok  INTEGER
+            )""")
+        cur = conn.execute(
+            "INSERT INTO startup_log (started_at, mode, host, pid, git_commit, python, wnba_enabled, "
+            "challenger_ok) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (datetime.now(timezone.utc).isoformat(), mode, socket.gethostname(), os.getpid(),
+             _git_commit(), sys.version.split()[0], int(wnba_enabled), int(challenger_ok)))
+        conn.commit()
+        return cur.lastrowid
+    finally:
+        conn.close()
+
+
+def _git_commit() -> str | None:
+    """HEAD's commit hash read from .git (no subprocess), or None."""
+    git = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".git")
+    try:
+        with open(os.path.join(git, "HEAD")) as f:
+            head = f.read().strip()
+        if not head.startswith("ref: "):
+            return head
+        ref = head[5:]
+        path = os.path.join(git, *ref.split("/"))
+        if os.path.exists(path):
+            with open(path) as f:
+                return f.read().strip()
+        with open(os.path.join(git, "packed-refs")) as f:
+            for line in f:
+                if line.rstrip().endswith(" " + ref):
+                    return line.split()[0]
+    except OSError:
+        pass
+    return None
 
 
 def log_prediction(
