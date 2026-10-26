@@ -637,7 +637,7 @@ export default function App() {
 
   // One navigation element for every width: a labelled sidebar from 1024 px, a top bar below.
   return (
-    <div className="min-h-screen lg:flex">
+    <div className={`min-h-screen lg:flex ${currentPage === 'history' ? 'shell-fit' : ''}`}>
       <nav aria-label="Main"
            className="shell-nav app-topbar shrink-0 flex items-center gap-1 px-3 sm:px-6 h-14 border-b
                       lg:sticky lg:top-0 lg:h-screen lg:w-52 lg:flex-col lg:items-stretch lg:gap-1 lg:px-3 lg:py-5
@@ -671,7 +671,7 @@ export default function App() {
       </nav>
 
       <main className="app-shell flex-1 min-w-0 px-4 sm:px-6 lg:px-8 pt-6 lg:pt-8 pb-12">
-        <div className="mx-auto w-full max-w-[1200px]">
+        <div className="shell-content mx-auto w-full max-w-[1200px]">
           {currentPage === 'history' && <History />}
 
           {currentPage === 'predict' && <>

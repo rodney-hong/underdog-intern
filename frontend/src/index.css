@@ -329,15 +329,38 @@
 }
 
 /* History from 768 px: the screen fills the viewport and the table scrolls inside its card, so
-   rows per page never lengthens the page; filters and the pager stay in view. The height is the
-   viewport less the shell around <main>: the 57 px top bar plus 24 + 48 px padding below 1024 px,
-   32 + 48 px padding beside the sidebar from 1024 px. Phones keep normal page scrolling. */
+   rows per page never lengthens the page; filters and the pager stay in view. No fixed offsets:
+   while History shows, the shell is one viewport tall (a column under the top bar, a row beside
+   the sidebar from 1024 px), <main> takes what is left and each level down passes the remaining
+   height on with flex: 1 and min-height: 0. Below 480 px of room, <main> scrolls instead.
+   Phones keep normal page scrolling, and so does Predict at every width. */
 @media (min-width: 768px) {
-  .history-fit {
+  .shell-fit {
+    height: 100vh;
+    height: 100dvh;
     display: flex;
     flex-direction: column;
-    height: calc(100vh - 129px);
-    height: calc(100dvh - 129px);
+  }
+  .shell-fit > nav {
+    flex: none;
+  }
+  .shell-fit > main {
+    flex: 1 1 auto;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    overflow-y: auto;
+  }
+  .shell-fit .shell-content {
+    flex: 1 1 auto;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+  }
+  .history-fit {
+    flex: 1 1 auto;
+    display: flex;
+    flex-direction: column;
     min-height: 480px;
   }
   .history-fit > * {
@@ -359,9 +382,8 @@
   }
 }
 @media (min-width: 1024px) {
-  .history-fit {
-    height: calc(100vh - 80px);
-    height: calc(100dvh - 80px);
+  .shell-fit {
+    flex-direction: row;
   }
 }
 
