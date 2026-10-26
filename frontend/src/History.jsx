@@ -5,6 +5,7 @@ import ConfirmDialog from './components/ConfirmDialog'
 import { apiFetch } from './api'
 import { formatCentral, formatGameDate } from './format'
 import { useIsPhone } from './useMediaQuery'
+import { sideColor } from './sides'
 
 const PAGE_SIZES = [10, 25, 50]
 
@@ -22,6 +23,41 @@ const MODEL_FILTERS = ['Challenger', 'Frozen', 'Challenger retro', 'All']
 const MODEL_KEYS = { Challenger: ['challenger'], Frozen: ['frozen'], 'Challenger retro': ['challenger_retro'],
                      All: ['challenger', 'frozen'] }
 const TOOLTIP_WIDTH = 260
+
+// Below 768 px the column headers aren't there to click: a "Sort by" select offers the same sorts
+// (every sortable column, both ways) on the same sort state. "key:direction"; '' is the default
+// order (newest made first), which a sort on Made, newest first equals.
+const SORT_OPTIONS = [
+  ['', 'Made, newest first'],
+  ['timestamp:asc', 'Made, oldest first'],
+  ['game_date:desc', 'Game date, latest first'],
+  ['game_date:asc', 'Game date, earliest first'],
+  ['player_name:asc', 'Player, A to Z'],
+  ['player_name:desc', 'Player, Z to A'],
+  ['confidence:desc', 'Confidence, high to low'],
+  ['confidence:asc', 'Confidence, low to high'],
+  ['stat_line:desc', 'Line, high to low'],
+  ['stat_line:asc', 'Line, low to high'],
+  ['stat_type:asc', 'Stat, A to Z'],
+  ['stat_type:desc', 'Stat, Z to A'],
+  ['opponent_team:asc', 'Opponent, A to Z'],
+  ['opponent_team:desc', 'Opponent, Z to A'],
+  ['predicted_outcome:asc', 'Predicted, OVER first'],
+  ['predicted_outcome:desc', 'Predicted, UNDER first'],
+  ['actual_result:asc', 'Actual, DNP then OVER then UNDER'],
+  ['actual_result:desc', 'Actual, UNDER then OVER then DNP'],
+]
+
+// The select's value for a sort state, and the sort state for a select value
+export function sortOptionValue({ key, direction }) {
+  if (!key || (key === 'timestamp' && direction === 'desc')) return ''
+  return `${key}:${direction}`
+}
+export function sortFromOption(value) {
+  if (!value) return { key: null, direction: 'asc' }
+  const [key, direction] = value.split(':')
+  return { key, direction }
+}
 
 // "12 rows", or "335 current · 337 total" when replaced (dimmed) picks are among them
 export function rowCountLabel(rows) {
@@ -167,7 +203,6 @@ function PlayerName({ name, stat, league, model }) {
 // What a row shows, shared by the table (desktop) and the list (phones). OVER and UNDER each
 // have a hue (--over, --under) on the pick and on where the result landed (the history carries
 // OVER / UNDER, not the box-score number); Pending and DNP stay grey; Hit / Miss keep their tags.
-const sideColor = (side) => (side === 'OVER' ? 'var(--over)' : side === 'UNDER' ? 'var(--under)' : undefined)
 
 function rowView(p) {
   const isDNP = p.actual_result === 'DNP'
@@ -491,7 +526,18 @@ export default function History() {
               Clear filters
             </button>
           )}
-          <div className="col-span-2 sm:ml-auto flex items-center justify-end gap-2 h-[34px]">
+          <div className="col-span-2 sm:ml-auto flex flex-wrap items-center justify-end gap-x-2 gap-y-3 min-h-[34px]">
+            <label className="md:hidden w-full sm:w-auto flex items-center gap-2">
+              <span className="text-sm shrink-0" style={{ color: 'var(--text-muted)' }}>Sort by</span>
+              <select
+                value={sortOptionValue(sortConfig)}
+                onChange={(e) => setSortConfig(sortFromOption(e.target.value))}
+                aria-label="Sort by"
+                className="input-field h-[34px] px-2 text-sm cursor-pointer min-w-0 flex-1"
+              >
+                {SORT_OPTIONS.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
+              </select>
+            </label>
             <span className="text-sm num" style={{ color: 'var(--text-muted)' }}>{rowCountLabel(filtered)}</span>
             <span className="text-sm pl-2" style={{ color: 'var(--text-muted)' }}>Rows per page</span>
             <select

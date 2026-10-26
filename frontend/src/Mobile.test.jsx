@@ -90,3 +90,38 @@ it('several screenshots at once: rows from each, a failed image is named', async
   // the Predict button sits in the sticky bar
   expect(screen.getByText('Predict 3 rows').parentElement.className).toContain('sticky-action')
 })
+
+it('History on a phone: "Sort by" sorts the whole filtered set and shares the table\'s sort state', async () => {
+  const rows = [['Zed Last', 0.55], ['Amy First', 0.72], ['Mo Middle', 0.61]].map(([player_name, confidence], i) =>
+    ({ ...pred, id: i + 1, player_name, confidence }))
+  globalThis.fetch = vi.fn(async (url) => ({ ok: true, status: 200,
+    json: async () => (url.includes('/predictions/history') ? rows : TR) }))
+  render(<History />)
+  const cards = await screen.findByRole('list', { name: 'Predictions' })
+  const names = () => within(cards).getAllByRole('button', { name: /Last|First|Middle/ }).map((b) => b.textContent)
+  expect(names()).toEqual(['Zed Last', 'Amy First', 'Mo Middle'])          // default: the server's order
+
+  const sortBy = screen.getByRole('combobox', { name: 'Sort by' })
+  fireEvent.change(sortBy, { target: { value: 'player_name:asc' } })
+  expect(names()).toEqual(['Amy First', 'Mo Middle', 'Zed Last'])
+  fireEvent.change(sortBy, { target: { value: 'confidence:desc' } })
+  expect(names()).toEqual(['Amy First', 'Mo Middle', 'Zed Last'])
+  fireEvent.change(sortBy, { target: { value: 'confidence:asc' } })
+  expect(names()).toEqual(['Zed Last', 'Mo Middle', 'Amy First'])
+  fireEvent.change(sortBy, { target: { value: '' } })
+  expect(names()).toEqual(['Zed Last', 'Amy First', 'Mo Middle'])
+})
+
+it('on desktop a header click and the "Sort by" select show the same sort', async () => {
+  phone(false)
+  globalThis.fetch = vi.fn(async (url) => ({ ok: true, status: 200,
+    json: async () => (url.includes('/predictions/history') ? [pred] : TR) }))
+  render(<History />)
+  const table = await screen.findByRole('table')
+  fireEvent.click(within(table).getByText('Player'))
+  expect(screen.getByRole('combobox', { name: 'Sort by' }).value).toBe('player_name:asc')
+  fireEvent.click(within(table).getByText('Player'))
+  expect(screen.getByRole('combobox', { name: 'Sort by' }).value).toBe('player_name:desc')
+  fireEvent.change(screen.getByRole('combobox', { name: 'Sort by' }), { target: { value: 'stat_line:desc' } })
+  expect(within(table).getByText('Line').closest('th').getAttribute('aria-sort')).toBe('descending')
+})

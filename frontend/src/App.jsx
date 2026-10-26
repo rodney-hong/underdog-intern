@@ -6,6 +6,7 @@ import { apiFetch, checkSession, logout, onUnauthorized } from './api'
 import { fetchTrackRecord, pct, rangeStr } from './trackRecord'
 import { ClearButton, Label } from './components/fields'
 import PlayerSearch from './components/PlayerSearch'
+import { sideColor } from './sides'
 
 const STAT_TYPES = [
   'Points', 'Assists', 'Rebounds', 'PRA', '3PM', 'PR', 'PA', 'RA',
@@ -191,12 +192,19 @@ function GameDateField({ value, onChange }) {
 // Injury / news context components
 // ---------------------------------------------------------------------------
 
-// Injury status in words, no colour: the status leads in semibold, the reason follows in grey.
+// An injury status by severity: Out and Doubtful red, Questionable amber, anything else
+// (Probable, Available, Day-To-Day) in ink.
+const injuryColor = (status) => (
+  status === 'Out' || status === 'Doubtful' ? 'var(--injury-out)'
+    : status === 'Questionable' ? 'var(--injury-questionable)' : undefined
+)
+
+// The player's own status leads in semibold, the reason follows in grey.
 function InjuryBanner({ status, reason }) {
   if (!status || status === 'ambiguous') return null   // unconfirmed name: show nothing
   return (
     <div className="notice animate-fade-in flex items-start gap-2 px-3 py-2 text-sm">
-      <span className="font-semibold shrink-0">{status}</span>
+      <span className="font-semibold shrink-0" style={{ color: injuryColor(status) }}>{status}</span>
       {reason && <span style={{ color: 'var(--text-muted)' }}>{reason}</span>}
     </div>
   )
@@ -211,18 +219,22 @@ function NewsNote({ text }) {
   )
 }
 
-function OpponentInjuryReport({ injuries, opponentName }) {
+// One row per player: the name (wrapping when long) and the status on the first line, the
+// note on its own full-width line below. Plain flow layout, nothing positioned.
+export function OpponentInjuryReport({ injuries, opponentName }) {
   if (!injuries || injuries.length === 0) return null
   return (
     <section className="card animate-fade-in p-5">
       <h2 className="panel-title">{opponentName} injury report</h2>
       <ul className="mt-3">
         {injuries.map((inj, i) => (
-          <li key={i} className="flex items-baseline gap-3 py-2 text-sm"
+          <li key={i} className="py-2 text-sm"
               style={i ? { borderTop: '1px solid var(--rule)' } : undefined}>
-            <span className="min-w-0 flex-1">{inj.player}</span>
-            {inj.reason && <span className="hidden sm:inline" style={{ color: 'var(--text-muted)' }}>{inj.reason}</span>}
-            <span className="font-semibold shrink-0">{inj.status}</span>
+            <div className="flex items-baseline justify-between gap-3">
+              <span className="min-w-0 break-words">{inj.player}</span>
+              <span className="font-semibold shrink-0" style={{ color: injuryColor(inj.status) }}>{inj.status}</span>
+            </div>
+            {inj.reason && <p className="mt-0.5 break-words" style={{ color: 'var(--text-muted)' }}>{inj.reason}</p>}
           </li>
         ))}
       </ul>
@@ -261,7 +273,7 @@ function TrackRecordLine({ player, stat, league, predictionId, model }) {
   )
 }
 
-// The pick and its probability as plain figures in ink: no colour, no fill bar.
+// The pick and its probability in the pick's hue (OVER / UNDER), no fill bar.
 function ResultCard({ result, player, stat, league }) {
   return (
     <section className="card animate-fade-in p-5 space-y-4" aria-label="Prediction">
@@ -272,11 +284,11 @@ function ResultCard({ result, player, stat, league }) {
       <dl className="grid grid-cols-2" style={{ borderTop: '1px solid var(--rule)', borderBottom: '1px solid var(--rule)' }}>
         <div className="py-3 pr-4">
           <dt className="text-xs" style={{ color: 'var(--text-muted)' }}>Pick</dt>
-          <dd className="text-2xl font-semibold">{result.outcome}</dd>
+          <dd className="text-2xl font-semibold" style={{ color: sideColor(result.outcome) }}>{result.outcome}</dd>
         </div>
         <div className="py-3 pl-4" style={{ borderLeft: '1px solid var(--rule)' }}>
           <dt className="text-xs" style={{ color: 'var(--text-muted)' }}>Confidence</dt>
-          <dd className="text-2xl num">{result.confidence}%</dd>
+          <dd className="text-2xl num" style={{ color: sideColor(result.outcome) }}>{result.confidence}%</dd>
         </div>
       </dl>
       <p className="text-sm leading-relaxed">
@@ -317,7 +329,7 @@ function SlipCard({ slip, onClear }) {
           <li key={i} className="py-3 space-y-0.5" style={i ? { borderTop: '1px solid var(--rule)' } : undefined}>
             <div className="flex items-baseline justify-between gap-2">
               <span className="font-medium text-sm">{pick.player}</span>
-              <span className="font-semibold text-sm shrink-0">{pick.outcome}</span>
+              <span className="font-semibold text-sm shrink-0" style={{ color: sideColor(pick.outcome) }}>{pick.outcome}</span>
             </div>
             <div className="flex items-baseline justify-between gap-2 text-xs" style={{ color: 'var(--text-muted)' }}>
               <span className="num">{pick.stat_type} · {pick.line}</span>

@@ -4,6 +4,7 @@ import { SCREENSHOT_STATS, toEditable, isReady, predictBody, selectPlayer, typeP
 import PlayerSearch from './components/PlayerSearch'
 import { apiFetch } from './api'
 import { useIsPhone } from './useMediaQuery'
+import { sideColor } from './sides'
 
 // The server refuses uploads over 10 MB (screenshot_import.MAX_IMAGE_BYTES) and scales every
 // image to 2,000 px on its longer side; a bigger phone image is scaled to that here first, in
@@ -48,7 +49,7 @@ function ResultText({ res }) {
   if (!res) return null
   if (res.error) return <span className="text-xs" style={{ color: 'var(--text-muted)' }}>{res.error}</span>
   return (
-    <span className="num">
+    <span className="num" style={{ color: sideColor(res.outcome) }}>
       <span className="font-semibold">{res.outcome}</span> {res.confidence}%
     </span>
   )
