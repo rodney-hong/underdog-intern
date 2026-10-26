@@ -788,3 +788,5 @@ Recorded before any 2025-26 game has been loaded, fitted on or scored by the cha
 - Evaluating the challenger on real or backfilled book lines needs its own dated entry, as in "Test A on backfilled historical lines".
 
 No result on 2025-26 had been computed when this entry was written.
+
+**Entry: challenger memory fix (2026-10-25).** `challenger/inference.py:features_for_context` now loads team rows only for the player's own teams (NULL ids mapped as `prep()` maps them) instead of every team's; for a player with fewer than 11 earlier games that was every row since 1946. Only the absence features use these rows, and they ignore other teams, so the output cannot change. Checked on a backup copy at 431af4b: 278/278 stored challenger rows and 160 short-history predictions are bit-identical in mu, alpha, P(over), expected minutes and rate; the frozen file's SHA-256 and fingerprint are unchanged. No change to models, features, hypotheses, populations or the logging schedule.
