@@ -164,8 +164,11 @@ function PlayerName({ name, stat, league, model }) {
   )
 }
 
-// What a row shows, shared by the table (desktop) and the list (phones). The pick and the
-// actual result are plain words in ink; only the Result (Hit / Miss) carries colour.
+// What a row shows, shared by the table (desktop) and the list (phones). OVER and UNDER each
+// have a hue (--over, --under) on the pick and on where the result landed (the history carries
+// OVER / UNDER, not the box-score number); Pending and DNP stay grey; Hit / Miss keep their tags.
+const sideColor = (side) => (side === 'OVER' ? 'var(--over)' : side === 'UNDER' ? 'var(--under)' : undefined)
+
 function rowView(p) {
   const isDNP = p.actual_result === 'DNP'
   const isResolved = p.actual_result !== null && !isDNP
@@ -176,9 +179,9 @@ function rowView(p) {
   const actualDisplay = isDNP
     ? <span style={{ color: 'var(--text-muted)' }}>DNP</span>
     : isResolved
-    ? <span>{p.actual_result}</span>
+    ? <span style={{ color: sideColor(p.actual_result) }}>{p.actual_result}</span>
     : <span style={{ color: 'var(--text-muted)' }}>Pending</span>
-  const predicted = <span className="font-medium">{p.predicted_outcome}</span>
+  const predicted = <span className="font-medium" style={{ color: sideColor(p.predicted_outcome) }}>{p.predicted_outcome}</span>
   return { resultTag, actualDisplay, predicted, dateStr: formatCentral(p.timestamp),
            tableDateStr: formatCentral(p.timestamp, { suffix: false }), gameDateStr: formatGameDate(p.game_date) }
 }

@@ -5,7 +5,8 @@
 /* ============================================================
    Design tokens: "Data terminal" (taste-skill app style, seed 756921758).
    Numbers stay in ink and carry their meaning in the text; the one selection mark is a
-   1px line under the chosen label. Colour is spent only on Hit / Miss in History.
+   1px line under the chosen label. Colour is spent only in History: Hit / Miss, and a hue each
+   for OVER and UNDER (neither green nor red, so neither reads as good or bad). Predict has none.
    The older names (--bg-*, --text-*) are kept as aliases so every component reads one set.
    ============================================================ */
 
@@ -21,6 +22,8 @@
     --muted:   #8a8c92;
     --primary: #ffffff;          /* inverted: white fill, black label */
     --on-primary: #111111;
+    --over:  #6ea8fe;            /* History's OVER (pick, and where the result landed): 7.7:1 on the card */
+    --under: #e3a33b;            /* History's UNDER: 8.5:1 on the card */
     --positive: #44a282;  --pill-positive-bg: #1b2828;  --pill-positive-ink: #5fc39c;
     --negative: #e5566f;  --pill-negative-bg: #2c1a20;  --pill-negative-ink: #e5566f;
     --scrim: rgba(0, 0, 0, 0.6);
@@ -39,6 +42,8 @@
     --muted:   #5f6168;
     --primary: #1d1f20;          /* near-black fill, white label */
     --on-primary: #ffffff;
+    --over:  #1f5fbf;            /* 6.1:1 on the card, 5.4:1 on the raised tone */
+    --under: #965a00;            /* 5.6:1 on the card, 4.9:1 on the raised tone */
     --positive: #247b50;  --pill-positive-bg: #dcfae5;  --pill-positive-ink: #04250e;
     --negative: #c4242a;  --pill-negative-bg: #ffedea;  --pill-negative-ink: #831c1e;
     --scrim: rgba(0, 0, 0, 0.4);
