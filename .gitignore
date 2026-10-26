@@ -46,3 +46,6 @@ backend/experiments/results/*.json
 
 # deploy.sh: commit the server last restarted on (server only)
 .deployed
+
+# taste-skill working files and screenshots (frontend redesign)
+.taste-skill/

@@ -32,15 +32,16 @@ export function rowCountLabel(rows) {
 }
 
 // ---------------------------------------------------------------------------
-// Summary cards
+// Summary strip
 // ---------------------------------------------------------------------------
 
-function SummaryCard({ label, value, sub }) {
+// One cell of the summary strip: a grey label over the figure, a grey note under it.
+function SummaryCell({ label, value, sub, lead = false }) {
   return (
-    <div className="card rounded-2xl px-4 py-3 flex flex-col gap-0.5">
-      <span className="text-xs uppercase tracking-widest" style={{ color: 'var(--text-muted)' }}>{label}</span>
-      <span className="text-2xl font-bold" style={{ color: 'var(--text-primary)' }}>{value}</span>
-      {sub && <span className="text-xs" style={{ color: 'var(--text-muted)' }}>{sub}</span>}
+    <div className="summary-cell px-4 py-3 min-w-0">
+      <div className="text-xs" style={{ color: 'var(--text-muted)' }}>{label}</div>
+      <div className={`num ${lead ? 'text-[30px] leading-9 font-semibold' : 'text-2xl leading-9'}`}>{value}</div>
+      {sub && <div className="text-xs num" style={{ color: 'var(--text-muted)' }}>{sub}</div>}
     </div>
   )
 }
@@ -53,15 +54,13 @@ function SummaryCard({ label, value, sub }) {
 // on desktop they sit in one row after "Filter:", as before.
 function FilterSelect({ value, onChange, options, label, className = '' }) {
   return (
-    <label className="flex flex-col gap-1 sm:contents">
-      <span className="sm:hidden text-[11px] font-semibold uppercase tracking-widest" style={{ color: 'var(--text-muted)' }}>
-        {label}
-      </span>
+    <label className="flex flex-col">
+      <span className="field-label">{label}</span>
       <select
         value={value}
         onChange={(e) => onChange(e.target.value)}
         aria-label={label}
-        className={`input-field rounded-xl px-3 py-2 text-sm cursor-pointer ${className}`}
+        className={`input-field h-[34px] px-2.5 text-sm cursor-pointer ${className}`}
       >
         {options.map((o) => (
           <option key={o} value={o}>{o}</option>
@@ -133,15 +132,15 @@ function PlayerName({ name, stat, league, model }) {
             onPointerDown={(e) => { touch.current = e.pointerType !== 'mouse' }}
             onPointerMove={(e) => { if (e.pointerType === 'mouse') touch.current = false }}
             onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggle() } }}
-            className="cursor-help tap-inline underline decoration-dotted underline-offset-4 sm:no-underline"
-            style={{ textDecorationColor: 'var(--text-muted)' }}>{name}</span>
+            className="cursor-help tap-inline underline decoration-dotted underline-offset-4"
+            style={{ textDecorationColor: 'var(--control)' }}>{name}</span>
       {tip && (
         <div
           role="tooltip"
-          className="fixed z-50 rounded-xl px-3 py-2 text-xs space-y-0.5 shadow-lg pointer-events-none"
-          style={{ left: tip.x, top: tip.y, maxWidth: TOOLTIP_WIDTH, backgroundColor: 'var(--bg-secondary)', border: '1px solid var(--border)', color: 'var(--text-secondary)' }}
+          className="floating fixed z-50 rounded-md px-3 py-2 text-xs space-y-0.5 pointer-events-none num"
+          style={{ left: tip.x, top: tip.y, maxWidth: TOOLTIP_WIDTH }}
         >
-          <div className="font-semibold" style={{ color: 'var(--text-primary)' }}>{name} · {stat}</div>
+          <div className="font-semibold">{name} · {stat}</div>
           {tip.error ? (
             <div style={{ color: 'var(--text-muted)' }}>Track record unavailable</div>
           ) : !tip.tr ? (
@@ -151,10 +150,7 @@ function PlayerName({ name, stat, league, model }) {
               <div className="flex flex-wrap items-center gap-2">
                 <span>Record: {tip.tr.wins}–{tip.tr.losses} ({tip.tr.n} picks)</span>
                 {!tip.tr.enough && (
-                  <span className="rounded px-1.5 py-0.5 text-[10px] font-semibold"
-                        style={{ backgroundColor: 'var(--warning-bg)', color: 'var(--warning)', border: '1px solid var(--warning-border)' }}>
-                    Small sample
-                  </span>
+                  <span className="tag">Small sample</span>
                 )}
               </div>
               <div>Raw: {pct(tip.tr.raw_rate)} ({rangeStr(tip.tr)})</div>
@@ -168,26 +164,22 @@ function PlayerName({ name, stat, league, model }) {
   )
 }
 
-// What a row shows, shared by the table (desktop) and the cards (phones)
+// What a row shows, shared by the table (desktop) and the list (phones). The pick and the
+// actual result are plain words in ink; only the Result (Hit / Miss) carries colour.
 function rowView(p) {
-  const isOver = p.predicted_outcome === 'OVER'
   const isDNP = p.actual_result === 'DNP'
   const isResolved = p.actual_result !== null && !isDNP
   const isCorrect = isResolved && p.predicted_outcome === p.actual_result
-  const resultIcon = isDNP
-    ? <span style={{ color: 'var(--text-muted)' }}>—</span>
-    : isResolved ? (isCorrect ? '✅' : '❌') : '⏳'
+  const resultTag = isResolved
+    ? <span className={`tag ${isCorrect ? 'tag-hit' : 'tag-miss'}`}>{isCorrect ? 'Hit' : 'Miss'}</span>
+    : <span style={{ color: 'var(--text-muted)' }} aria-label={isDNP ? 'No result (DNP)' : 'No result yet'}>—</span>
   const actualDisplay = isDNP
-    ? <span className="font-semibold" style={{ color: '#8b5cf6' }}>DNP</span>
+    ? <span style={{ color: 'var(--text-muted)' }}>DNP</span>
     : isResolved
-    ? <span className="font-semibold" style={{ color: p.actual_result === 'OVER' ? 'var(--success)' : 'var(--danger)' }}>{p.actual_result}</span>
+    ? <span>{p.actual_result}</span>
     : <span style={{ color: 'var(--text-muted)' }}>Pending</span>
-  const predicted = (
-    <span className="font-semibold" style={{ color: isOver ? 'var(--success)' : 'var(--danger)' }}>
-      {p.predicted_outcome}
-    </span>
-  )
-  return { resultIcon, actualDisplay, predicted, dateStr: formatCentral(p.timestamp),
+  const predicted = <span className="font-medium">{p.predicted_outcome}</span>
+  return { resultTag, actualDisplay, predicted, dateStr: formatCentral(p.timestamp),
            tableDateStr: formatCentral(p.timestamp, { suffix: false }), gameDateStr: formatGameDate(p.game_date) }
 }
 
@@ -195,76 +187,83 @@ const LIMITED_TITLE = 'Rookie or fewer than 10 games before this game: not count
 
 function LimitedBadge() {
   return (
-    <span className="ml-1.5 rounded px-1 py-0.5 text-[10px] font-medium whitespace-nowrap"
-          style={{ backgroundColor: 'var(--bg-tertiary)', color: 'var(--text-muted)' }} title={LIMITED_TITLE}>
+    <span className="tag ml-1.5" title={LIMITED_TITLE}>
       limited data
     </span>
   )
 }
 
-// Set the actual result by hand: ✏ opens OVER / UNDER with confirm and cancel.
+const icon = (d) => (
+  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8"
+       strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">{d}</svg>
+)
+const PENCIL = icon(<path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L8 18l-4 1 1-4z" />)
+const CHECK = icon(<path d="M5 12.5l4.5 4.5L19 7.5" />)
+const CROSS = icon(<path d="M6 6l12 12M18 6L6 18" />)
+
+// Set the actual result by hand: the pencil opens OVER / UNDER with confirm and cancel.
 function ResultEditor({ isEditing, editValue, onEdit, onEditChange, onEditConfirm, onEditCancel, large = false }) {
-  const size = large ? 'tap' : ''
+  const size = large ? 'tap' : 'w-7 h-7'
   if (!isEditing) {
-    return <button onClick={onEdit} className={`icon-btn ${size} text-sm px-1 flex items-center justify-center`}
-                   title="Set actual result" aria-label="Set actual result">✏</button>
+    return <button onClick={onEdit} className={`icon-btn ${size} flex items-center justify-center`}
+                   title="Set actual result" aria-label="Set actual result">{PENCIL}</button>
   }
   return (
-    <div className="flex items-center gap-1.5">
+    <div className="flex items-center gap-1">
       <select value={editValue} onChange={(e) => onEditChange(e.target.value)} aria-label="Actual result"
-              className={`input-field rounded-lg px-2 py-1 text-xs ${size}`}>
+              className={`input-field px-1.5 py-1 text-xs ${large ? 'tap' : ''}`}>
         <option value="OVER">OVER</option>
         <option value="UNDER">UNDER</option>
       </select>
-      <button onClick={onEditConfirm} className={`btn-accent ${size} text-xs px-2 py-1 rounded-lg`} aria-label="Save">✓</button>
-      <button onClick={onEditCancel} className={`icon-btn ${size} text-xs px-1 py-1`} aria-label="Cancel">✕</button>
+      <button onClick={onEditConfirm} className={`btn-accent ${size} flex items-center justify-center`} aria-label="Save">{CHECK}</button>
+      <button onClick={onEditCancel} className={`icon-btn ${size} flex items-center justify-center`} aria-label="Cancel">{CROSS}</button>
     </div>
   )
 }
 
-function PredictionRow({ prediction: p, editor, stripe, model }) {
+function PredictionRow({ prediction: p, editor, model }) {
   const v = rowView(p)
   return (
-    <tr style={{ backgroundColor: stripe ? 'var(--bg-stripe)' : 'transparent', opacity: p.is_current === 0 ? 0.45 : 1 }}>
-      <td className="px-2 py-2 text-xs truncate" style={{ color: 'var(--text-muted)' }}>{v.tableDateStr}</td>
-      <td className="px-2 py-2 text-xs truncate" style={{ color: 'var(--text-muted)' }}>{v.gameDateStr}</td>
-      <td className="px-2 py-2 truncate" style={{ color: 'var(--text-secondary)' }}>
+    <tr style={{ opacity: p.is_current === 0 ? 0.45 : 1 }}>
+      <td className="px-2 py-2.5 text-xs truncate num" style={{ color: 'var(--text-muted)' }}>{v.tableDateStr}</td>
+      <td className="px-2 py-2.5 text-xs truncate num" style={{ color: 'var(--text-muted)' }}>{v.gameDateStr}</td>
+      <td className="px-2 py-2.5 truncate">
         <PlayerName name={p.player_name} stat={p.stat_type} league={p.league ?? 'NBA'} model={model} />
         {!!p.is_limited_data && <LimitedBadge />}
       </td>
-      <td className="px-2 py-2 truncate" style={{ color: 'var(--text-muted)' }}>{p.stat_type}</td>
-      <td className="px-2 py-2 truncate" style={{ color: 'var(--text-secondary)' }}>{p.stat_line}</td>
-      <td className="px-2 py-2 truncate" style={{ color: 'var(--text-muted)' }}>{p.opponent_team}</td>
-      <td className="px-2 py-2 truncate">{v.predicted}</td>
-      <td className="px-2 py-2 truncate" style={{ color: 'var(--text-secondary)' }}>{(p.confidence * 100).toFixed(1)}%</td>
-      <td className="px-2 py-2 truncate">{v.actualDisplay}</td>
-      <td className="px-2 py-2 text-center">{v.resultIcon}</td>
-      <td className="px-2 py-2"><ResultEditor {...editor} /></td>
+      <td className="px-2 py-2.5 truncate" style={{ color: 'var(--text-muted)' }}>{p.stat_type}</td>
+      <td className="px-2 py-2.5 truncate text-right num">{p.stat_line}</td>
+      <td className="px-2 py-2.5 truncate" style={{ color: 'var(--text-muted)' }}>{p.opponent_team}</td>
+      <td className="px-2 py-2.5 truncate">{v.predicted}</td>
+      <td className="px-2 py-2.5 truncate text-right num">{(p.confidence * 100).toFixed(1)}%</td>
+      <td className="px-2 py-2.5 truncate">{v.actualDisplay}</td>
+      <td className="px-2 py-2.5">{v.resultTag}</td>
+      <td className="px-1 py-1"><ResultEditor {...editor} /></td>
     </tr>
   )
 }
 
-// Phones: one card per prediction instead of an 11-column row.
+// Phones: one two-to-four-line row per prediction instead of an 11-column table row.
 function PredictionCard({ prediction: p, editor, model }) {
   const v = rowView(p)
   return (
-    <li className="card rounded-2xl px-4 py-3 space-y-1.5" style={{ opacity: p.is_current === 0 ? 0.45 : 1 }}>
+    <li className="py-3 space-y-1" style={{ opacity: p.is_current === 0 ? 0.45 : 1 }}>
       <div className="flex items-start justify-between gap-3">
-        <div className="min-w-0 text-sm font-semibold" style={{ color: 'var(--text-primary)' }}>
+        <div className="min-w-0 text-sm font-medium">
           <PlayerName name={p.player_name} stat={p.stat_type} league={p.league ?? 'NBA'} model={model} />
           {!!p.is_limited_data && <LimitedBadge />}
         </div>
-        <span className="shrink-0 text-base leading-none">{v.resultIcon}</span>
+        <span className="shrink-0 pt-3">{v.resultTag}</span>
       </div>
-      <div className="text-sm" style={{ color: 'var(--text-secondary)' }}>
+      <div className="text-sm num" style={{ color: 'var(--text-muted)' }}>
         {p.stat_type} {p.stat_line} · vs {p.opponent_team}
       </div>
-      <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-sm">
-        <span>{v.predicted} <span style={{ color: 'var(--text-muted)' }}>{(p.confidence * 100).toFixed(1)}%</span></span>
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-sm num">
+        <span>{v.predicted} {(p.confidence * 100).toFixed(1)}%</span>
         <span style={{ color: 'var(--text-muted)' }}>Actual: {v.actualDisplay}</span>
       </div>
       <div className="flex items-center justify-between gap-3">
-        <span className="text-xs" style={{ color: 'var(--text-muted)' }}>
+        <span className="text-xs num" style={{ color: 'var(--text-muted)' }}>
           Game {v.gameDateStr} · made {v.dateStr}
         </span>
         <ResultEditor {...editor} large />
@@ -411,39 +410,44 @@ export default function History() {
     { label: 'Actual',    key: 'actual_result' },
   ]
 
+  const replaced = summary.all - summary.current
+
   return (
-    <div className="w-full max-w-6xl mx-auto sm:px-4">
-      {/* Header row: summary cards + clean button */}
-      <div className="flex flex-col sm:flex-row items-stretch sm:items-start gap-3 sm:gap-4 mb-6">
-        <div className="grid grid-cols-2 sm:grid-cols-5 gap-3 flex-1">
-          <SummaryCard label="Current picks" value={summary.total}
-                       sub={`${summary.resolved} resolved${summary.all !== summary.total ? ` · ${summary.all} rows in all` : ''}`} />
-          <SummaryCard label="Accuracy" value={summary.accuracy} sub={summary.resolved > 0 ? `${summary.correct}/${summary.resolved} correct` : 'no data'} />
-          {summary.tiers.map((t) => (
-            <SummaryCard key={t.label} label={t.label} value={t.value} sub={t.sub} />
-          ))}
+    <div className="w-full">
+      {/* Title row: the screen's name, what the figures leave out, the one clean-up action */}
+      <div className="flex flex-wrap items-start justify-between gap-x-6 gap-y-3 mb-6">
+        <div className="min-w-0">
+          <h1 className="text-2xl font-semibold tracking-tight">History</h1>
+          {(summary.limitedCount > 0 || replaced > 0) && (
+            <p className="mt-1 text-sm max-w-3xl" style={{ color: 'var(--text-muted)' }}>
+              {replaced > 0 &&
+                `${replaced} replaced pick${replaced !== 1 ? 's' : ''} (dimmed: a later pick for the same player, stat and game) `}
+              {summary.limitedCount > 0 &&
+                `${replaced > 0 ? 'and ' : ''}${summary.limitedCount} limited-data prediction${summary.limitedCount !== 1 ? 's' : ''} `}
+              not counted in these figures.
+            </p>
+          )}
         </div>
-        <div className="shrink-0 sm:pt-1">
-          <button
-            onClick={askCleanDuplicates}
-            disabled={cleaning || loading}
-            className="btn-danger-ghost tap w-full sm:w-auto px-3 py-2 rounded-xl text-xs"
-            title="Remove duplicates, keeping earliest per unique combo"
-          >
-            {cleaning ? 'Cleaning…' : 'Clean Duplicates'}
-          </button>
-        </div>
+        <button
+          onClick={askCleanDuplicates}
+          disabled={cleaning || loading}
+          className="btn-danger-ghost tap shrink-0 px-3 py-1.5 text-sm"
+          title="Remove duplicates, keeping earliest per unique combo"
+        >
+          {cleaning ? 'Cleaning…' : 'Clean Duplicates'}
+        </button>
       </div>
 
-      {(summary.limitedCount > 0 || summary.all > summary.current) && (
-        <p className="text-xs -mt-3 sm:-mt-4 mb-4" style={{ color: 'var(--text-muted)' }}>
-          {summary.all > summary.current &&
-            `${summary.all - summary.current} replaced pick${summary.all - summary.current !== 1 ? 's' : ''} (dimmed: a later pick for the same player, stat and game) `}
-          {summary.limitedCount > 0 &&
-            `${summary.all > summary.current ? 'and ' : ''}${summary.limitedCount} limited-data prediction${summary.limitedCount !== 1 ? 's' : ''} `}
-          not counted in these figures.
-        </p>
-      )}
+      {/* Summary: one panel split by rules; accuracy leads */}
+      <div className="card summary-strip grid grid-cols-2 sm:grid-cols-5 mb-6">
+        <SummaryCell label="Current picks" value={summary.total}
+                     sub={`${summary.resolved} resolved${summary.all !== summary.total ? ` · ${summary.all} rows in all` : ''}`} />
+        <SummaryCell label="Accuracy" value={summary.accuracy} lead
+                     sub={summary.resolved > 0 ? `${summary.correct}/${summary.resolved} correct` : 'no data'} />
+        {summary.tiers.map((t) => (
+          <SummaryCell key={t.label} label={`Confidence ${t.label}`} value={t.value} sub={t.sub} />
+        ))}
+      </div>
 
       {confirmClean !== null && (
         <ConfirmDialog
@@ -458,147 +462,147 @@ export default function History() {
         />
       )}
 
-      {/* Filters row: a two-column grid on phones, one row on desktop */}
-      <div className="grid grid-cols-2 sm:flex sm:flex-wrap items-center gap-2 mb-4">
-        <span className="hidden sm:inline text-xs uppercase tracking-widest" style={{ color: 'var(--text-muted)' }}>Filter:</span>
-        <FilterSelect value={modelFilter} onChange={setModelFilter} options={MODEL_FILTERS} label="Model" className="w-full sm:w-auto" />
-        <FilterSelect value={leagueFilter} onChange={setLeagueFilter} options={LEAGUE_FILTERS} label="League" className="w-full sm:w-auto" />
-        <FilterSelect value={statFilter} onChange={setStatFilter} options={ALL_STAT_TYPES} label="Stat" className="w-full sm:w-auto" />
-        <FilterSelect value={outcomeFilter} onChange={setOutcomeFilter} options={OUTCOME_FILTERS} label="Outcome" className="w-full sm:w-auto" />
-        <input
-          type="search"
-          value={searchQuery}
-          onChange={(e) => setSearchQuery(e.target.value)}
-          placeholder="Search player…"
-          aria-label="Search player"
-          className="input-field rounded-xl px-3 py-2 text-sm w-full sm:w-40 col-span-2"
-        />
-        {hasActiveFilter && (
-          <button
-            onClick={() => { setLeagueFilter('All'); setStatFilter('All'); setOutcomeFilter('All'); setSearchQuery('') }}
-            className="icon-btn tap text-xs justify-self-start"
-          >
-            Clear filters
-          </button>
-        )}
-        <div className="col-span-2 sm:ml-auto flex items-center justify-end gap-2">
-          <span className="text-xs" style={{ color: 'var(--text-muted)' }}>Rows per page:</span>
-          <select
-            value={pageSize}
-            onChange={(e) => setPageSize(Number(e.target.value))}
-            aria-label="Rows per page"
-            className="input-field rounded-xl px-2 py-2 text-sm cursor-pointer"
-          >
-            {PAGE_SIZES.map((n) => <option key={n} value={n}>{n}</option>)}
-          </select>
-          <span className="text-xs" style={{ color: 'var(--text-muted)' }}>{rowCountLabel(filtered)}</span>
-        </div>
-      </div>
-
-      {/* Table (desktop) or cards (phones) */}
-      {loading ? (
-        <div className="text-center py-16" style={{ color: 'var(--text-muted)' }}>Loading…</div>
-      ) : loadError ? (
-        <div className="text-center py-16 space-y-3" style={{ color: 'var(--text-muted)' }}>
-          <p>Couldn’t load the history.</p>
-          <button onClick={fetchHistory} className="btn-ghost tap px-4 py-2 rounded-xl text-sm">Try again</button>
-        </div>
-      ) : filtered.length === 0 ? (
-        <div className="text-center py-16" style={{ color: 'var(--text-muted)' }}>
-          {predictions.length === 0 ? 'No predictions logged yet.' : 'No predictions match the current filters.'}
-        </div>
-      ) : (
-        <>
-          {isPhone ? (
-            <ul className="space-y-2" aria-label="Predictions">
-              {paginated.map((p) => (
-                <PredictionCard key={p.id} prediction={p} editor={editorFor(p)} model={TRACK_MODEL[modelFilter]} />
-              ))}
-            </ul>
-          ) : (
-            <div
-              className="overflow-y-auto max-h-96 rounded-2xl border"
-              style={{ borderColor: 'var(--border)' }}
+      <section className="card" aria-label="Predictions table">
+        {/* Filters: a two-column grid on phones, one row on wider screens */}
+        <div className="grid grid-cols-2 sm:flex sm:flex-wrap items-end gap-3 p-4" style={{ borderBottom: '1px solid var(--border)' }}>
+          <FilterSelect value={modelFilter} onChange={setModelFilter} options={MODEL_FILTERS} label="Model" className="w-full sm:w-auto" />
+          <FilterSelect value={leagueFilter} onChange={setLeagueFilter} options={LEAGUE_FILTERS} label="League" className="w-full sm:w-auto" />
+          <FilterSelect value={statFilter} onChange={setStatFilter} options={ALL_STAT_TYPES} label="Stat" className="w-full sm:w-auto" />
+          <FilterSelect value={outcomeFilter} onChange={setOutcomeFilter} options={OUTCOME_FILTERS} label="Outcome" className="w-full sm:w-auto" />
+          <label className="flex flex-col col-span-2">
+            <span className="field-label">Player</span>
+            <input
+              type="search"
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+              placeholder="Search player…"
+              aria-label="Search player"
+              className="input-field h-[34px] px-2.5 text-sm w-full sm:w-48"
+            />
+          </label>
+          {hasActiveFilter && (
+            <button
+              onClick={() => { setLeagueFilter('All'); setStatFilter('All'); setOutcomeFilter('All'); setSearchQuery('') }}
+              className="icon-btn tap h-[34px] px-2 text-sm justify-self-start"
             >
-              <table className="w-full text-sm" style={{ tableLayout: 'fixed' }}>
-                <colgroup>
-                  <col style={{ width: '13%' }} />
-                  <col style={{ width: '8%' }} />
-                  <col style={{ width: '13%' }} />
-                  <col style={{ width: '9%' }} />
-                  <col style={{ width: '5%' }} />
-                  <col style={{ width: '14%' }} />
-                  <col style={{ width: '7%' }} />
-                  <col style={{ width: '6%' }} />
-                  <col style={{ width: '7%' }} />
-                  <col style={{ width: '5%' }} />
-                  <col style={{ width: '3%' }} />
-                </colgroup>
-                <thead>
-                  <tr
-                    className="text-left text-xs uppercase tracking-widest border-b"
-                    style={{ borderBottomColor: 'var(--border)' }}
-                  >
-                    {SORT_COLUMNS.map(({ label, key }) => {
-                      const active = sortConfig.key === key
-                      return (
-                        <th
-                          key={key}
-                          onClick={() => handleSort(key)}
-                          className="sort-header px-2 py-2 font-semibold truncate"
-                        >
-                          {label}
-                          {active && (
-                            <span className="ml-1" style={{ color: 'var(--accent)' }}>
-                              {sortConfig.direction === 'asc' ? '↑' : '↓'}
-                            </span>
-                          )}
-                        </th>
-                      )
-                    })}
-                    <th className="px-2 py-2 font-semibold text-center select-none" style={{ color: 'var(--text-muted)' }}>Result</th>
-                    <th className="px-2 py-2"></th>
-                  </tr>
-                </thead>
-                <tbody className="divide-theme">
-                  {paginated.map((p, i) => (
-                    <PredictionRow
-                      key={p.id}
-                      prediction={p}
-                      editor={editorFor(p)}
-                      stripe={i % 2 === 1}
-                      model={TRACK_MODEL[modelFilter]}
-                    />
-                  ))}
-                </tbody>
-              </table>
-            </div>
+              Clear filters
+            </button>
           )}
+          <div className="col-span-2 sm:ml-auto flex items-center justify-end gap-2 h-[34px]">
+            <span className="text-sm num" style={{ color: 'var(--text-muted)' }}>{rowCountLabel(filtered)}</span>
+            <span className="text-sm pl-2" style={{ color: 'var(--text-muted)' }}>Rows per page</span>
+            <select
+              value={pageSize}
+              onChange={(e) => setPageSize(Number(e.target.value))}
+              aria-label="Rows per page"
+              className="input-field h-[34px] px-2 text-sm cursor-pointer num"
+            >
+              {PAGE_SIZES.map((n) => <option key={n} value={n}>{n}</option>)}
+            </select>
+          </div>
+        </div>
 
-          {/* Pagination */}
-          {totalPages > 1 && (
-            <div className="flex items-center justify-between gap-2 mt-4 px-1">
-              <button
-                onClick={() => setPage((p) => Math.max(1, p - 1))}
-                disabled={clampedPage === 1}
-                className="btn-ghost tap px-4 py-2 rounded-xl text-sm"
-              >
-                ← Previous
-              </button>
-              <span className="text-xs text-center" style={{ color: 'var(--text-muted)' }}>
-                Page {clampedPage} of {totalPages}
-              </span>
-              <button
-                onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
-                disabled={clampedPage === totalPages}
-                className="btn-ghost tap px-4 py-2 rounded-xl text-sm"
-              >
-                Next →
-              </button>
-            </div>
-          )}
-        </>
-      )}
+        {/* Table (desktop) or rows (phones). No inner scroll: the page scrolls and the header row sticks. */}
+        {loading ? (
+          <div className="px-4 py-16 text-sm" style={{ color: 'var(--text-muted)' }}>Loading…</div>
+        ) : loadError ? (
+          <div className="px-4 py-16 space-y-3 text-sm">
+            <p>Couldn’t load the history.</p>
+            <button onClick={fetchHistory} className="btn-ghost tap px-4 py-2 text-sm">Try again</button>
+          </div>
+        ) : filtered.length === 0 ? (
+          <div className="px-4 py-16 text-sm" style={{ color: 'var(--text-muted)' }}>
+            {predictions.length === 0 ? 'No predictions logged yet.' : 'No predictions match the current filters.'}
+          </div>
+        ) : (
+          <>
+            {isPhone ? (
+              <ul className="px-4 phone-rows" aria-label="Predictions">
+                {paginated.map((p) => (
+                  <PredictionCard key={p.id} prediction={p} editor={editorFor(p)} model={TRACK_MODEL[modelFilter]} />
+                ))}
+              </ul>
+            ) : (
+              <div className="px-2">
+                <table className="data-table w-full text-sm" style={{ tableLayout: 'fixed' }}>
+                  <colgroup>
+                    <col style={{ width: '12%' }} />
+                    <col style={{ width: '8%' }} />
+                    <col style={{ width: '15%' }} />
+                    <col style={{ width: '9%' }} />
+                    <col style={{ width: '6%' }} />
+                    <col style={{ width: '15%' }} />
+                    <col style={{ width: '8%' }} />
+                    <col style={{ width: '7%' }} />
+                    <col style={{ width: '8%' }} />
+                    <col style={{ width: '7%' }} />
+                    <col style={{ width: '5%' }} />
+                  </colgroup>
+                  <thead>
+                    <tr>
+                      {SORT_COLUMNS.map(({ label, key }) => {
+                        const active = sortConfig.key === key
+                        const numeric = key === 'stat_line' || key === 'confidence'
+                        return (
+                          <th
+                            key={key}
+                            onClick={() => handleSort(key)}
+                            aria-sort={active ? (sortConfig.direction === 'asc' ? 'ascending' : 'descending') : undefined}
+                            className="sort-header px-2 py-2.5 truncate"
+                            style={numeric ? { textAlign: 'right' } : undefined}
+                          >
+                            {label}
+                            {active && (
+                              <span className="ml-1" aria-hidden="true">
+                                {sortConfig.direction === 'asc' ? '↑' : '↓'}
+                              </span>
+                            )}
+                          </th>
+                        )
+                      })}
+                      <th className="px-2 py-2.5 select-none">Result</th>
+                      <th className="px-2 py-2.5"><span className="sr-only">Edit</span></th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {paginated.map((p) => (
+                      <PredictionRow
+                        key={p.id}
+                        prediction={p}
+                        editor={editorFor(p)}
+                        model={TRACK_MODEL[modelFilter]}
+                      />
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+
+            {/* Pagination */}
+            {totalPages > 1 && (
+              <div className="flex items-center justify-between gap-2 px-4 py-3" style={{ borderTop: '1px solid var(--border)' }}>
+                <button
+                  onClick={() => setPage((p) => Math.max(1, p - 1))}
+                  disabled={clampedPage === 1}
+                  className="btn-ghost tap px-3 py-1.5 text-sm"
+                >
+                  ← Previous
+                </button>
+                <span className="text-sm text-center num" style={{ color: 'var(--text-muted)' }}>
+                  Page {clampedPage} of {totalPages}
+                </span>
+                <button
+                  onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
+                  disabled={clampedPage === totalPages}
+                  className="btn-ghost tap px-3 py-1.5 text-sm"
+                >
+                  Next →
+                </button>
+              </div>
+            )}
+          </>
+        )}
+      </section>
     </div>
   )
 }

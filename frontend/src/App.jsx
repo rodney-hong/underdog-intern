@@ -43,7 +43,7 @@ function MoonIcon() {
 function FieldWrapper({ children, visible }) {
   if (!visible) return null
   return (
-    <div className="transition-all duration-300 animate-slide-down opacity-100">
+    <div className="animate-slide-down">
       {children}
     </div>
   )
@@ -56,9 +56,9 @@ function FieldWrapper({ children, visible }) {
 function TeamField({ team, onClear }) {
   return (
     <div>
-      <Label>Player's Team</Label>
+      <Label>Team</Label>
       <div className="relative">
-        <div className="input-field w-full rounded-xl px-4 py-3 pr-10 select-none" style={{ color: 'var(--text-muted)' }}>
+        <div className="input-field w-full px-3 py-2 pr-10 select-none" style={{ backgroundColor: 'var(--raised)', borderColor: 'var(--border)' }}>
           {team || <span style={{ opacity: 0.5 }}>Loading…</span>}
         </div>
         <ClearButton visible={!!team} onClick={onClear} />
@@ -75,12 +75,12 @@ function OpponentField({ value, teams, playerTeam, onChange, onClear }) {
   const filtered = teams.filter((t) => t !== playerTeam)
   return (
     <div>
-      <Label>Opponent Team</Label>
+      <Label>Opponent</Label>
       <div className="relative">
         <select
           value={value}
           onChange={(e) => onChange(e.target.value)}
-          className="input-field w-full rounded-xl px-4 py-3 pr-10 appearance-none cursor-pointer"
+          className="input-field w-full px-3 py-2 pr-10 appearance-none cursor-pointer"
         >
           <option value="">Select opponent…</option>
           {filtered.map((t) => (
@@ -115,15 +115,13 @@ function StatLineField({ value, onChange, onClear, source, lineLoading }) {
   }
   return (
     <div>
-      <div className="flex items-center justify-between mb-1.5">
-        <label className="text-xs font-semibold uppercase tracking-widest" style={{ color: 'var(--text-muted)' }}>
-          Stat Line
-        </label>
+      <div className="flex items-baseline justify-between">
+        <label className="field-label">Line</label>
         {lineLoading && (
           <span className="text-xs" style={{ color: 'var(--text-muted)' }}>fetching line…</span>
         )}
         {!lineLoading && source && (
-          <span className="text-xs font-medium" style={{ color: 'var(--text-muted)' }}>
+          <span className="text-xs" style={{ color: 'var(--text-muted)' }}>
             via {SOURCE_LABELS[source] ?? source}
           </span>
         )}
@@ -135,7 +133,7 @@ function StatLineField({ value, onChange, onClear, source, lineLoading }) {
           value={value}
           onChange={handleChange}
           placeholder="e.g. 24.5"
-          className="input-field w-full rounded-xl px-4 py-3 pr-10"
+          className="input-field num w-full px-3 py-2 pr-10"
         />
         <ClearButton visible={!!value} onClick={onClear} />
       </div>
@@ -150,12 +148,12 @@ function StatLineField({ value, onChange, onClear, source, lineLoading }) {
 function StatTypeField({ value, onChange, onClear }) {
   return (
     <div>
-      <Label>Stat Type</Label>
+      <Label>Stat</Label>
       <div className="relative">
         <select
           value={value}
           onChange={(e) => onChange(e.target.value)}
-          className="input-field w-full rounded-xl px-4 py-3 pr-10 appearance-none cursor-pointer"
+          className="input-field w-full px-3 py-2 pr-10 appearance-none cursor-pointer"
         >
           <option value="">Select stat type…</option>
           {STAT_TYPES.map((s) => (
@@ -178,12 +176,12 @@ function StatTypeField({ value, onChange, onClear }) {
 function GameDateField({ value, onChange }) {
   return (
     <div>
-      <Label>Game Date</Label>
+      <Label>Game date</Label>
       <input
         type="date"
         value={value}
         onChange={(e) => onChange(e.target.value)}
-        className="input-field w-full rounded-xl px-4 py-3"
+        className="input-field num w-full px-3 py-2"
       />
     </div>
   )
@@ -193,19 +191,13 @@ function GameDateField({ value, onChange }) {
 // Injury / news context components
 // ---------------------------------------------------------------------------
 
-const STATUS_CLS = {
-  Out:          'status-out',
-  Questionable: 'status-questionable',
-  Probable:     'status-neutral',
-}
-
+// Injury status in words, no colour: the status leads in semibold, the reason follows in grey.
 function InjuryBanner({ status, reason }) {
   if (!status || status === 'ambiguous') return null   // unconfirmed name: show nothing
-  const cls = STATUS_CLS[status] ?? 'status-neutral'
   return (
-    <div className={`animate-fade-in flex items-start gap-2 border rounded-xl px-4 py-2.5 text-sm ${cls}`}>
+    <div className="notice animate-fade-in flex items-start gap-2 px-3 py-2 text-sm">
       <span className="font-semibold shrink-0">{status}</span>
-      {reason && <span className="opacity-80">— {reason}</span>}
+      {reason && <span style={{ color: 'var(--text-muted)' }}>{reason}</span>}
     </div>
   )
 }
@@ -213,32 +205,28 @@ function InjuryBanner({ status, reason }) {
 function NewsNote({ text }) {
   if (!text) return null
   return (
-    <div className="animate-fade-in text-xs italic px-1" style={{ color: 'var(--text-muted)' }}>
-      📰 {text}
-    </div>
+    <p className="animate-fade-in text-xs" style={{ color: 'var(--text-muted)' }}>
+      News: {text}
+    </p>
   )
 }
 
 function OpponentInjuryReport({ injuries, opponentName }) {
   if (!injuries || injuries.length === 0) return null
   return (
-    <div className="card animate-fade-in mt-4 rounded-2xl p-5 space-y-3">
-      <p className="text-xs font-semibold uppercase tracking-widest" style={{ color: 'var(--text-muted)' }}>
-        {opponentName} Injury Report
-      </p>
-      <ul className="space-y-2">
-        {injuries.map((inj, i) => {
-          const cls = STATUS_CLS[inj.status] ?? 'status-neutral'
-          return (
-            <li key={i} className={`flex items-start gap-2 border rounded-xl px-3 py-2 text-sm ${cls}`}>
-              <span className="font-medium shrink-0">{inj.player}</span>
-              <span className="font-semibold shrink-0">({inj.status})</span>
-              {inj.reason && <span className="opacity-70">— {inj.reason}</span>}
-            </li>
-          )
-        })}
+    <section className="card animate-fade-in p-5">
+      <h2 className="panel-title">{opponentName} injury report</h2>
+      <ul className="mt-3">
+        {injuries.map((inj, i) => (
+          <li key={i} className="flex items-baseline gap-3 py-2 text-sm"
+              style={i ? { borderTop: '1px solid var(--rule)' } : undefined}>
+            <span className="min-w-0 flex-1">{inj.player}</span>
+            {inj.reason && <span className="hidden sm:inline" style={{ color: 'var(--text-muted)' }}>{inj.reason}</span>}
+            <span className="font-semibold shrink-0">{inj.status}</span>
+          </li>
+        ))}
       </ul>
-    </div>
+    </section>
   )
 }
 
@@ -273,31 +261,30 @@ function TrackRecordLine({ player, stat, league, predictionId, model }) {
   )
 }
 
+// The pick and its probability as plain figures in ink: no colour, no fill bar.
 function ResultCard({ result, player, stat, league }) {
-  const isOver = result.outcome === 'OVER'
   return (
-    <div className="card animate-fade-in mt-6 rounded-2xl p-5 sm:p-6 space-y-4">
-      <div className="flex flex-wrap items-center gap-x-4 gap-y-3">
-        <span className="text-4xl font-black tracking-tight" style={{ color: isOver ? 'var(--success)' : 'var(--danger)' }}>
-          {result.outcome}
-        </span>
-        <div className="flex flex-col">
-          <span className="text-xs uppercase tracking-widest" style={{ color: 'var(--text-muted)' }}>Confidence</span>
-          <span className="text-2xl font-bold" style={{ color: 'var(--text-primary)' }}>{result.confidence}%</span>
-        </div>
-        <div className="flex-1 min-w-[8rem] h-2 rounded-full overflow-hidden" style={{ backgroundColor: 'var(--bg-tertiary)' }}>
-          <div
-            className="h-full rounded-full transition-all duration-700"
-            style={{ width: `${result.confidence}%`, backgroundColor: isOver ? 'var(--success)' : 'var(--danger)' }}
-          />
-        </div>
+    <section className="card animate-fade-in p-5 space-y-4" aria-label="Prediction">
+      <div>
+        <h2 className="panel-title">{player}</h2>
+        <p className="text-sm" style={{ color: 'var(--text-muted)' }}>{stat}</p>
       </div>
-      <p className="text-sm leading-relaxed border-t pt-4" style={{ color: 'var(--text-secondary)', borderTopColor: 'var(--border)' }}>
+      <dl className="grid grid-cols-2" style={{ borderTop: '1px solid var(--rule)', borderBottom: '1px solid var(--rule)' }}>
+        <div className="py-3 pr-4">
+          <dt className="text-xs" style={{ color: 'var(--text-muted)' }}>Pick</dt>
+          <dd className="text-2xl font-semibold">{result.outcome}</dd>
+        </div>
+        <div className="py-3 pl-4" style={{ borderLeft: '1px solid var(--rule)' }}>
+          <dt className="text-xs" style={{ color: 'var(--text-muted)' }}>Confidence</dt>
+          <dd className="text-2xl num">{result.confidence}%</dd>
+        </div>
+      </dl>
+      <p className="text-sm leading-relaxed">
         {result.explanation}
       </p>
       <TrackRecordLine player={player} stat={stat} league={league} predictionId={result.prediction_id}
                        model={result.model} />
-    </div>
+    </section>
   )
 }
 
@@ -310,68 +297,40 @@ function SlipCard({ slip, onClear }) {
 
   if (slip.picks.length === 0) {
     return (
-      <div className="card animate-fade-in mt-4 w-full max-w-lg rounded-2xl p-6 text-center">
-        <p className="text-sm" style={{ color: 'var(--text-muted)' }}>
-          No strong picks found for tonight.
-        </p>
-      </div>
+      <p className="animate-fade-in mt-4 text-sm" style={{ color: 'var(--text-muted)' }}>
+        No strong picks found for tonight.
+      </p>
     )
   }
 
   return (
-    <div className="card animate-fade-in mt-4 w-full max-w-lg rounded-2xl p-6 space-y-4">
-      <div className="flex items-center justify-between">
-        <h2 className="font-bold text-base" style={{ color: 'var(--text-primary)' }}>
-          Tonight's Suggested Slip 🎯
-        </h2>
-        <button
-          onClick={onClear}
-          className="btn-ghost tap text-xs px-3 py-1.5 rounded-lg font-medium"
-        >
+    <div className="animate-fade-in mt-4">
+      <div className="flex items-center justify-between gap-3">
+        <h3 className="text-sm font-semibold">Tonight's suggested slip</h3>
+        <button onClick={onClear} className="btn-ghost tap text-xs px-3 py-1.5">
           Clear
         </button>
       </div>
 
-      <div className="space-y-3">
-        {slip.picks.map((pick, i) => {
-          const isOver = pick.outcome === 'OVER'
-          return (
-            <div
-              key={i}
-              className="rounded-xl p-3.5 space-y-1.5"
-              style={{ backgroundColor: 'var(--bg-tertiary)' }}
-            >
-              <div className="flex items-center justify-between gap-2">
-                <span className="font-semibold text-sm" style={{ color: 'var(--text-primary)' }}>
-                  {pick.player}
-                </span>
-                <span
-                  className="font-black text-sm shrink-0"
-                  style={{ color: isOver ? 'var(--success)' : 'var(--danger)' }}
-                >
-                  {pick.outcome}
-                </span>
-              </div>
-              <div className="flex items-center justify-between gap-2">
-                <span className="text-xs" style={{ color: 'var(--text-secondary)' }}>
-                  {pick.stat_type} · {pick.line}
-                </span>
-                <span className="text-xs font-medium shrink-0" style={{ color: 'var(--text-muted)' }}>
-                  {Math.round(pick.confidence * 100)}% confidence
-                </span>
-              </div>
-              <p className="text-xs" style={{ color: 'var(--text-muted)' }}>
-                {pick.game}
-              </p>
+      <ul className="mt-2">
+        {slip.picks.map((pick, i) => (
+          <li key={i} className="py-3 space-y-0.5" style={i ? { borderTop: '1px solid var(--rule)' } : undefined}>
+            <div className="flex items-baseline justify-between gap-2">
+              <span className="font-medium text-sm">{pick.player}</span>
+              <span className="font-semibold text-sm shrink-0">{pick.outcome}</span>
             </div>
-          )
-        })}
-      </div>
+            <div className="flex items-baseline justify-between gap-2 text-xs" style={{ color: 'var(--text-muted)' }}>
+              <span className="num">{pick.stat_type} · {pick.line}</span>
+              <span className="num shrink-0">{Math.round(pick.confidence * 100)}% confidence</span>
+            </div>
+            <p className="text-xs" style={{ color: 'var(--text-muted)' }}>{pick.game}</p>
+          </li>
+        ))}
+      </ul>
 
-      <div className="border-t pt-4 text-center" style={{ borderColor: 'var(--border)' }}>
-        <span className="text-sm font-semibold" style={{ color: 'var(--text-primary)' }}>
-          Parlay Confidence: {Math.round(slip.parlay_confidence * 100)}%
-        </span>
+      <div className="flex items-baseline justify-between gap-2 pt-3 text-sm" style={{ borderTop: '1px solid var(--border)' }}>
+        <span style={{ color: 'var(--text-muted)' }}>Parlay confidence</span>
+        <span className="num font-semibold">{Math.round(slip.parlay_confidence * 100)}%</span>
       </div>
     </div>
   )
@@ -399,20 +358,28 @@ function Spinner() {
   )
 }
 
-// Pill toggle (NBA / WNBA, slip legs): a 44 px tap target on phones, compact on desktop.
+// One choice of a few (NBA / WNBA, slip legs): the chosen label is underlined by a 1px line.
+// A 44 px tap target on phones, compact on desktop.
 function Pill({ active, onClick, children }) {
   return (
     <button
       onClick={onClick}
-      className="pill tap px-4 py-1.5 rounded-full text-xs font-bold transition-all duration-150"
-      style={{
-        backgroundColor: active ? 'var(--accent)' : 'var(--bg-tertiary)',
-        color: active ? '#fff' : 'var(--text-muted)',
-      }}
+      className="choice tap px-2 py-1 text-sm font-medium"
       aria-pressed={active}
     >
-      {children}
+      <span className="choice-label">{children}</span>
     </button>
+  )
+}
+
+// The product's mark: a basketball's seams, drawn in ink.
+function Mark({ size = 20 }) {
+  return (
+    <svg className="mark shrink-0" width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor"
+         strokeWidth="1.6" aria-hidden="true">
+      <circle cx="12" cy="12" r="9" />
+      <path d="M3 12h18M12 3v18M6.2 5.6c2.6 1.8 2.6 11 0 12.8M17.8 5.6c-2.6 1.8-2.6 11 0 12.8" />
+    </svg>
   )
 }
 
@@ -624,189 +591,220 @@ export default function App() {
     }
   }
 
-  return (
-    <div className="app-shell min-h-screen flex flex-col items-center px-4 pt-8 pb-12 sm:py-16" style={{ backgroundColor: 'var(--bg-primary)' }}>
-      {/* Header */}
-      <div className="text-center mb-6 sm:mb-8">
-        <h1 className="text-3xl font-black tracking-tight" style={{ color: 'var(--text-primary)' }}>Sports Bettr</h1>
-        <p className="mt-1 text-sm" style={{ color: 'var(--text-muted)' }}>AI-powered over/under predictions using real game data</p>
-      </div>
+  const themeLabel = theme === 'dark' ? 'Switch to light mode' : 'Switch to dark mode'
+  const themeButton = (withText) => (
+    <button
+      onClick={toggleTheme}
+      className="icon-btn tap flex items-center gap-2 px-2 py-1.5 text-sm"
+      aria-label={themeLabel}
+      title={themeLabel}
+    >
+      {theme === 'dark' ? <SunIcon /> : <MoonIcon />}
+      {withText && <span className="hidden lg:inline">{theme === 'dark' ? 'Light mode' : 'Dark mode'}</span>}
+    </button>
+  )
 
-      {/* Nav bar */}
-      <div className="card flex items-center gap-1 rounded-xl p-1 mb-6 sm:mb-8">
-        {loggedIn && ['predict', 'history'].map((page) => (
+  // Logged out, checking or offline: the product's name over one centred card.
+  if (!loggedIn) {
+    return (
+      <div className="app-shell min-h-screen flex flex-col items-center px-4 pt-6 pb-12">
+        <div className="w-full max-w-sm flex justify-end">{themeButton(false)}</div>
+        <div className="w-full max-w-sm mt-10 sm:mt-16 mb-6 flex items-center gap-3">
+          <Mark size={28} />
+          <div>
+            <p className="text-base font-semibold leading-tight">Sports Bettr</p>
+            <p className="text-sm" style={{ color: 'var(--text-muted)' }}>Over/under predictions from real game data</p>
+          </div>
+        </div>
+
+        {auth === 'checking' && (
+          <div className="w-full max-w-sm flex items-center gap-2 py-6 text-sm" style={{ color: 'var(--text-muted)' }}>
+            <Spinner /> Loading…
+          </div>
+        )}
+
+        {auth === 'offline' && (
+          <div className="card w-full max-w-sm p-6 space-y-4">
+            <p className="text-sm">Can’t reach the server.</p>
+            <button onClick={recheck} className="btn-ghost tap w-full py-2.5 text-sm font-medium">Try again</button>
+          </div>
+        )}
+
+        {(auth === 'out' || auth === 'expired') && <Login expired={auth === 'expired'} onLoggedIn={() => setAuth('in')} />}
+      </div>
+    )
+  }
+
+  // One navigation element for every width: a labelled sidebar from 1024 px, a top bar below.
+  return (
+    <div className="min-h-screen lg:flex">
+      <nav aria-label="Main"
+           className="shell-nav app-topbar shrink-0 flex items-center gap-1 px-3 sm:px-6 h-14 border-b
+                      lg:sticky lg:top-0 lg:h-screen lg:w-52 lg:flex-col lg:items-stretch lg:gap-1 lg:px-3 lg:py-5
+                      lg:border-b-0 lg:border-r">
+        <div className="flex items-center gap-2 mr-2 lg:mr-0 lg:px-2 lg:mb-6">
+          <Mark />
+          <span className="hidden min-[400px]:inline text-sm font-semibold whitespace-nowrap">Sports Bettr</span>
+        </div>
+        {['predict', 'history'].map((page) => (
           <button
             key={page}
             onClick={() => setCurrentPage(page)}
-            className={`tap px-5 py-2 rounded-lg text-sm font-semibold capitalize transition-all duration-200 ${
-              currentPage === page ? 'nav-tab-active' : 'nav-tab'
-            }`}
+            className="choice tap px-2 py-1.5 text-sm font-medium lg:text-left"
             aria-current={currentPage === page ? 'page' : undefined}
           >
-            {page === 'predict' ? 'Predict' : 'History'}
+            <span className="choice-label">{page === 'predict' ? 'Predict' : 'History'}</span>
           </button>
         ))}
-        <button
-          onClick={toggleTheme}
-          className={`theme-toggle tap ${loggedIn ? 'ml-2' : ''} p-2 rounded-lg flex items-center justify-center`}
-          aria-label={theme === 'dark' ? 'Switch to light mode' : 'Switch to dark mode'}
-          title={theme === 'dark' ? 'Switch to light mode' : 'Switch to dark mode'}
-        >
-          {theme === 'dark' ? <SunIcon /> : <MoonIcon />}
-        </button>
-        {loggedIn && (
+        <div className="ml-auto flex items-center gap-1 lg:ml-0 lg:mt-auto lg:flex-col lg:items-stretch">
+          {themeButton(true)}
           <button
             onClick={handleLogout}
-            className="theme-toggle tap ml-1 p-2 rounded-lg flex items-center justify-center"
+            className="icon-btn tap flex items-center gap-2 px-2 py-1.5 text-sm"
             aria-label="Log out"
             title="Log out"
           >
             <LogoutIcon />
+            <span className="hidden lg:inline">Log out</span>
           </button>
-        )}
-      </div>
-
-      {auth === 'checking' && (
-        <div className="flex items-center gap-2 py-16 text-sm" style={{ color: 'var(--text-muted)' }}>
-          <Spinner /> Loading…
         </div>
-      )}
+      </nav>
 
-      {auth === 'offline' && (
-        <div className="card w-full max-w-sm rounded-2xl p-6 space-y-4 text-center">
-          <p className="text-sm" style={{ color: 'var(--text-secondary)' }}>Can’t reach the server.</p>
-          <button onClick={recheck} className="btn-ghost tap w-full py-3 rounded-xl text-sm font-medium">Try again</button>
-        </div>
-      )}
+      <main className="app-shell flex-1 min-w-0 px-4 sm:px-6 lg:px-8 pt-6 lg:pt-8 pb-12">
+        <div className="mx-auto w-full max-w-[1200px]">
+          {currentPage === 'history' && <History />}
 
-      {(auth === 'out' || auth === 'expired') && <Login expired={auth === 'expired'} onLoggedIn={() => setAuth('in')} />}
+          {currentPage === 'predict' && <>
+            <h1 className="text-2xl font-semibold tracking-tight mb-6">Predict</h1>
+            <div className="space-y-6">
+              {/* Main entry: screenshot -> confirm -> predict (manual form below) */}
+              {sport === 'NBA' && <ScreenshotImport teams={allTeams} />}
 
-      {loggedIn && currentPage === 'history' && <History />}
+              <div className="grid gap-6 lg:grid-cols-2 items-start">
+                <div className="space-y-6 min-w-0">
+                  {/* Form card */}
+                  <section className="card p-5 space-y-4" aria-labelledby="single-prop">
+                    <div className="flex items-center justify-between gap-3">
+                      <h2 id="single-prop" className="panel-title">Single prop</h2>
+                      <div className="flex gap-1">
+                        {['NBA', 'WNBA'].map((s) => (
+                          <Pill key={s} active={sport === s} onClick={() => handleSportChange(s)}>{s}</Pill>
+                        ))}
+                      </div>
+                    </div>
 
-      {loggedIn && currentPage === 'predict' && <>
-        {/* Main entry: screenshot -> confirm -> predict (manual form below) */}
-        {sport === 'NBA' && <ScreenshotImport teams={allTeams} />}
+                    {wnbaOff ? (
+                      <div className="notice px-3 py-2 text-sm">
+                        WNBA is turned off on this server.
+                      </div>
+                    ) : (
+                      <PlayerSearch
+                        value={playerQuery}
+                        onChange={setPlayerQuery}
+                        onSelect={handlePlayerSelect}
+                        onClear={resetAll}
+                        searchPath={`${sportPrefix}/players/search`}
+                        placeholder={`Search ${sport} players…`}
+                      />
+                    )}
 
-        {/* Form card */}
-        <div className="card w-full max-w-lg rounded-2xl p-5 sm:p-6 shadow-2xl space-y-4">
-          {/* Sport toggle */}
-          <div className="flex gap-2">
-            {['NBA', 'WNBA'].map((s) => (
-              <Pill key={s} active={sport === s} onClick={() => handleSportChange(s)}>{s}</Pill>
-            ))}
-          </div>
+                    {playerContext?.injury_status && (
+                      <InjuryBanner
+                        status={playerContext.injury_status.status}
+                        reason={playerContext.injury_status.reason}
+                      />
+                    )}
+                    {playerContext?.news && <NewsNote text={playerContext.news} />}
 
-          {wnbaOff ? (
-            <div className="status-neutral border rounded-xl px-4 py-3 text-sm">
-              WNBA is turned off on this server.
-            </div>
-          ) : (
-            <PlayerSearch
-              value={playerQuery}
-              onChange={setPlayerQuery}
-              onSelect={handlePlayerSelect}
-              onClear={resetAll}
-              searchPath={`${sportPrefix}/players/search`}
-              placeholder={`Search ${sport} players…`}
-            />
-          )}
+                    <FieldWrapper visible={showAdditionalFields}>
+                      <div className="grid gap-4 sm:grid-cols-2">
+                        <TeamField team={playerTeam} onClear={resetAll} />
+                        <OpponentField
+                          value={opponent}
+                          teams={allTeams}
+                          playerTeam={playerTeam}
+                          onChange={setOpponent}
+                          onClear={() => { setOpponent(''); setResult(null) }}
+                        />
+                        <StatTypeField
+                          value={statType}
+                          onChange={setStatType}
+                          onClear={() => { setStatType(''); setResult(null) }}
+                        />
+                        <StatLineField
+                          value={statLine}
+                          onChange={(val) => { setStatLine(val); setLineSource(null) }}
+                          onClear={() => { setStatLine(''); setLineSource(null); setResult(null) }}
+                          source={lineSource}
+                          lineLoading={lineLoading}
+                        />
+                        <GameDateField value={gameDate} onChange={setGameDate} />
+                      </div>
+                    </FieldWrapper>
 
-          {playerContext?.injury_status && (
-            <InjuryBanner
-              status={playerContext.injury_status.status}
-              reason={playerContext.injury_status.reason}
-            />
-          )}
-          {playerContext?.news && <NewsNote text={playerContext.news} />}
+                    <FieldWrapper visible={showAdditionalFields}>
+                      <button
+                        onClick={handlePredict}
+                        disabled={!canPredict || predicting}
+                        className="btn-accent tap w-full py-2.5 text-sm"
+                      >
+                        {predicting ? (
+                          <span className="flex items-center justify-center gap-2">
+                            <Spinner />
+                            Analyzing…
+                          </span>
+                        ) : (
+                          'Predict'
+                        )}
+                      </button>
+                    </FieldWrapper>
 
-          <FieldWrapper visible={showAdditionalFields}>
-            <div className="space-y-4 pt-1">
-              <TeamField team={playerTeam} onClear={resetAll} />
-              <OpponentField
-                value={opponent}
-                teams={allTeams}
-                playerTeam={playerTeam}
-                onChange={setOpponent}
-                onClear={() => { setOpponent(''); setResult(null) }}
-              />
-              <GameDateField value={gameDate} onChange={setGameDate} />
-              <StatLineField
-                value={statLine}
-                onChange={(val) => { setStatLine(val); setLineSource(null) }}
-                onClear={() => { setStatLine(''); setLineSource(null); setResult(null) }}
-                source={lineSource}
-                lineLoading={lineLoading}
-              />
-              <StatTypeField
-                value={statType}
-                onChange={setStatType}
-                onClear={() => { setStatType(''); setResult(null) }}
-              />
-            </div>
-          </FieldWrapper>
+                    {error && (
+                      <div role="alert" className="notice animate-fade-in px-3 py-2 text-sm">
+                        {error}
+                      </div>
+                    )}
+                  </section>
 
-          <FieldWrapper visible={showAdditionalFields}>
-            <button
-              onClick={handlePredict}
-              disabled={!canPredict || predicting}
-              className="btn-accent w-full mt-2 py-3.5 rounded-xl font-bold text-sm uppercase tracking-widest"
-            >
-              {predicting ? (
-                <span className="flex items-center justify-center gap-2">
-                  <Spinner />
-                  Analyzing…
-                </span>
-              ) : (
-                'Predict'
-              )}
-            </button>
-          </FieldWrapper>
+                  {result && <>
+                    <ResultCard result={result} player={selectedPlayer} stat={statType} league={sport} />
+                    <OpponentInjuryReport injuries={opponentInjuries} opponentName={opponent} />
+                    <button
+                      onClick={resetAll}
+                      className="btn-ghost tap w-full py-2.5 text-sm font-medium"
+                    >
+                      Clear all
+                    </button>
+                  </>}
+                </div>
 
-          {error && (
-            <div role="alert" className="animate-fade-in status-out border rounded-xl px-4 py-3 text-sm">
-              {error}
-            </div>
-          )}
-        </div>
+                {sport === 'NBA' && (
+                  <section className="card p-5 min-w-0" aria-labelledby="slip-title">
+                    <h2 id="slip-title" className="panel-title">Slip</h2>
+                    <div className="mt-3 flex flex-wrap items-center gap-x-3 gap-y-2">
+                      <span className="text-sm" style={{ color: 'var(--text-muted)' }}>Legs</span>
+                      <div className="flex gap-1">
+                        {[2, 3, 4, 5].map((n) => (
+                          <Pill key={n} active={slipSize === n} onClick={() => setSlipSize(n)}>{n}</Pill>
+                        ))}
+                      </div>
+                      <button
+                        onClick={handleBuildSlip}
+                        disabled={slipLoading}
+                        className="btn-ghost tap ml-auto px-4 py-2 text-sm font-medium"
+                      >
+                        {slipLoading ? 'Building your slip…' : 'Build me a slip'}
+                      </button>
+                    </div>
 
-        {sport === 'NBA' && (
-          <>
-            <div className="w-full max-w-lg mt-4 space-y-2">
-              <div className="flex flex-wrap items-center gap-2">
-                <span className="text-xs font-semibold uppercase tracking-widest" style={{ color: 'var(--text-muted)' }}>
-                  Legs
-                </span>
-                {[2, 3, 4, 5].map((n) => (
-                  <Pill key={n} active={slipSize === n} onClick={() => setSlipSize(n)}>{n}</Pill>
-                ))}
+                    <SlipCard slip={slipResult} onClear={() => setSlipResult(null)} />
+                  </section>
+                )}
               </div>
-              <button
-                onClick={handleBuildSlip}
-                disabled={slipLoading}
-                className="btn-ghost w-full py-3 rounded-xl text-sm font-medium"
-              >
-                {slipLoading ? 'Building your slip…' : '🎯 Build Me a Slip'}
-              </button>
             </div>
-
-            <SlipCard slip={slipResult} onClear={() => setSlipResult(null)} />
-
-          </>
-        )}
-
-        {result && (
-          <div className="w-full max-w-lg">
-            <ResultCard result={result} player={selectedPlayer} stat={statType} league={sport} />
-            <OpponentInjuryReport injuries={opponentInjuries} opponentName={opponent} />
-            <button
-              onClick={resetAll}
-              className="btn-ghost mt-4 w-full py-3 rounded-xl text-sm font-medium"
-            >
-              Clear All
-            </button>
-          </div>
-        )}
-      </>}
+          </>}
+        </div>
+      </main>
     </div>
   )
 }

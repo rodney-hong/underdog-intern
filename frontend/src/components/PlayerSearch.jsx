@@ -12,7 +12,7 @@ import { apiFetch } from '../api'
 // Keys: ArrowDown / ArrowUp move, Enter picks (the first option when none is highlighted),
 // Escape closes.
 export default function PlayerSearch({ value, onChange, onSelect, onClear, searchPath = '/players/search', placeholder,
-                                      label = 'Player Search', compact = false }) {
+                                      label = 'Player', compact = false }) {
   const [suggestions, setSuggestions] = useState([])
   const [loading, setLoading] = useState(false)
   const [open, setOpen] = useState(false)
@@ -132,7 +132,7 @@ export default function PlayerSearch({ value, onChange, onSelect, onClear, searc
       id={listId}
       role="listbox"
       data-placement={place.up ? 'up' : 'down'}
-      className="card z-50 rounded-xl shadow-2xl overflow-y-auto"
+      className="floating z-50 rounded-md overflow-y-auto"
       style={{ position: 'absolute', left: place.left, top: place.top, width: place.width,
                height: place.height, overscrollBehavior: 'contain' }}
     >
@@ -174,7 +174,7 @@ export default function PlayerSearch({ value, onChange, onSelect, onClear, searc
           onKeyDown={handleKeyDown}
           onFocus={() => suggestions.length > 0 && setOpen(true)}
           placeholder={placeholder ?? 'Search players…'}
-          className={`input-field w-full rounded-xl pr-10 ${compact ? 'px-3 py-2 text-sm' : 'px-4 py-3'}`}
+          className={`input-field w-full pr-10 ${compact ? 'px-2.5 py-1.5 text-sm' : 'px-3 py-2'}`}
         />
         {loading && (
           <span className="absolute right-3 top-1/2 -translate-y-1/2 text-sm" style={{ color: 'var(--text-muted)' }}>…</span>

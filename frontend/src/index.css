@@ -3,65 +3,84 @@
 @tailwind utilities;
 
 /* ============================================================
-   CSS Custom Properties — Apple-inspired design tokens
+   Design tokens: "Data terminal" (taste-skill app style, seed 756921758).
+   Numbers stay in ink and carry their meaning in the text; the one selection mark is a
+   1px line under the chosen label. Colour is spent only on Hit / Miss in History.
+   The older names (--bg-*, --text-*) are kept as aliases so every component reads one set.
    ============================================================ */
 
 @layer base {
   [data-theme="dark"] {
-    --bg-primary:   #1c1c1e;
-    --bg-secondary: #2c2c2e;
-    --bg-tertiary:  #3a3a3c;
-    --bg-stripe:    #232325;
-    --text-primary:   #ffffff;
-    --text-secondary: #ebebf5;
-    --text-muted:     #8e8e93;
-    --border:       #38383a;
-    --accent:       #0a84ff;
-    --accent-hover: #0071e3;
-    --success:      #30d158;
-    --danger:       #ff453a;
-    --warning:      #ffd60a;
-    --danger-bg:     rgba(255, 69, 58, 0.15);
-    --danger-border: rgba(255, 69, 58, 0.40);
-    --warning-bg:     rgba(255, 214, 10, 0.12);
-    --warning-border: rgba(255, 214, 10, 0.35);
+    --ground:  #171719;
+    --surface: #131217;
+    --raised:  #212023;
+    --border:  #26252a;
+    --rule:    #1f1e23;
+    --control: #3a3a3e;
+    --text:    #ffffff;
+    --muted:   #8a8c92;
+    --primary: #ffffff;          /* inverted: white fill, black label */
+    --on-primary: #111111;
+    --positive: #44a282;  --pill-positive-bg: #1b2828;  --pill-positive-ink: #5fc39c;
+    --negative: #e5566f;  --pill-negative-bg: #2c1a20;  --pill-negative-ink: #e5566f;
+    --scrim: rgba(0, 0, 0, 0.6);
+    --float-shadow: 0 12px 28px rgba(0, 0, 0, 0.35);
+    color-scheme: dark;
   }
 
   [data-theme="light"] {
-    --bg-primary:   #f2f2f7;
-    --bg-secondary: #ffffff;
-    --bg-tertiary:  #e5e5ea;
-    --bg-stripe:    #f4f4f8;
-    --text-primary:   #000000;
-    --text-secondary: #3c3c43;
-    --text-muted:     #8e8e93;
-    --border:       #c6c6c8;
-    --accent:       #007aff;
-    --accent-hover: #0071e3;
-    --success:      #34c759;
-    --danger:       #ff3b30;
-    --warning:      #ff9500;
-    --danger-bg:     rgba(255, 59, 48, 0.08);
-    --danger-border: rgba(255, 59, 48, 0.25);
-    --warning-bg:     rgba(255, 149, 0, 0.08);
-    --warning-border: rgba(255, 149, 0, 0.25);
+    --ground:  #f7f7f8;
+    --surface: #ffffff;
+    --raised:  #f0f0f2;
+    --border:  #e4e4e7;
+    --rule:    #efeff1;
+    --control: #cfd1d6;
+    --text:    #111113;
+    --muted:   #5f6168;
+    --primary: #1d1f20;          /* near-black fill, white label */
+    --on-primary: #ffffff;
+    --positive: #247b50;  --pill-positive-bg: #dcfae5;  --pill-positive-ink: #04250e;
+    --negative: #c4242a;  --pill-negative-bg: #ffedea;  --pill-negative-ink: #831c1e;
+    --scrim: rgba(0, 0, 0, 0.4);
+    --float-shadow: 0 8px 24px rgba(0, 0, 0, 0.12);
+    color-scheme: light;
   }
 
-  html {
-    transition: background-color 0.2s ease, color 0.2s ease;
+  [data-theme] {
+    --bg-primary:   var(--ground);
+    --bg-secondary: var(--surface);
+    --bg-tertiary:  var(--raised);
+    --text-primary:   var(--text);
+    --text-secondary: var(--text);
+    --text-muted:     var(--muted);
+    --danger:         var(--negative);
   }
 
   body {
-    background-color: var(--bg-primary);
-    color: var(--text-primary);
+    background-color: var(--ground);
+    color: var(--text);
+    font-size: 14px;
+    line-height: 20px;
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
-    transition: background-color 0.2s ease, color 0.2s ease;
   }
 
   select option {
-    background-color: var(--bg-secondary);
-    color: var(--text-primary);
+    background-color: var(--surface);
+    color: var(--text);
+  }
+
+  input[type="checkbox"] {
+    accent-color: var(--text);
+  }
+
+  :focus-visible {
+    outline: 2px solid var(--text);
+    outline-offset: 2px;
+  }
+
+  .num {
+    font-variant-numeric: tabular-nums;
   }
 }
 
@@ -71,180 +90,259 @@
 
 * {
   scrollbar-width: thin;
-  scrollbar-color: var(--bg-tertiary) var(--bg-secondary);
+  scrollbar-color: var(--control) transparent;
 }
 *::-webkit-scrollbar {
   width: 6px;
   height: 6px;
 }
 *::-webkit-scrollbar-track {
-  background: var(--bg-secondary);
-  border-radius: 3px;
+  background: transparent;
 }
 *::-webkit-scrollbar-thumb {
-  background: var(--bg-tertiary);
+  background: var(--control);
   border-radius: 3px;
-}
-*::-webkit-scrollbar-thumb:hover {
-  background: var(--text-muted);
 }
 
 /* ============================================================
-   Semantic component classes
+   Shell: a labelled sidebar from 1024 px, a top bar below it
    ============================================================ */
 
-/* Card / panel */
-.card {
-  background-color: var(--bg-secondary);
-  border: 1px solid var(--border);
-  transition: background-color 0.2s ease, border-color 0.2s ease;
+.shell-nav {
+  background-color: var(--ground);
+  border-color: var(--border);
 }
 
-/* Form inputs and selects */
-.input-field {
-  background-color: var(--bg-tertiary);
+/* Nav items and every other single choice (NBA / WNBA, slip legs): the chosen one is marked
+   by a 1px line exactly as wide as its label, nothing else. */
+.choice {
+  color: var(--muted);
+  transition: color 0.15s ease;
+}
+.choice:hover {
+  color: var(--text);
+}
+.choice > .choice-label {
+  display: inline-block;
+  padding-bottom: 3px;
+  border-bottom: 1px solid transparent;
+}
+.choice[aria-current="page"],
+.choice[aria-pressed="true"] {
+  color: var(--text);
+}
+.choice[aria-current="page"] > .choice-label,
+.choice[aria-pressed="true"] > .choice-label {
+  border-bottom-color: var(--text);
+}
+
+.mark {
+  color: var(--text);
+}
+
+/* ============================================================
+   Panels, fields, buttons
+   ============================================================ */
+
+.card {
+  background-color: var(--surface);
   border: 1px solid var(--border);
-  color: var(--text-primary);
+  border-radius: 6px;
+}
+
+.panel-title {
+  font-size: 16px;
+  line-height: 24px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.field-label {
+  display: block;
+  font-size: 12px;
+  line-height: 16px;
+  font-weight: 500;
+  color: var(--muted);
+  margin-bottom: 6px;
+}
+
+.input-field {
+  background-color: var(--surface);
+  border: 1px solid var(--control);
+  border-radius: 6px;
+  color: var(--text);
   outline: none;
-  transition: background-color 0.2s ease, border-color 0.15s ease, color 0.2s ease;
+  transition: border-color 0.15s ease;
+}
+.input-field:hover {
+  border-color: var(--muted);
 }
 .input-field:focus {
-  border-color: var(--accent);
+  border-color: var(--text);
 }
 .input-field::placeholder {
-  color: var(--text-muted);
+  color: var(--muted);
   opacity: 1;
 }
 
-/* Accent (primary action) button */
 .btn-accent {
-  background-color: var(--accent);
-  color: #ffffff;
-  transition: background-color 0.15s ease;
+  background-color: var(--primary);
+  color: var(--on-primary);
+  border-radius: 6px;
+  font-weight: 600;
+  transition: opacity 0.15s ease;
 }
 .btn-accent:hover:not(:disabled) {
-  background-color: var(--accent-hover);
+  opacity: 0.88;
+}
+.btn-accent:active:not(:disabled) {
+  opacity: 0.76;
 }
 .btn-accent:disabled {
-  background-color: var(--bg-tertiary);
-  color: var(--text-muted);
+  background-color: var(--raised);
+  color: var(--muted);
   cursor: not-allowed;
 }
 
-/* Ghost (secondary) button */
 .btn-ghost {
   background: transparent;
-  border: 1px solid var(--border);
-  color: var(--text-muted);
-  transition: border-color 0.15s ease, color 0.15s ease;
+  border: 1px solid var(--control);
+  border-radius: 6px;
+  color: var(--text);
+  transition: border-color 0.15s ease, background-color 0.15s ease;
 }
 .btn-ghost:hover:not(:disabled) {
-  border-color: var(--text-muted);
-  color: var(--text-secondary);
+  border-color: var(--muted);
+  background-color: var(--raised);
 }
 .btn-ghost:disabled {
-  opacity: 0.3;
+  color: var(--muted);
+  opacity: 0.6;
   cursor: not-allowed;
 }
 
-/* Danger ghost button (Clean Duplicates) */
+/* Clean Duplicates: neutral at rest, the negative colour only on hover */
 .btn-danger-ghost {
   background: transparent;
-  border: 1px solid var(--border);
-  color: var(--text-muted);
+  border: 1px solid var(--control);
+  border-radius: 6px;
+  color: var(--text);
   transition: border-color 0.15s ease, color 0.15s ease;
 }
 .btn-danger-ghost:hover:not(:disabled) {
-  color: var(--danger);
-  border-color: var(--danger-border);
+  color: var(--negative);
+  border-color: var(--negative);
 }
 .btn-danger-ghost:disabled {
-  opacity: 0.4;
+  color: var(--muted);
   cursor: not-allowed;
 }
 
-/* Nav tabs */
-.nav-tab {
-  background: transparent;
-  color: var(--text-muted);
-  transition: color 0.15s ease;
-}
-.nav-tab:hover {
-  color: var(--text-secondary);
-}
-.nav-tab-active {
-  background-color: var(--accent);
-  color: #ffffff;
-}
-
-/* Autocomplete suggestion items */
 .suggestion-item {
-  color: var(--text-secondary);
-  transition: background-color 0.1s ease;
-}
-.suggestion-item:hover {
-  background-color: var(--bg-tertiary);
+  color: var(--text);
 }
 
-/* Status badges (injuries) */
-.status-out {
-  background-color: var(--danger-bg);
-  border-color: var(--danger-border);
-  color: var(--danger);
-}
-.status-questionable {
-  background-color: var(--warning-bg);
-  border-color: var(--warning-border);
-  color: var(--warning);
-}
-.status-neutral {
-  background-color: var(--bg-tertiary);
-  border-color: var(--border);
-  color: var(--text-muted);
+/* Notices (injury status, errors, WNBA off): neutral, the words carry the weight */
+.notice {
+  background-color: var(--raised);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text);
 }
 
-/* Icon-only buttons (×, ✏) */
+.tag {
+  flex: none;
+  white-space: nowrap;
+  display: inline-block;
+  border-radius: 4px;
+  padding: 1px 6px;
+  font-size: 11px;
+  line-height: 16px;
+  font-weight: 500;
+  background-color: var(--raised);
+  color: var(--muted);
+}
+.tag-hit {
+  background-color: var(--pill-positive-bg);
+  color: var(--pill-positive-ink);
+}
+.tag-miss {
+  background-color: var(--pill-negative-bg);
+  color: var(--pill-negative-ink);
+}
+
 .icon-btn {
   background: transparent;
-  color: var(--text-muted);
-  transition: color 0.15s ease;
+  color: var(--muted);
+  border-radius: 6px;
+  transition: color 0.15s ease, background-color 0.15s ease;
 }
 .icon-btn:hover {
-  color: var(--text-primary);
+  color: var(--text);
+  background-color: var(--raised);
 }
 
-/* Theme toggle pill */
-.theme-toggle {
-  background-color: var(--bg-tertiary);
+/* Floating things only: menus, tooltips, the dialog */
+.floating {
+  background-color: var(--surface);
   border: 1px solid var(--border);
-  color: var(--text-secondary);
-  transition: background-color 0.15s ease, border-color 0.15s ease, color 0.2s ease;
-}
-.theme-toggle:hover {
-  border-color: var(--text-muted);
+  box-shadow: var(--float-shadow);
 }
 
-/* Sortable table headers */
+/* Tables: rules and alignment */
+.data-table thead th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background-color: var(--surface);
+  box-shadow: inset 0 -1px 0 var(--border);
+  font-size: 12px;
+  font-weight: 400;
+  color: var(--muted);
+  text-align: left;
+  white-space: nowrap;
+}
+.data-table tbody tr + tr td {
+  border-top: 1px solid var(--rule);
+}
+/* History's summary: one panel, cells split by rules. Five cells on a phone's two columns:
+   the last one takes the full row instead of leaving half a row empty. */
+@media (max-width: 639px) {
+  .summary-strip > .summary-cell:nth-child(n + 3) {
+    border-top: 1px solid var(--rule);
+  }
+  .summary-strip > .summary-cell:nth-child(even) {
+    border-left: 1px solid var(--rule);
+  }
+  .summary-strip > .summary-cell:last-child:nth-child(odd) {
+    grid-column: 1 / -1;
+  }
+}
+@media (min-width: 640px) {
+  .summary-strip > .summary-cell + .summary-cell {
+    border-left: 1px solid var(--rule);
+  }
+}
+
+.phone-rows > li + li {
+  border-top: 1px solid var(--rule);
+}
+
 .sort-header {
-  color: var(--text-muted);
   cursor: pointer;
   user-select: none;
-  white-space: nowrap;
   transition: color 0.15s ease;
 }
 .sort-header:hover {
-  color: var(--text-secondary);
+  color: var(--text);
 }
-
-/* Table row dividers using theme border */
-.divide-theme > * + * {
-  border-top-width: 1px;
-  border-top-style: solid;
-  border-color: var(--border);
+.sort-header[aria-sort="ascending"],
+.sort-header[aria-sort="descending"] {
+  color: var(--text);
 }
 
 /* ============================================================
-   Phones (below Tailwind's sm breakpoint, 640 px). Desktop is unchanged.
+   Phones (below Tailwind's sm breakpoint, 640 px)
    ============================================================ */
 
 /* The screenshot table's Predict button stays on screen while the rows scroll by. */
@@ -254,23 +352,22 @@
   z-index: 10;
   margin: 0 -0.25rem;
   padding: 0.5rem 0.25rem calc(0.5rem + env(safe-area-inset-bottom));
-  background: linear-gradient(to bottom, transparent, var(--bg-secondary) 0.5rem);
+  background-color: var(--surface);
+  border-top: 1px solid var(--border);
 }
 
 @media (max-width: 639px) {
-  /* When a field is focused (or the keyboard opens) the browser scrolls it into view clear of
-     the pinned Predict bar (.sticky-action: 3.5rem button + padding + safe area). */
   html {
     scroll-padding-bottom: calc(6rem + env(safe-area-inset-bottom));
   }
 
-  /* Notched phones: keep content clear of the notch and the home indicator
-     (index.html sets viewport-fit=cover). */
   .app-shell {
-    padding-top: max(2rem, calc(env(safe-area-inset-top) + 1rem));
     padding-left: max(1rem, env(safe-area-inset-left));
     padding-right: max(1rem, env(safe-area-inset-right));
     padding-bottom: max(3rem, calc(env(safe-area-inset-bottom) + 1.5rem));
+  }
+  .app-topbar {
+    padding-top: env(safe-area-inset-top);
   }
 
   /* 16 px stops iOS Safari zooming into a focused field */
@@ -282,7 +379,6 @@
     min-height: 44px;
   }
 
-  /* Tap targets of at least 44 x 44 px */
   .tap {
     min-height: 44px;
     min-width: 44px;
@@ -292,7 +388,6 @@
     display: flex;
     align-items: center;
   }
-  /* inline text that opens something (History's player name): 44 px tall, still inline */
   .tap-inline {
     min-height: 44px;
     display: inline-flex;
@@ -301,25 +396,27 @@
 }
 
 /* ============================================================
-   Animations
+   Motion: feedback only. Fields revealed by a choice fade in; nothing else enters.
    ============================================================ */
 
 @layer utilities {
-  .animate-slide-down {
-    animation: slideDown 0.3s ease-out forwards;
-  }
-
-  @keyframes slideDown {
-    from { opacity: 0; transform: translateY(-10px); }
-    to   { opacity: 1; transform: translateY(0); }
-  }
-
+  .animate-slide-down,
   .animate-fade-in {
-    animation: fadeIn 0.4s ease-out forwards;
+    animation: fadeIn 0.18s ease-out both;
   }
 
   @keyframes fadeIn {
-    from { opacity: 0; transform: scale(0.97); }
-    to   { opacity: 1; transform: scale(1); }
+    from { opacity: 0; }
+    to   { opacity: 1; }
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .animate-slide-down,
+  .animate-fade-in {
+    animation: none;
+  }
+  * {
+    transition: none !important;
   }
 }

@@ -2,7 +2,7 @@
 
 export function Label({ children }) {
   return (
-    <label className="block text-xs font-semibold uppercase tracking-widest mb-1.5" style={{ color: 'var(--text-muted)' }}>
+    <label className="field-label">
       {children}
     </label>
   )
@@ -14,7 +14,7 @@ export function ClearButton({ onClick, visible }) {
     <button
       type="button"
       onClick={onClick}
-      className="icon-btn absolute right-1 w-11 h-11 flex items-center justify-center sm:right-3 sm:w-auto sm:h-auto top-1/2 -translate-y-1/2 text-lg leading-none"
+      className="icon-btn absolute right-1 w-11 h-11 flex items-center justify-center sm:right-1 sm:w-8 sm:h-8 top-1/2 -translate-y-1/2 text-lg leading-none"
       aria-label="Clear"
     >
       ×

@@ -30,26 +30,26 @@ function AlertFlag({ alerts, open, onToggle, className = '' }) {
   return (
     <button type="button" onClick={onToggle} title={alerts.join('\n')} aria-expanded={open}
             aria-label="Why this row is flagged"
-            className={`icon-btn tap flex items-center justify-center ${className}`} style={{ color: 'var(--warning)' }}>
-      ⚑
+            className={`icon-btn tap flex items-center justify-center ${className}`} style={{ color: 'var(--text)' }}>
+      ⚑{/* taste-skill-ignore: the flag glyph is a kept feature */}
     </button>
   )
 }
 
 function AlertList({ alerts }) {
   return (
-    <ul className="mt-1 space-y-0.5 text-xs" style={{ color: 'var(--warning)' }}>
-      {alerts.map((a) => <li key={a}>⚑ {a}</li>)}
+    <ul className="mt-1 space-y-0.5 text-xs font-medium">
+      {alerts.map((a) => <li key={a}>⚑ {a}</li>)}{/* taste-skill-ignore */}
     </ul>
   )
 }
 
 function ResultText({ res }) {
   if (!res) return null
-  if (res.error) return <span className="text-xs" style={{ color: 'var(--danger)' }}>{res.error}</span>
+  if (res.error) return <span className="text-xs" style={{ color: 'var(--text-muted)' }}>{res.error}</span>
   return (
-    <span className="font-semibold" style={{ color: res.outcome === 'OVER' ? 'var(--success)' : 'var(--danger)' }}>
-      {res.outcome} {res.confidence}%
+    <span className="num">
+      <span className="font-semibold">{res.outcome}</span> {res.confidence}%
     </span>
   )
 }
@@ -152,8 +152,8 @@ export default function ScreenshotImport({ teams }) {
 
   const ready = rows.filter(isReady).length
   // Same field style as the History filters and the Predict form, sized for a table cell
-  const cell = 'input-field w-full rounded-xl px-3 py-2 text-sm'
-  const th = 'px-2 py-2 font-semibold'
+  const cell = 'input-field w-full px-2.5 py-1.5 text-sm'
+  const th = 'px-2 py-2'
 
   const playerField = (r) => (r.searchable ? (
     <PlayerSearch value={r.player_name} placeholder={r.card_name} label={null} compact
@@ -174,12 +174,12 @@ export default function ScreenshotImport({ teams }) {
   )
 
   const lineField = (r) => (
-    <input className={cell} inputMode="decimal" value={r.stat_line} aria-label="Line"
+    <input className={`${cell} num sm:text-right`} inputMode="decimal" value={r.stat_line} aria-label="Line"
            onChange={(e) => update(r.key, 'stat_line', e.target.value)} />
   )
 
   const multipliers = (r) => (r.higher != null || r.lower != null) && (
-    <div className="mt-1 text-xs" style={{ color: 'var(--text-muted)' }}>
+    <div className="mt-1 text-xs num" style={{ color: 'var(--text-muted)' }}>
       {r.higher != null ? `H ${r.higher}x` : ''} {r.lower != null ? `L ${r.lower}x` : ''}
     </div>
   )
@@ -198,21 +198,24 @@ export default function ScreenshotImport({ teams }) {
     const note = unresolvedNote(r)
     return (
       <>
-        {note && <div className="mt-1 text-xs" style={{ color: 'var(--warning)' }}>⚑ {note}</div>}
+        {note && <div className="mt-1 text-xs font-medium">⚑ {note}</div>}{/* taste-skill-ignore */}
         {r.flags.map((f) => (
-          <div key={f} className="mt-1 text-xs" style={{ color: 'var(--warning)' }}>{f}</div>
+          <div key={f} className="mt-1 text-xs font-medium">{f}</div>
         ))}
       </>
     )
   }
 
   return (
-    <div className="card w-full max-w-4xl rounded-2xl p-4 sm:p-6 shadow-2xl space-y-4 mb-6">
+    <section className="card w-full p-4 sm:p-5 space-y-4" aria-labelledby="screenshot-import">
       <div tabIndex={0} onPaste={onPaste} className="flex flex-wrap items-center justify-between gap-3 outline-none">
-        <span className="text-sm font-semibold" style={{ color: 'var(--text-secondary)' }}>
-          {extracting || (isPhone ? 'Screenshot import' : 'Screenshot import (paste or choose)')}
-        </span>
-        <label className={`btn-ghost tap inline-flex items-center justify-center px-4 py-2 rounded-xl text-sm font-medium ${
+        <div className="min-w-0">
+          <h2 id="screenshot-import" className="panel-title">Screenshot import</h2>
+          <p className="text-sm" style={{ color: 'var(--text-muted)' }}>
+            {extracting || (isPhone ? 'Underdog screenshots' : 'Paste or choose Underdog screenshots')}
+          </p>
+        </div>
+        <label className={`btn-ghost tap inline-flex items-center justify-center px-4 py-2 text-sm font-medium ${
           extracting ? 'opacity-30 cursor-not-allowed' : 'cursor-pointer'} ${isPhone ? 'w-full' : ''}`}>
           {isPhone ? 'Choose screenshots' : 'Choose images'}
           <input type="file" accept="image/*" multiple className="hidden" disabled={!!extracting}
@@ -221,15 +224,15 @@ export default function ScreenshotImport({ teams }) {
       </div>
 
       {errors.map((err) => (
-        <div key={err} role="alert" className="animate-fade-in status-out border rounded-xl px-4 py-3 text-sm">{err}</div>
+        <div key={err} role="alert" className="notice animate-fade-in px-3 py-2 text-sm">{err}</div>
       ))}
 
       {rows.length > 0 && (
         <div className="animate-fade-in space-y-4">
           {isPhone ? (
-            <ul className="space-y-3" aria-label="Rows to confirm">
-              {rows.map((r) => (
-                <li key={r.key} className="rounded-2xl border p-3 space-y-3" style={{ borderColor: 'var(--border)' }}>
+            <ul aria-label="Rows to confirm">
+              {rows.map((r, i) => (
+                <li key={r.key} className="py-3 space-y-3" style={i ? { borderTop: '1px solid var(--border)' } : undefined}>
                   <div className="flex items-start gap-1">
                     <div className="flex-1 min-w-0">
                       {playerField(r)}
@@ -246,7 +249,7 @@ export default function ScreenshotImport({ teams }) {
                   </div>
                   {opponentField(r)}
                   <div className="flex items-center justify-between gap-3">
-                    <label className="tap inline-flex items-center gap-3 text-sm cursor-pointer" style={{ color: 'var(--text-secondary)' }}>
+                    <label className="tap inline-flex items-center gap-3 text-sm cursor-pointer">
                       <input type="checkbox" className="h-5 w-5" checked={r.is_home}
                              onChange={(e) => update(r.key, 'is_home', e.target.checked)} />
                       Home game
@@ -257,8 +260,8 @@ export default function ScreenshotImport({ teams }) {
               ))}
             </ul>
           ) : (
-            <div className="rounded-2xl border overflow-x-auto" style={{ borderColor: 'var(--border)' }}>
-              <table className="w-full text-sm" style={{ tableLayout: 'fixed', minWidth: '640px' }}>
+            <div className="overflow-x-auto -mx-1">
+              <table className="data-table w-full text-sm" style={{ tableLayout: 'fixed', minWidth: '640px' }}>
                 <colgroup>
                   <col style={{ width: '25%' }} />
                   <col style={{ width: '15%' }} />
@@ -269,21 +272,19 @@ export default function ScreenshotImport({ teams }) {
                   <col style={{ width: '4%' }} />
                 </colgroup>
                 <thead>
-                  <tr className="text-left text-xs uppercase tracking-widest border-b"
-                      style={{ borderBottomColor: 'var(--border)', color: 'var(--text-muted)' }}>
+                  <tr>
                     <th className={th}>Player</th>
                     <th className={th}>Stat</th>
-                    <th className={th}>Line</th>
+                    <th className={`${th} text-right`} style={{ textAlign: 'right' }}>Line</th>
                     <th className={th}>Opponent</th>
-                    <th className={`${th} text-center`}>Home</th>
+                    <th className={th} style={{ textAlign: 'center' }}>Home</th>
                     <th className={th}>Result</th>
                     <th className={th} />
                   </tr>
                 </thead>
                 <tbody>
-                  {rows.map((r, i) => (
-                    <tr key={r.key} className="align-top"
-                        style={{ backgroundColor: i % 2 ? 'var(--bg-stripe)' : 'transparent' }}>
+                  {rows.map((r) => (
+                    <tr key={r.key} className="align-top">
                       <td className="px-2 py-2">
                         <div className="relative">
                           <div className={r.alerts.length ? 'pr-6' : ''}>{playerField(r)}</div>
@@ -294,7 +295,7 @@ export default function ScreenshotImport({ teams }) {
                         {openAlerts[r.key] && <AlertList alerts={r.alerts} />}
                       </td>
                       <td className="px-2 py-2">{statField(r)}</td>
-                      <td className="px-2 py-2">{lineField(r)}{multipliers(r)}</td>
+                      <td className="px-2 py-2 text-right">{lineField(r)}{multipliers(r)}</td>
                       <td className="px-2 py-2">{opponentField(r)}</td>
                       <td className="px-2 py-2 text-center align-middle">
                         <input type="checkbox" checked={r.is_home} aria-label="Home"
@@ -302,7 +303,7 @@ export default function ScreenshotImport({ teams }) {
                       </td>
                       <td className="px-2 py-2 align-middle truncate"><ResultText res={results[r.key]} /></td>
                       <td className="px-1 py-2 text-center align-middle">
-                        <button className="icon-btn text-lg leading-none" onClick={() => remove(r.key)}
+                        <button className="icon-btn px-1 text-lg leading-none" onClick={() => remove(r.key)}
                                 aria-label="Remove row">×</button>
                       </td>
                     </tr>
@@ -315,13 +316,13 @@ export default function ScreenshotImport({ teams }) {
             <button
               onClick={predictAll}
               disabled={predicting || ready === 0}
-              className="btn-accent w-full py-3.5 rounded-xl font-bold text-sm uppercase tracking-widest"
+              className="btn-accent tap w-full py-2.5 text-sm"
             >
               {predicting ? 'Predicting…' : `Predict ${ready} row${ready !== 1 ? 's' : ''}`}
             </button>
           </div>
         </div>
       )}
-    </div>
+    </section>
   )
 }
