@@ -4,6 +4,8 @@ KAGGLEHUB_CACHE), off-server backups against an in-memory fake bucket (0.7: rete
 model upload with manifest, restore passing PRAGMA integrity_check), and the deploy guard
 (0.8). Temp files only; nothing reaches Kaggle or a real bucket.
 """
+import datetime as dt
+import gzip
 import os
 import sqlite3
 import sys
@@ -14,6 +16,7 @@ BACKEND = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, BACKEND)
 
 import database          # noqa: E402
+import offsite_backup    # noqa: E402
 
 
 
@@ -72,3 +75,125 @@ def test_a_successful_etl_prunes_older_versions(tmp_path, monkeypatch):
     monkeypatch.setattr(database, "prune_kaggle_cache", lambda v: calls.append(v))
     assert database.run_etl() is True and calls == [523]
     assert database.run_etl() is False and calls == [523]       # up to date: no load, no prune
+
+
+# --- 0.7 off-server backups -------------------------------------------------------------
+
+class FakeS3:
+    """The subset of boto3's S3 client that offsite_backup uses, in memory."""
+    def __init__(self):
+        self.objects = {}
+
+    def upload_file(self, Filename, Bucket, Key, ExtraArgs=None):
+        with open(Filename, "rb") as f:
+            self.objects[Key] = (f.read(), (ExtraArgs or {}).get("Metadata", {}))
+
+    def list_objects_v2(self, Bucket, Prefix, ContinuationToken=None):
+        keys = sorted(k for k in self.objects if k.startswith(Prefix))
+        start = int(ContinuationToken or 0)
+        page = keys[start:start + 2]                         # tiny pages: exercise pagination
+        out = {"Contents": [{"Key": k} for k in page], "IsTruncated": start + 2 < len(keys)}
+        if out["IsTruncated"]:
+            out["NextContinuationToken"] = str(start + 2)
+        return out
+
+    def delete_object(self, Bucket, Key):
+        del self.objects[Key]
+
+    def head_object(self, Bucket, Key):
+        if Key not in self.objects:
+            raise KeyError(Key)
+        return {"Metadata": self.objects[Key][1]}
+
+    def download_file(self, Bucket, Key, Filename):
+        with open(Filename, "wb") as f:
+            f.write(self.objects[Key][0])
+
+
+@pytest.fixture
+def bucket(monkeypatch, tmp_path):
+    for k, v in {"SPACES_KEY": "k", "SPACES_SECRET": "s", "SPACES_BUCKET": "sportsbettr-backups",
+                 "SPACES_ENDPOINT": "https://nyc3.digitaloceanspaces.com"}.items():
+        monkeypatch.setenv(k, v)
+    db = str(tmp_path / "predictions.db")
+    conn = sqlite3.connect(db)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("CREATE TABLE t (x INTEGER)")
+    conn.executemany("INSERT INTO t VALUES (?)", [(i,) for i in range(1000)])
+    conn.commit()
+    conn.close()
+    return FakeS3(), db
+
+
+def test_nightly_backup_uploads_and_keeps_7_daily_and_4_weekly(bucket):
+    s3, db = bucket
+    day = dt.date(2026, 11, 1)                                # a Sunday
+    for k in range(40):
+        offsite_backup.nightly(db, today=day + dt.timedelta(days=k), s3=s3)
+    daily = sorted(k for k in s3.objects if k.startswith("predictions/daily/"))
+    weekly = sorted(k for k in s3.objects if k.startswith("predictions/weekly/"))
+    assert len(daily) == 7 and daily[-1] == "predictions/daily/predictions_2026-12-10.db.gz"
+    assert len(weekly) == 4 and weekly[-1] == "predictions/weekly/predictions_2026-W49.db.gz"
+    assert not [f for f in os.listdir(os.path.dirname(db) + "/backups") if f.startswith("offsite_")]  # temp gone
+
+
+def test_restore_passes_integrity_check_and_matches(bucket, tmp_path):
+    s3, db = bucket
+    out = offsite_backup.nightly(db, today=dt.date(2026, 11, 3), s3=s3)
+    data, meta = s3.objects[out["keys"][0]]
+    assert meta["sha256"] == out["sha256"] and gzip.decompress(data)[:16] == b"SQLite format 3\x00"
+    dest = str(tmp_path / "restored.db")
+    r = offsite_backup.restore(out["keys"][0], dest, s3=s3)
+    assert r["integrity_check"] == "ok"
+    conn = sqlite3.connect(dest)
+    assert conn.execute("SELECT COUNT(*), SUM(x) FROM t").fetchone() == (1000, sum(range(1000)))
+    conn.close()
+    with pytest.raises(FileExistsError):
+        offsite_backup.restore(out["keys"][0], dest, s3=s3)    # never overwrites
+
+
+def test_restore_refuses_a_corrupt_backup(bucket, tmp_path):
+    s3, _ = bucket
+    s3.objects["predictions/daily/bad.db.gz"] = (gzip.compress(b"SQLite format 3\x00" + b"\x00" * 5000), {})
+    dest = str(tmp_path / "bad.db")
+    with pytest.raises(Exception):
+        offsite_backup.restore("predictions/daily/bad.db.gz", dest, s3=s3)
+    assert not os.path.exists(dest)
+
+
+def test_upload_models_once_with_manifest_and_never_overwrites(bucket, tmp_path, monkeypatch):
+    s3, _ = bucket
+    (tmp_path / "challenger" / "models").mkdir(parents=True)
+    for name, body in (("model_Points.pkl", b"p"), ("challenger/models/c.pkl", b"c")):
+        (tmp_path / name).write_bytes(body)
+    monkeypatch.setattr(offsite_backup, "HERE", str(tmp_path))
+    out = offsite_backup.upload_models(s3=s3)
+    assert out["uploaded"] == ["challenger/models/c.pkl", "model_Points.pkl"]
+    assert "models/MANIFEST.sha256" in s3.objects
+    assert offsite_backup.upload_models(s3=s3)["skipped"] == out["uploaded"]       # same files: skipped
+    (tmp_path / "model_Points.pkl").write_bytes(b"changed")
+    with pytest.raises(RuntimeError, match="different file"):
+        offsite_backup.upload_models(s3=s3)
+
+
+def test_upload_historical_keeps_3(bucket):
+    s3, db = bucket
+    for k in range(5):
+        offsite_backup.upload_historical(db, s3=s3, now=dt.datetime(2026, 11, 10 + k, tzinfo=dt.timezone.utc))
+    assert sorted(s3.objects) == [f"historical/historical_202611{d}T000000Z.db.gz" for d in (12, 13, 14)]
+
+
+def test_run_nightly_never_raises_and_records_the_result(bucket, monkeypatch, tmp_path):
+    _, db = bucket
+    monkeypatch.setattr(database, "DB_PATH", db)
+    monkeypatch.setattr(offsite_backup, "nightly", lambda: (_ for _ in ()).throw(RuntimeError("bucket down")))
+    res = offsite_backup.run_nightly()
+    assert res["ok"] is False and "bucket down" in res["error"]
+    import json
+    assert json.load(open(os.path.join(os.path.dirname(db), "backups", "offsite_last.json")))["ok"] is False
+
+
+def test_backup_settings(monkeypatch):
+    for k in offsite_backup.SETTINGS:
+        monkeypatch.delenv(k, raising=False)
+    assert not offsite_backup.configured() and offsite_backup.missing_settings() == list(offsite_backup.SETTINGS)

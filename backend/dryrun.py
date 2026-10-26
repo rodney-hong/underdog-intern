@@ -75,6 +75,7 @@ def _pulled_today(label: str, day: dt.date) -> bool:
 
 def plan(now: dt.datetime, startup: bool = False) -> list[tuple[dt.datetime, str]]:
     """Every job prod would run from `now` to the end of now's ET day, sorted by time."""
+    import offsite_backup
     now = now.astimezone(EASTERN)
     day = now.date()
     at = lambda h, m=0: dt.datetime.combine(day, dt.time(h, m), EASTERN)
@@ -128,6 +129,10 @@ def plan(now: dt.datetime, startup: bool = False) -> list[tuple[dt.datetime, str
                 break
             jobs.append((t, "Kaggle version retry (metadata call; ETL + resolve if newer)"))
 
+    if offsite_backup.configured():
+        b = at(offsite_backup.BACKUP_HOUR_ET, offsite_backup.BACKUP_MINUTE_ET)
+        if b >= now:
+            jobs.append((b, "off-server backup of predictions.db to the bucket"))
     jobs.sort(key=lambda j: j[0])
     return jobs
 

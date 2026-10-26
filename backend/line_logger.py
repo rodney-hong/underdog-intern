@@ -1654,6 +1654,17 @@ def start_scheduler():
     # Missed-pull safety net: a lost pre-tip job is re-added within one cycle.
     sched.add_job(pretip_self_check, "interval", minutes=SELF_CHECK_MINUTES, kwargs={"scheduler": sched},
                   id="pretip_self_check", replace_existing=True, coalesce=True, max_instances=1)
+    # Nightly off-server backup (offsite_backup.py) when the bucket is configured.
+    import offsite_backup
+    if offsite_backup.configured():
+        sched.add_job(offsite_backup.run_nightly, "cron", hour=offsite_backup.BACKUP_HOUR_ET,
+                      minute=offsite_backup.BACKUP_MINUTE_ET, id="offsite_backup", replace_existing=True,
+                      misfire_grace_time=3 * 3600, coalesce=True, max_instances=1)
+    else:
+        print("!" * 78)
+        print(f"[backup] off-server backup NOT scheduled: {', '.join(offsite_backup.missing_settings())} "
+              f"not set in .env")
+        print("!" * 78)
     sched.start()
     _scheduler = sched
     print(f"[line_logger] scheduler started: open pull {'ON ' + str(OPEN_PULL_HOUR_ET) + ':00 ET' if OPEN_PULL_ENABLED else 'OFF'}, "

@@ -100,6 +100,8 @@ def test_self_check_job_is_in_the_prod_scheduler(tmp_path, monkeypatch):
     monkeypatch.setattr(database, "DB_PATH", str(tmp_path / "s.db"))
     monkeypatch.setattr(line_logger, "DB_PATH", str(tmp_path / "s.db"))
     monkeypatch.setenv("SPORTSBETTR_MODE", "prod")
+    for k in ("SPACES_KEY", "SPACES_SECRET", "SPACES_BUCKET", "SPACES_ENDPOINT"):
+        monkeypatch.setenv(k, "x")
     monkeypatch.setattr(line_logger, "_scheduler", None)
     fired = []                                        # the startup catch-up job fires at once: no OddsAPI
     monkeypatch.setattr(line_logger, "ODDS_API_KEY", "")
@@ -108,7 +110,7 @@ def test_self_check_job_is_in_the_prod_scheduler(tmp_path, monkeypatch):
     sched = line_logger.start_scheduler()
     try:
         ids = {j.id for j in sched.get_jobs()}
-        assert {"pretip_self_check", "line_pretip_scheduler", "morning_maintenance"} <= ids
+        assert {"pretip_self_check", "offsite_backup", "line_pretip_scheduler", "morning_maintenance"} <= ids
         trig = sched.get_job("pretip_self_check").trigger
         assert trig.interval == dt.timedelta(minutes=15)
     finally:
