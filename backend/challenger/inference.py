@@ -75,6 +75,29 @@ def _rows(conn, where: str, params: tuple) -> pd.DataFrame:
                              f"AND {where}", conn, params=params)
 
 
+def _team_rows(conn, hist: pd.DataFrame, team: int, team_from: str, tip: str) -> pd.DataFrame:
+    """
+    Rows for the absence features (team_games_of -> _absence_block): played rows in
+    [team_from, tip) of the teams the player's own rows can carry, i.e. his history's teams
+    after prep() fills NULL ids from load_team_map, plus ctx["team"]. _absence_block only
+    looks up teams present in his rows and skips every other team, so loading other teams
+    changes nothing; it only cost memory (team_from = "0000" for a player with fewer than
+    11 earlier games meant every regular-season row since 1946, ~1 GB). The SQL filter
+    keeps exactly the rows prep() would map to those teams: an id among them, or a NULL id
+    whose (city, name) load_team_map maps to one of them (migration plan v2, step 0.9;
+    tests/test_challenger_memory.py and experiments/challenger_memory_parity.py check
+    identical output).
+    """
+    team_map = load_team_map(conn)
+    teams = {int(team)} | set(prep(hist, team_map)["playerteamId"].astype("int64").tolist())
+    names = [k for k, v in team_map.items() if v in teams]
+    by_name = "".join(" OR (playerteamId IS NULL AND playerteamCity = ? AND playerteamName = ?)"
+                      for _ in names)
+    ids = ", ".join("?" * len(teams))
+    return _rows(conn, f"gameDateTimeEst >= ? AND gameDateTimeEst < ? AND (playerteamId IN ({ids}){by_name})",
+                 (team_from, tip, *sorted(teams), *[x for k in names for x in k]))
+
+
 def features_before_tip(conn, person_id: int, game_id: int) -> tuple[pd.DataFrame, dict]:
     """The target game's feature row, built from rows that tipped before it (guarded)."""
     ctx = game_context(conn, game_id, person_id)
@@ -94,7 +117,7 @@ def features_for_context(conn, person_id: int, ctx: dict) -> tuple[pd.DataFrame,
     hist = _rows(conn, "personId = ? AND gameDateTimeEst < ?", (int(person_id), tip))
     times = sorted(hist["gameDateTimeEst"])
     team_from = times[-11] if len(times) >= 11 else "0000"
-    team_rows = _rows(conn, "gameDateTimeEst >= ? AND gameDateTimeEst < ?", (team_from, tip))
+    team_rows = _team_rows(conn, hist, ctx["team"], team_from, tip)
     lg = conn.execute(f"SELECT gameDateTimeEst FROM (SELECT DISTINCT gameId, gameDateTimeEst FROM player_stats "
                       f"WHERE {REGULAR_SQL} AND gameDateTimeEst < ?) ORDER BY gameDateTimeEst DESC "
                       "LIMIT 1 OFFSET ?", (tip, LEAGUE_TEAM_GAMES)).fetchone()
