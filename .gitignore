@@ -41,5 +41,8 @@ Thumbs.db
 # Cross-process lock files (backend/proc_lock.py)
 *.lock
 
+# Experiment results data (the .md write-ups may be committed; the .json never)
+backend/experiments/results/*.json
+
 # deploy.sh: commit the server last restarted on (server only)
 .deployed
