@@ -942,6 +942,51 @@ def download_kaggle_files(version: int) -> dict:
     return out
 
 
+def kaggle_dataset_cache_dir() -> str:
+    """Where kagglehub keeps this dataset's versions: KAGGLEHUB_CACHE (kagglehub 1.0.1,
+    kagglehub/config.py; default ~/.cache/kagglehub) / datasets / owner / slug."""
+    from kagglehub.config import get_cache_folder
+    owner, slug = KAGGLE_DATASET.split("/")
+    return os.path.join(get_cache_folder(), "datasets", owner, slug)
+
+
+def prune_kaggle_cache(keep_version: int, dataset_dir: str | None = None) -> dict:
+    """
+    After a successful load of keep_version, delete every OLDER cached version: its
+    versions/<N> folder and kagglehub's completion markers (<N>.complete for whole-dataset
+    downloads, .complete/<N>/ for per-file ones). keep_version and anything newer stay.
+    Never raises: a failed delete is reported and the ETL result stands.
+    Returns {"removed": [N, ...], "freed_bytes": int, "errors": [...]}.
+    """
+    import shutil
+    base = dataset_dir or kaggle_dataset_cache_dir()
+    out = {"removed": [], "freed_bytes": 0, "errors": []}
+    vdir = os.path.join(base, "versions")
+    if not os.path.isdir(vdir):
+        return out
+    for name in sorted(os.listdir(vdir)):
+        if not name.isdigit() or int(name) >= keep_version:
+            continue
+        path = os.path.join(vdir, name)
+        size = sum(os.path.getsize(os.path.join(r, f)) for r, _, fs in os.walk(path) for f in fs)
+        try:
+            shutil.rmtree(path)
+            for marker in (os.path.join(base, f"{name}.complete"), os.path.join(base, ".complete", name)):
+                if os.path.isdir(marker):
+                    shutil.rmtree(marker)
+                elif os.path.exists(marker):
+                    os.remove(marker)
+        except OSError as exc:
+            out["errors"].append(f"v{name}: {exc!r}")
+            continue
+        out["removed"].append(int(name))
+        out["freed_bytes"] += size
+    if out["removed"] or out["errors"]:
+        print(f"Kaggle cache pruned: removed {out['removed']} ({out['freed_bytes'] / 1e9:.1f} GB), "
+              f"kept v{keep_version}+{'; errors: ' + '; '.join(out['errors']) if out['errors'] else ''}")
+    return out
+
+
 def backup_predictions_to_csv() -> str:
     """Write all rows from the predictions table to predictions_backup.csv."""
     import csv
@@ -1236,6 +1281,7 @@ def _run_etl() -> bool:
         conn.close()
 
     print("ETL complete.")
+    prune_kaggle_cache(latest_version)    # older cached versions are never read again
     resolve_pending_predictions()
     return True
 
