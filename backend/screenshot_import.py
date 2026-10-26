@@ -22,7 +22,13 @@ Extractor (SCREENSHOT_EXTRACTOR in .env):
           error, the image is read again with gemini and the switch is logged; after a quota
           error gemini is used directly for QUOTA_COOLDOWN_MINUTES.
   gemini  the same card reads through the Gemini API (generateContent, key GEMINI_API_KEY, model
-          SCREENSHOT_GEMINI_MODEL, default gemma-4-31b-it), image sent inline (no file upload).
+          SCREENSHOT_GEMINI_MODEL, default gemma-4-31b-it), image sent inline (no file upload),
+          thinking off (SCREENSHOT_GEMINI_THINKING); only the reply's answer part is parsed,
+          never a part marked "thought".
+  Hosted services (ollama_cloud, gemini) fail fast: every request has a timeout, HTTP 500 / 503
+  is retried once, and a service with no answer within HOSTED_FIRST_READ_SECONDS, or that times
+  out, is unreachable, refuses the key or fails the retry, fails the whole image at once
+  (ServiceDown), so both failing reaches the app as one message within about a minute.
   claude  Claude API, key ANTHROPIC_API_KEY, model SCREENSHOT_CLAUDE_MODEL; whole image,
           one call, multipliers included.
 The image is held in memory only: nothing is written to disk.
@@ -53,6 +59,13 @@ OLLAMA_CLOUD_PARALLEL = int(os.getenv("SCREENSHOT_OLLAMA_CLOUD_PARALLEL", "1")) 
 GEMINI_URL = os.getenv("GEMINI_URL", "https://generativelanguage.googleapis.com")
 GEMINI_MODEL = os.getenv("SCREENSHOT_GEMINI_MODEL", "gemma-4-31b-it")
 GEMINI_PARALLEL = int(os.getenv("SCREENSHOT_GEMINI_PARALLEL", "2"))
+# Gemma 4 on the Gemini API only switches thinking on or off: thinkingLevel "minimal" = off,
+# "high" = on (ai.google.dev/gemma/docs/core/gemma_on_gemini_api). Empty: send no thinkingConfig.
+GEMINI_THINKING = os.getenv("SCREENSHOT_GEMINI_THINKING", "minimal").strip()
+HOSTED_TIMEOUT_SECONDS = float(os.getenv("SCREENSHOT_HOSTED_TIMEOUT_SECONDS", "20"))      # one hosted request
+HOSTED_FIRST_READ_SECONDS = float(os.getenv("SCREENSHOT_HOSTED_FIRST_READ_SECONDS", "25"))  # until its first answer
+HOSTED_RETRY_STATUSES = (500, 503)      # retried once; anything else fails at once
+HOSTED_RETRY_PAUSE = 1.0
 FALLBACK = {"ollama_cloud": "gemini"}   # extractor -> the one used when it fails
 QUOTA_COOLDOWN_MINUTES = 60             # after a usage-limit error, skip that service this long
 READ_SCALES = (2, 3)           # each card is read twice, upscaled 2x and 3x
@@ -102,6 +115,11 @@ class ExtractorUnavailable(Exception):
 
 class QuotaExceeded(ExtractorUnavailable):
     """A hosted service refused because a usage limit, quota or rate limit was reached."""
+
+
+class ServiceDown(ExtractorUnavailable):
+    """A hosted service can't read anything right now (timed out, unreachable, refused the key,
+    HTTP 5xx after the retry): the whole image fails at once instead of card by card."""
 
 
 class BadImage(ValueError):
@@ -321,11 +339,77 @@ def _json_text(text: str) -> dict:
         return json.loads(text[i:j + 1])
 
 
-def _ollama_chat(img, prompt: str, url: str, model: str, label: str, headers: dict | None = None) -> dict:
-    """One Ollama /api/chat call on a PIL image: temperature 0, thinking off, JSON mode."""
+class _Budget:
+    """One hosted service's time limits while it reads one image: each request at most
+    HOSTED_TIMEOUT_SECONDS; until the service's first answer, every request and the retry
+    together at most HOSTED_FIRST_READ_SECONDS. A down service fails the image inside that
+    window; a working one then reads the remaining cards at its own pace. `stopped` is set
+    when the image has failed, so reads still queued or in flight send nothing more."""
+
+    def __init__(self, label: str):
+        self.label = label
+        self.until = time.monotonic() + HOSTED_FIRST_READ_SECONDS
+        self.answered = False
+        self.stopped = False
+
+    def timeout(self) -> float:
+        if self.stopped:
+            raise ServiceDown(f"{self.label}: stopped, another read already failed")
+        if self.answered:
+            return HOSTED_TIMEOUT_SECONDS
+        left = self.until - time.monotonic()
+        if left < 1:
+            raise ServiceDown(f"{self.label} gave no answer within {HOSTED_FIRST_READ_SECONDS:.0f} s")
+        return min(HOSTED_TIMEOUT_SECONDS, left)
+
+
+def _error_detail(resp) -> str:
+    """The service's own error message, short: Gemini {"error": {"message"}}, Ollama {"error"}."""
+    try:
+        err = resp.json().get("error")
+        msg = err.get("message") if isinstance(err, dict) else err
+    except Exception:
+        msg = None
+    return f": {str(msg)[:160]}" if msg else ""
+
+
+def _post_hosted(label: str, url: str, body: dict, headers: dict, budget: _Budget):
+    """One hosted request with a timeout; one retry on HTTP 500 / 503, then ServiceDown.
+    A usage limit raises QuotaExceeded; a refused key, a timeout or no connection, ServiceDown."""
+    for attempt in (1, 2):
+        timeout = budget.timeout()
+        try:
+            resp = httpx.post(url, json=body, headers=headers,
+                              timeout=httpx.Timeout(timeout, connect=min(5.0, timeout)))
+        except httpx.TimeoutException as exc:
+            raise ServiceDown(f"{label} did not answer within {timeout:.0f} s") from exc
+        except httpx.HTTPError as exc:
+            raise ServiceDown(f"{label} could not be reached ({type(exc).__name__})") from exc
+        code = resp.status_code
+        if code < 400:
+            budget.answered = True
+            return resp
+        if _is_quota(resp):
+            raise QuotaExceeded(f"{label} usage limit reached (HTTP {code})")
+        if code in (401, 403) or "api key not valid" in resp.text.lower():
+            raise ServiceDown(f"{label} refused the API key (HTTP {code})")
+        if code in HOSTED_RETRY_STATUSES and attempt == 1:
+            time.sleep(HOSTED_RETRY_PAUSE)
+            continue
+        raise ServiceDown(f"{label} returned HTTP {code}{' twice' if attempt == 2 else ''}{_error_detail(resp)}")
+
+
+def _ollama_chat(img, prompt: str, url: str, model: str, label: str, headers: dict | None = None,
+                 budget: _Budget | None = None) -> dict:
+    """One Ollama /api/chat call on a PIL image: temperature 0, thinking off, JSON mode.
+    With a budget (Ollama Cloud) it goes through _post_hosted; without (local Ollama) a model
+    load can take minutes, so the timeout is long and any 5xx is retried once."""
     body = {"model": model, "stream": False, "format": "json", "think": False,
             "options": {"temperature": 0},
             "messages": [{"role": "user", "content": prompt, "images": [_png_b64(img)]}]}
+    if budget is not None:
+        resp = _post_hosted(label, f"{url}/api/chat", body, headers or {}, budget)
+        return _json_text(resp.json()["message"]["content"])
     kw = {"headers": headers} if headers else {}
     for attempt in (1, 2):   # one retry on a 5xx: a model load can fail once (CUDA init, VRAM)
         try:
@@ -352,48 +436,47 @@ def _ollama_json(img, prompt: str) -> dict:
     return _ollama_chat(img, prompt, OLLAMA_URL, OLLAMA_MODEL, "Ollama")
 
 
-def _ollama_cloud_json(img, prompt: str) -> dict:
+def _ollama_cloud_json(img, prompt: str, budget: _Budget) -> dict:
     """Ollama Cloud: the same /api/chat on OLLAMA_CLOUD_URL with a Bearer OLLAMA_API_KEY."""
     key = os.getenv("OLLAMA_API_KEY", "").strip()
     if not key:
         raise ExtractorUnavailable("OLLAMA_API_KEY is not set in backend/.env")
     return _ollama_chat(img, prompt, OLLAMA_CLOUD_URL, OLLAMA_CLOUD_MODEL, "Ollama Cloud",
-                        headers={"Authorization": f"Bearer {key}"})
+                        headers={"Authorization": f"Bearer {key}"}, budget=budget)
 
 
-def _gemini_json(img, prompt: str) -> dict:
-    """Gemini API generateContent: image inline (base64, never uploaded as a file), temperature 0.
-    No JSON mode (Gemma models on the Gemini API may not offer it): the prompt asks for JSON and
-    _json_text reads it. Thought parts, if any, are skipped."""
-    key = os.getenv("GEMINI_API_KEY", "").strip()
-    if not key:
-        raise ExtractorUnavailable("GEMINI_API_KEY is not set in backend/.env")
-    url = f"{GEMINI_URL}/v1beta/models/{GEMINI_MODEL}:generateContent"
-    body = {"contents": [{"role": "user", "parts": [
-                {"inline_data": {"mime_type": "image/png", "data": _png_b64(img)}}, {"text": prompt}]}],
-            "generationConfig": {"temperature": 0}}
-    for attempt in (1, 2):   # one retry on a 5xx
-        try:
-            resp = httpx.post(url, timeout=300, json=body, headers={"x-goog-api-key": key})
-            resp.raise_for_status()
-            break
-        except httpx.HTTPStatusError as exc:
-            if _is_quota(exc.response):
-                raise QuotaExceeded(f"Gemini usage limit reached (HTTP {exc.response.status_code})") from exc
-            if exc.response.status_code in (401, 403) or "api key not valid" in exc.response.text.lower():
-                raise ExtractorUnavailable(f"Gemini refused the API key (HTTP {exc.response.status_code})") from exc
-            if attempt == 2 or exc.response.status_code < 500:
-                raise ExtractorUnavailable(f"Gemini ({GEMINI_MODEL}) failed: {exc}") from exc
-            time.sleep(2)
-        except httpx.HTTPError as exc:
-            raise ExtractorUnavailable(f"Gemini ({GEMINI_MODEL}) failed: {exc}") from exc
-    data = resp.json()
+def gemini_answer_text(data: dict) -> str:
+    """The answer text of a generateContent reply: the first candidate's parts that are not
+    thoughts ("thought": true), joined. Gemma 4 may put a thought part first, even an empty
+    one with thinking off; it is never parsed."""
     cands = data.get("candidates") or []
     if not cands:
         reason = (data.get("promptFeedback") or {}).get("blockReason", "no candidates")
         raise ExtractorUnavailable(f"Gemini returned no answer ({reason})")
     parts = (cands[0].get("content") or {}).get("parts") or []
-    return _json_text("".join(p.get("text", "") for p in parts if not p.get("thought")))
+    answer = [p["text"] for p in parts if not p.get("thought") and isinstance(p.get("text"), str)]
+    if not "".join(answer).strip():
+        raise ExtractorUnavailable(f"Gemini's reply had no answer part (finishReason "
+                                   f"{cands[0].get('finishReason')}, {len(parts)} thought part(s))")
+    return "".join(answer)
+
+
+def _gemini_json(img, prompt: str, budget: _Budget) -> dict:
+    """Gemini API generateContent: image inline (base64, never uploaded as a file), temperature 0,
+    thinking per GEMINI_THINKING. No JSON mode (Gemma models on the Gemini API may not offer it):
+    the prompt asks for JSON and _json_text reads the answer part."""
+    key = os.getenv("GEMINI_API_KEY", "").strip()
+    if not key:
+        raise ExtractorUnavailable("GEMINI_API_KEY is not set in backend/.env")
+    url = f"{GEMINI_URL}/v1beta/models/{GEMINI_MODEL}:generateContent"
+    config = {"temperature": 0}
+    if GEMINI_THINKING:
+        config["thinkingConfig"] = {"thinkingLevel": GEMINI_THINKING}
+    body = {"contents": [{"role": "user", "parts": [
+                {"inline_data": {"mime_type": "image/png", "data": _png_b64(img)}}, {"text": prompt}]}],
+            "generationConfig": config}
+    resp = _post_hosted("Gemini", url, body, {"x-goog-api-key": key}, budget)
+    return _json_text(gemini_answer_text(resp.json()))
 
 
 def _read_key(r: dict) -> tuple:
@@ -449,19 +532,26 @@ def _extract_ollama(png: bytes, media_type: str) -> list[dict]:
 
 
 def _extract_ollama_cloud(png: bytes, media_type: str) -> list[dict]:
-    return _extract_cards(png, _ollama_cloud_json, OLLAMA_CLOUD_PARALLEL)
+    b = _Budget("Ollama Cloud")
+    return _extract_cards(png, lambda im, prompt: _ollama_cloud_json(im, prompt, b), OLLAMA_CLOUD_PARALLEL, b)
 
 
 def _extract_gemini(png: bytes, media_type: str) -> list[dict]:
-    return _extract_cards(png, _gemini_json, GEMINI_PARALLEL)
+    b = _Budget("Gemini")
+    return _extract_cards(png, lambda im, prompt: _gemini_json(im, prompt, b), GEMINI_PARALLEL, b)
 
 
-def _extract_cards(png: bytes, read_json, parallel: int) -> list[dict]:
+_FAILS_THE_IMAGE = (QuotaExceeded, ServiceDown)
+
+
+def _extract_cards(png: bytes, read_json, parallel: int, budget: _Budget | None = None) -> list[dict]:
     """Cards detected: each card cropped and read at each of READ_SCALES (up to `parallel`
     calls at once) with read_json(image, prompt), one raw row per card. No cards: the whole
-    image, read twice (1x and 1.5x). A usage-limit error on any read fails the whole image
-    (QuotaExceeded), so a fallback service reads all of it again."""
-    from concurrent.futures import ThreadPoolExecutor
+    image, read twice (1x and 1.5x). A usage limit or a down service on any read fails the
+    whole image at once (QuotaExceeded / ServiceDown): queued reads are cancelled, the budget
+    stops reads in flight from sending more, and a fallback service reads all of it again.
+    Any other error stays with its card."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
     from PIL import Image
     img = Image.open(io.BytesIO(png)).convert("RGB")
     boxes = detect_cards(img)
@@ -485,12 +575,18 @@ def _extract_cards(png: bytes, read_json, parallel: int) -> list[dict]:
         except Exception as exc:
             return exc
 
-    with ThreadPoolExecutor(max_workers=max(1, parallel)) as ex:
-        results = list(ex.map(read, jobs))
+    ex = ThreadPoolExecutor(max_workers=max(1, parallel))
+    futures = [ex.submit(read, im) for im in jobs]
+    try:
+        for f in as_completed(futures):
+            if isinstance(f.result(), _FAILS_THE_IMAGE):
+                if budget is not None:
+                    budget.stopped = True
+                raise f.result()
+    finally:
+        ex.shutdown(wait=False, cancel_futures=True)     # never wait for a read in flight
+    results = [f.result() for f in futures]
     errors = [r for r in results if isinstance(r, Exception)]
-    quota = next((e for e in errors if isinstance(e, QuotaExceeded)), None)
-    if quota is not None:
-        raise quota
     if errors and len(errors) == len(results):          # nothing read at all: say why
         first = next((e for e in errors if isinstance(e, ExtractorUnavailable)), errors[0])
         if isinstance(first, ExtractorUnavailable):

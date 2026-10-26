@@ -189,3 +189,156 @@ def test_quota_detection():
     assert not si._is_quota(httpx.Response(500, request=req, text="quota service crashed"))
     assert si._json_text('Sure! {"a": 1} hope that helps') == {"a": 1}
     assert si._json_text('```json\n{"a": 2}\n```') == {"a": 2}
+
+
+# --- Gemini fallback fixes (2026-10-26): thought parts, timeouts, one retry, fail fast ------------
+
+class Script:
+    """httpx.post stand-in that answers from a list, one entry per call: an int is that HTTP
+    status, an exception is raised, "ok" is a good reply. The last entry repeats."""
+    def __init__(self, *steps):
+        self.steps, self.calls = list(steps), []
+
+    def __call__(self, url, json=None, timeout=None, headers=None):
+        self.calls.append({"url": url, "body": json, "timeout": timeout})
+        step = self.steps[min(len(self.calls), len(self.steps)) - 1]
+        req = httpx.Request("POST", url)
+        if isinstance(step, Exception):
+            raise step
+        if step == "ok":
+            if url.startswith(si.GEMINI_URL):
+                parts = [{"text": '{"player_name": "NOT THIS ONE", "line": 99.5}', "thought": True},
+                         {"text": __import__("json").dumps(CARD)}]
+                return httpx.Response(200, request=req, json={"candidates": [{"content": {"parts": parts}}]})
+            return httpx.Response(200, request=req, json={"message": {"content": __import__("json").dumps(CARD)}})
+        return httpx.Response(step, request=req, json={"error": {"code": step, "message": "Internal error encountered."}})
+
+
+@pytest.fixture
+def gemini_only(fake, monkeypatch):
+    monkeypatch.setenv("SCREENSHOT_EXTRACTOR", "gemini")
+    monkeypatch.setattr(si, "GEMINI_PARALLEL", 1)                   # one read at a time: exact call counts
+
+    def use(*steps):
+        s = Script(*steps)
+        monkeypatch.setattr(si.httpx, "post", s)
+        return s
+    return use
+
+
+def test_gemini_parses_only_the_answer_part_and_turns_thinking_off(gemini_only):
+    s = gemini_only("ok")
+    name, rows = si.extract_rows(_png())
+    assert name == "gemini" and len(rows) == 3
+    assert all(r["player_name"] == "Jalen Williams" and r["line"] == 5.5 for r in rows)   # never the thought
+    assert s.calls[0]["body"]["generationConfig"] == {"temperature": 0, "thinkingConfig": {"thinkingLevel": "minimal"}}
+    assert si.gemini_answer_text({"candidates": [{"content": {"parts": [
+        {"text": "", "thought": True}, {"text": '{"a": 1}'}]}}]}) == '{"a": 1}'           # empty thought block first
+    # the live reply's shape (2026-10-26, gemma-4-31b-it, thinkingLevel minimal): an empty thought
+    # part, then the answer split over two text parts
+    live = {"candidates": [{"finishReason": "STOP", "content": {"parts": [
+        {"text": "", "thought": True},
+        {"text": '```json\n{"player_name": "A Player", "stat_label": "Points", "line": "'},
+        {"text": '24.5", "buttons": ["Higher", "Lower"]}\n```'}]}}]}
+    assert si._json_text(si.gemini_answer_text(live)) == {
+        "player_name": "A Player", "stat_label": "Points", "line": "24.5", "buttons": ["Higher", "Lower"]}
+    with pytest.raises(si.ExtractorUnavailable, match="no answer part"):
+        si.gemini_answer_text({"candidates": [{"finishReason": "STOP",
+                                               "content": {"parts": [{"text": "{...}", "thought": True}]}}]})
+
+
+def test_thinking_setting_can_be_left_to_the_api(gemini_only, monkeypatch):
+    monkeypatch.setattr(si, "GEMINI_THINKING", "")
+    s = gemini_only("ok")
+    si.extract_rows(_png())
+    assert "thinkingConfig" not in s.calls[0]["body"]["generationConfig"]
+
+
+@pytest.mark.parametrize("status", [500, 503])
+def test_a_500_or_503_is_retried_once_then_succeeds(gemini_only, status):
+    s = gemini_only(status, "ok")
+    name, rows = si.extract_rows(_png())
+    assert name == "gemini" and len(rows) == 3 and not any(r.get("unreadable") for r in rows)
+    assert len(s.calls) == 3 * len(si.READ_SCALES) + 1                 # one retry, then every read once
+
+
+def test_two_500s_fail_the_image_at_once_with_a_clear_message(gemini_only):
+    s = gemini_only(500)
+    with pytest.raises(si.ServiceDown) as e:
+        si.extract_rows(_png())
+    assert str(e.value) == "Gemini returned HTTP 500 twice: Internal error encountered."
+    assert len(s.calls) == 2                                          # no other card is tried
+
+
+@pytest.mark.parametrize("status", [400, 502, 504])
+def test_other_errors_are_not_retried(gemini_only, status):
+    s = gemini_only(status)
+    with pytest.raises(si.ExtractorUnavailable):
+        si.extract_rows(_png())
+    if status >= 500:                                                 # a 5xx is the service: fail fast
+        assert len(s.calls) == 1
+
+
+def test_a_timeout_fails_at_once_with_a_clear_message(gemini_only):
+    s = gemini_only(httpx.ReadTimeout("timed out"))
+    with pytest.raises(si.ServiceDown, match=r"^Gemini did not answer within 20 s$"):
+        si.extract_rows(_png())
+    assert len(s.calls) == 1                                          # a timeout is not retried
+    t = s.calls[0]["timeout"]
+    assert isinstance(t, httpx.Timeout) and t.read == si.HOSTED_TIMEOUT_SECONDS and t.connect == 5.0
+
+
+def test_both_services_failing_reach_the_app_within_a_minute(fake, monkeypatch):
+    """Worst case on a simulated clock: every request takes its whole timeout before failing.
+    Ollama Cloud times out, Gemini returns 500 twice (the retry gets only what is left of its
+    first-answer window): the app has the message within two windows, under a minute."""
+    clock = {"t": 0.0}
+    monkeypatch.setattr(si.time, "monotonic", lambda: clock["t"])
+    monkeypatch.setattr(si.time, "sleep", lambda sec: clock.__setitem__("t", clock["t"] + sec))
+    script = Script(httpx.ReadTimeout("timed out"), 500, 500)
+
+    def slow(url, json=None, timeout=None, headers=None):
+        clock["t"] += timeout.read                                    # the request uses its whole timeout
+        return script(url, json=json, timeout=timeout, headers=headers)
+
+    s = script
+    monkeypatch.setattr(si.httpx, "post", slow)
+    from fastapi.testclient import TestClient
+    import main
+    r = TestClient(main.app).post("/screenshot/extract", files={"file": ("s.png", _png(), "image/png")})
+    assert r.status_code == 503
+    assert r.json()["detail"] == (
+        "Screenshot reading is unavailable right now: Ollama Cloud (Ollama Cloud did not answer within 20 s) "
+        "and Gemini (Gemini returned HTTP 500 twice: Internal error encountered.) both failed. "
+        "Enter the lines by hand, or try again later.")
+    assert len(s.calls) == 3
+    assert [c["timeout"].read for c in s.calls] == [20, 20, 4]        # Gemini's retry: 25 - 20 - 1 s pause
+    assert clock["t"] <= 2 * si.HOSTED_FIRST_READ_SECONDS <= 60
+
+
+def test_the_first_answer_window_caps_a_slow_service(monkeypatch):
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(si.time, "monotonic", lambda: clock["t"])
+    b = si._Budget("Gemini")
+    assert b.timeout() == si.HOSTED_TIMEOUT_SECONDS                  # 25 s left: a full 20 s request
+    clock["t"] += 20
+    assert b.timeout() == pytest.approx(si.HOSTED_FIRST_READ_SECONDS - 20)   # the retry gets what is left
+    clock["t"] += 4.5
+    with pytest.raises(si.ServiceDown, match="no answer within 25 s"):
+        b.timeout()
+    b2 = si._Budget("Gemini")
+    b2.answered = True                                                # once it answers, no window
+    clock["t"] += 600
+    assert b2.timeout() == si.HOSTED_TIMEOUT_SECONDS
+    b2.stopped = True
+    with pytest.raises(si.ServiceDown, match="stopped"):
+        b2.timeout()
+
+
+def test_a_service_down_midway_fails_the_image_and_falls_back(fake, monkeypatch):
+    """Ollama Cloud answers two reads, then times out: the whole image goes to Gemini."""
+    s = Script("ok", "ok", httpx.ConnectTimeout("timed out"), "ok")
+    monkeypatch.setattr(si.httpx, "post", s)
+    name, rows = si.extract_rows(_png())
+    assert name == "gemini" and len(rows) == 3 and not any(r.get("unreadable") for r in rows)
+    assert sum(not c["url"].startswith(si.GEMINI_URL) for c in s.calls) == 3   # nothing sent after the failure
