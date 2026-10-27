@@ -242,7 +242,15 @@ def main():
     r.add_argument("--field", default="password", help="JSON field the login body uses")
     r.add_argument("--check-password", action="store_true")
     r.add_argument("--authed-get", help="a read-only GET path to try with the new session")
+    for name in ("sweep", "ratelimit"):
+        sub.choices[name].add_argument(
+            "--cafile", help="trust only this CA bundle (e.g. certifi), not the OS store")
     args = ap.parse_args()
+    if getattr(args, "cafile", None):
+        global OPENER
+        import ssl
+        ctx = ssl.create_default_context(cafile=args.cafile)
+        OPENER = urllib.request.build_opener(_NoRedirect, urllib.request.HTTPSHandler(context=ctx))
     {"dump": dump, "sweep": sweep, "ratelimit": ratelimit}[args.cmd](args)
 
 
