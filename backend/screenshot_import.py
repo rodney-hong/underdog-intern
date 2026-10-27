@@ -292,6 +292,201 @@ def _tile_grid(boxes, mask, w, h) -> list[tuple[int, int, int, int]]:
     return tiles
 
 
+# --- Underdog's iPhone app: a game page's Players tab -----------------------------------
+
+PHONE_MIN_ASPECT = 1.8         # height / width at least this (a desktop crop can be too: see detect_phone)
+# Where the text sits in a whole tile / list row, as fractions of its height (iPhone
+# screenshots, 2026-10-27). A cut one is read only while its name, line and stat are whole.
+TILE_TOP_CUT_NAME = 0.035      # cut more off a tile's top and its name banner is clipped: unreadable
+TILE_TOP_CUT_LINE = 0.5        # ... and its line: skipped
+TILE_BOTTOM_KEEP = 0.76        # less of a tile left above the image's bottom and its stat is clipped: skipped
+ROW_TOP_CUT_LINE = 0.1         # a list row's line is on its buttons' upper half: cut more, skipped
+ROW_BOTTOM_KEEP = 0.6
+PARTLY_CUT = "partly cut off: check"
+HEADER_PROMPT = (
+    "This is the top of a game page in a sports pick'em app. Copy the two team abbreviations "
+    "of the game header, the one on the left and the one on the right, exactly as written "
+    '(for example \'BKN\' and \'BOS\'). Return JSON {"left_team": ..., "right_team": ...}. '
+    "Use null for anything not visible. Do not guess."
+)
+TAB_PROMPT = ('This image is one tab button from an app. Copy its label exactly as written. Return JSON '
+              '{"label": ...}. Use null if it is not readable. Do not guess.')
+ROW_PROMPT = (
+    "This image is one row of a player list from a sports pick'em app: a player's name, his "
+    "average, and one or two pick buttons, each with an arrow, a line and a multiplier. Copy its "
+    'raw text. Return JSON {"player_name": ..., "line": ..., "arrows": [...]}: player_name '
+    "exactly as written; line, the number on the pick buttons exactly as written (not the "
+    "average, not a multiplier); arrows, the direction of each button's arrow, 'up' or 'down'. "
+    "Ignore multipliers. Use null for anything not visible. Do not guess."
+)
+
+
+def detect_phone(img) -> dict | None:
+    """
+    Underdog's iPhone game page (Players tab), or None for anything else (the desktop path).
+      phone     tall (PHONE_MIN_ASPECT) with a row of at least three tab pills in its top
+                half; a desktop crop, however tall, has no such row
+      header    the box above the pills (the two teams), None when there is next to nothing
+      tab       the pill much brighter than the others (the selected one), or None
+      layout    'tiles' (two-column tiles, Popular), 'list' (rows of one or two line buttons
+                on the right, a stat tab) or None when neither is found
+      items     reading order; each {"box", "action"}: 'read'; 'flag' (cut by the image edge
+                but name, line and stat whole: read and flagged); 'unreadable' (a tile's name
+                clipped); 'skip' (its line or stat clipped). See the fractions above.
+    Boxes are in the image's pixels.
+    """
+    import numpy as np
+    from scipy import ndimage
+    if img.height < PHONE_MIN_ASPECT * img.width:
+        return None
+    scale = min(1.0, 1200 / max(img.size))
+    small = img.resize((max(1, int(img.width * scale)), max(1, int(img.height * scale)))) if scale < 1 else img
+    a = np.asarray(small.convert("RGB")).astype(np.int16)
+    h, w = a.shape[:2]
+    border = np.concatenate([a[:3].reshape(-1, 3), a[-3:].reshape(-1, 3),
+                             a[:, :3].reshape(-1, 3), a[:, -3:].reshape(-1, 3)])
+    mask = np.abs(a - np.median(border, axis=0)).max(axis=2) > 6
+    solid = ndimage.binary_opening(ndimage.binary_fill_holes(mask), structure=np.ones((9, 9)))
+    labels, _ = ndimage.label(solid)
+    lum = a.mean(axis=2)
+    comps = []                     # solid panels: (x0, y0, x1, y1, mean brightness)
+    for i, sl in enumerate(ndimage.find_objects(labels), start=1):
+        if sl is None:
+            continue
+        own = labels[sl] == i
+        if own.mean() >= 0.8:
+            comps.append((sl[1].start, sl[0].start, sl[1].stop, sl[0].stop, float(lum[sl][own].mean())))
+    pills = [c for c in comps if 0.06 * w <= c[3] - c[1] <= 0.13 * w and 0.08 * w <= c[2] - c[0] <= 0.4 * w
+             and c[3] < h / 2]
+    tabs = None
+    for p in sorted(pills, key=lambda c: c[1]):
+        row = [q for q in pills if abs(q[1] - p[1]) <= 0.015 * w]
+        if len(row) >= 3:
+            tabs = row
+            break
+    if tabs is None:
+        return None
+    inv = 1 / scale
+
+    def full(b):
+        return tuple(int(v * inv) for v in b[:4])
+
+    bright = sorted(tabs, key=lambda c: c[4], reverse=True)
+    top, content = min(c[1] for c in tabs), max(c[3] for c in tabs)
+    below = [c for c in comps if c[1] >= content and c[3] - c[1] >= 0.03 * w]
+    tiles = [c for c in below if 0.35 * w <= c[2] - c[0] <= 0.5 * w]
+    buttons = sorted((c for c in below if 0.12 * w <= c[2] - c[0] <= 0.35 * w and c[3] - c[1] <= 0.16 * w
+                      and c[0] >= 0.4 * w), key=lambda c: c[1])
+    rows = []                      # buttons side by side: one list row, the full width
+    for b in buttons:
+        if rows and abs(b[1] - rows[-1][1]) <= 0.03 * w:
+            rows[-1] = (0, min(rows[-1][1], b[1]), w, max(rows[-1][3], b[3]))
+        else:
+            rows.append((0, b[1], w, b[3]))
+    layout = "tiles" if tiles and len(tiles) >= len(rows) else "list" if rows else None
+    boxes = rows
+    if layout == "tiles":          # reading order: tiles whose tops are level form a row
+        lines = []
+        for c in sorted(tiles, key=lambda c: c[1]):
+            if lines and c[1] - lines[-1][0][1] <= 0.05 * w:
+                lines[-1].append(c)
+            else:
+                lines.append([c])
+        boxes = [c for line in lines for c in sorted(line, key=lambda c: c[0])]
+    whole = max((b[3] - b[1] for b in boxes), default=0)
+    items = []
+    for b in boxes:
+        seen = (b[3] - b[1]) / whole
+        at_bottom = b[3] >= h - 0.01 * w
+        if whole - (b[3] - b[1]) <= 2:                 # px at this scale: a whole one
+            action = "read"
+        elif layout == "tiles" and at_bottom:
+            action = "flag" if seen >= TILE_BOTTOM_KEEP else "skip"
+        elif layout == "tiles":
+            action = ("flag" if 1 - seen <= TILE_TOP_CUT_NAME else
+                      "unreadable" if 1 - seen <= TILE_TOP_CUT_LINE else "skip")
+        elif at_bottom:
+            action = "flag" if seen >= ROW_BOTTOM_KEEP else "skip"
+        else:
+            action = "flag" if 1 - seen <= ROW_TOP_CUT_LINE else "skip"
+        items.append({"box": full(b), "action": action})
+    return {"header": full((0, 0, w, top)) if top >= 0.3 * w else None,
+            "tab": full(bright[0]) if bright[0][4] - bright[1][4] >= 60 else None,
+            "layout": layout, "items": items}
+
+
+def _agreed(reads, keys) -> tuple | None:
+    """The values of `keys` when every read has them all (non-empty) and they agree, else None."""
+    out = []
+    for k in keys:
+        vals = [re.sub(r"\s+", " ", str(r.get(k) or "")).strip() if isinstance(r, dict) else "" for r in reads]
+        if not vals or not vals[0] or any(v.lower() != vals[0].lower() for v in vals):
+            return None
+        out.append(vals[0])
+    return tuple(out)
+
+
+def _arrow_buttons(arrows) -> list[str]:
+    """A list row's arrows ('up' / 'down' or the glyphs) as the button words sides_offered reads."""
+    out = []
+    for x in (arrows if isinstance(arrows, list) else [arrows]):
+        s = str(x or "").lower()
+        out += ["Higher"] if "up" in s or "↑" in s else ["Lower"] if "down" in s or "↓" in s else []
+    return out
+
+
+def _extract_phone(img, phone: dict, read_json, parallel: int, budget: _Budget | None = None) -> list[dict]:
+    """
+    One raw row per tile / list row that is not skipped (detect_phone), in reading order:
+    each read twice as on desktop (tiles with CARD_PROMPT, list rows with ROW_PROMPT and the
+    selected tab's label as the stat; no tab read, or two reads of it that differ: no stat,
+    never a guess). The header is read twice (1x, 1.5x); its two team abbreviations, when both
+    reads agree, go on every row as game_teams (else None: confirmation_rows then leaves every
+    row unresolved). Flagged items get PARTLY_CUT; clipped names, unreadable_row().
+    """
+    if not phone["items"]:
+        return []
+    jobs = []
+    if phone["header"]:
+        header = img.crop(phone["header"])
+        jobs += [(_upscale(header, f) if f > 1 else header, HEADER_PROMPT) for f in (1, 1.5)]
+    n_header = len(jobs)
+    if phone["layout"] == "list" and phone["tab"]:
+        tab = img.crop(phone["tab"])
+        jobs += [(_upscale(tab, f), TAB_PROMPT) for f in READ_SCALES]
+    n_pre = len(jobs)
+    prompt = ROW_PROMPT if phone["layout"] == "list" else CARD_PROMPT
+    for it in phone["items"]:
+        if it["action"] in ("read", "flag"):
+            x0, y0, x1, y1 = it["box"]
+            crop = img.crop((max(0, x0 - 4), max(0, y0 - 4), min(img.width, x1 + 4), min(img.height, y1 + 4)))
+            jobs += [(_upscale(crop, f), prompt) for f in READ_SCALES]
+    results = _read_all(jobs, read_json, parallel, budget)
+    teams = _agreed(results[:n_header], ("left_team", "right_team")) if n_header else None
+    label = _agreed(results[n_header:n_pre], ("label",)) if n_pre > n_header else None
+    n, k, rows = len(READ_SCALES), n_pre, []
+    for it in phone["items"]:
+        if it["action"] == "skip":
+            continue
+        if it["action"] == "unreadable":
+            rows.append(unreadable_row())
+            continue
+        reads = [r if isinstance(r, dict) else {} for r in results[k:k + n]]
+        k += n
+        if phone["layout"] == "list":
+            reads = [{**r, "stat_label": label[0] if label else None, "buttons": _arrow_buttons(r.get("arrows"))}
+                     for r in reads]
+        if not any(_readable(r) for r in reads):
+            rows.append(unreadable_row())
+            continue
+        row = _two_reads(reads[0], reads[1] if len(reads) > 1 else {})
+        if it["action"] == "flag":
+            row["alerts"].append(PARTLY_CUT)
+        row["game_teams"] = [t.upper() for t in teams] if teams else None
+        rows.append(row)
+    return rows
+
+
 GPU_MEMORY_MESSAGE = "Not enough GPU memory: close other apps"
 
 
@@ -550,10 +745,12 @@ def _extract_cards(png: bytes, read_json, parallel: int, budget: _Budget | None 
     image, read twice (1x and 1.5x). A usage limit or a down service on any read fails the
     whole image at once (QuotaExceeded / ServiceDown): queued reads are cancelled, the budget
     stops reads in flight from sending more, and a fallback service reads all of it again.
-    Any other error stays with its card."""
-    from concurrent.futures import ThreadPoolExecutor, as_completed
+    Any other error stays with its card. Underdog's iPhone game page goes to _extract_phone."""
     from PIL import Image
     img = Image.open(io.BytesIO(png)).convert("RGB")
+    phone = detect_phone(img)
+    if phone is not None:
+        return _extract_phone(img, phone, read_json, parallel, budget)
     boxes = detect_cards(img)
     if not boxes:
         first, second = [read_json(_upscale(img, f) if f > 1 else img, SHEET_PROMPT).get("cards") or []
@@ -567,16 +764,32 @@ def _extract_cards(png: bytes, read_json, parallel: int, budget: _Budget | None 
     jobs = []
     for x0, y0, x1, y1 in boxes:
         card = img.crop((max(0, x0 - 4), max(0, y0 - 4), min(img.width, x1 + 4), min(img.height, y1 + 4)))
-        jobs += [_upscale(card, f) for f in READ_SCALES]
+        jobs += [(_upscale(card, f), CARD_PROMPT) for f in READ_SCALES]
+    results = _read_all(jobs, read_json, parallel, budget)
+    n, rows = len(READ_SCALES), []
+    for i in range(0, len(results), n):
+        reads = [r if isinstance(r, dict) else {} for r in results[i:i + n]]
+        if not any(_readable(r) for r in reads):
+            rows.append(unreadable_row())
+            continue
+        rows.append(_two_reads(reads[0], reads[1] if len(reads) > 1 else {}))
+    return rows
 
-    def read(im):   # one card read never fails the image: its error is kept for that card
+
+def _read_all(jobs, read_json, parallel: int, budget: _Budget | None = None) -> list:
+    """read_json(image, prompt) for each (image, prompt) job, up to `parallel` at once: the
+    answers in job order, the exception in place of a read that failed. A usage limit or a
+    down service fails the whole image (see _extract_cards); nothing read at all says why."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    def read(job):   # one card read never fails the image: its error is kept for that card
         try:
-            return read_json(im, CARD_PROMPT)
+            return read_json(*job)
         except Exception as exc:
             return exc
 
     ex = ThreadPoolExecutor(max_workers=max(1, parallel))
-    futures = [ex.submit(read, im) for im in jobs]
+    futures = [ex.submit(read, job) for job in jobs]
     try:
         for f in as_completed(futures):
             if isinstance(f.result(), _FAILS_THE_IMAGE):
@@ -592,14 +805,7 @@ def _extract_cards(png: bytes, read_json, parallel: int, budget: _Budget | None 
         if isinstance(first, ExtractorUnavailable):
             raise first
         raise ExtractorUnavailable(f"could not read any card ({first!r})"[:300])
-    n, rows = len(READ_SCALES), []
-    for i in range(0, len(results), n):
-        reads = [r if isinstance(r, dict) else {} for r in results[i:i + n]]
-        if not any(_readable(r) for r in reads):
-            rows.append(unreadable_row())
-            continue
-        rows.append(_two_reads(reads[0], reads[1] if len(reads) > 1 else {}))
-    return rows
+    return results
 
 
 _EXTRACT = {"claude": _extract_claude, "ollama": _extract_ollama, "ollama_cloud": _extract_ollama_cloud,
@@ -689,12 +895,15 @@ def normalize_row(r: dict) -> dict | None:
     if not name or line is None:
         return None
     team = str(r.get("team") or "").strip().upper() or None
-    return {"player_name": name, "team": team, "stat_text": str(r.get("stat") or "").strip(),
-            "stat": normalize_stat(r.get("stat")), "line": line,
-            "higher_multiplier": _number(r.get("higher_multiplier")),
-            "lower_multiplier": _number(r.get("lower_multiplier")),
-            "sides_offered": r.get("sides_offered") or _sides_from_multipliers(r),
-            "reads_agree": r.get("reads_agree"), "alerts": list(r.get("alerts") or [])}
+    row = {"player_name": name, "team": team, "stat_text": str(r.get("stat") or "").strip(),
+           "stat": normalize_stat(r.get("stat")), "line": line,
+           "higher_multiplier": _number(r.get("higher_multiplier")),
+           "lower_multiplier": _number(r.get("lower_multiplier")),
+           "sides_offered": r.get("sides_offered") or _sides_from_multipliers(r),
+           "reads_agree": r.get("reads_agree"), "alerts": list(r.get("alerts") or [])}
+    if "game_teams" in r:          # a phone row: resolved against its header's two teams only
+        row["game_teams"] = r["game_teams"]
+    return row
 
 
 def _sides_from_multipliers(r: dict) -> str | None:
@@ -756,6 +965,75 @@ def resolve_player(conn, name: str, team: str | None) -> dict:
     if not hits and named:
         return {"status": "team_mismatch", "roster_teams": sorted(f"{h['team_city']} {h['team_name']}" for h in named)}
     return {"status": "ambiguous" if hits else "not_found"}
+
+
+def game_roster_teams(conn, abbrevs) -> list[dict] | None:
+    """The two roster teams a phone header names (ESPN or NBA abbreviation, nickname), or None
+    unless there are two, each names exactly one team, and they differ."""
+    if not abbrevs or len(abbrevs) != 2:
+        return None
+    for cols in ("team_abbrev, team_city, team_name, nba_team_id", "team_abbrev, team_city, team_name"):
+        try:
+            teams = [dict(zip(("team_abbrev", "team_city", "team_name", "nba_team_id"), r))
+                     for r in conn.execute(f"SELECT DISTINCT {cols} FROM rosters")]
+            break
+        except sqlite3.OperationalError:
+            teams = []
+    out = []
+    for a in abbrevs:
+        hits = [t for t in teams if str(a or "").strip().upper() in _team_names(t)]
+        if len(hits) != 1:
+            return None
+        out.append(hits[0])
+    return out if out[0]["team_name"] != out[1]["team_name"] else None
+
+
+def resolve_on_game(conn, name: str, game_teams) -> dict:
+    """
+    A phone row's name against the rosters of its header's two teams only, never league-wide.
+    'J. Tatum' (one letter first): that initial + the rest of the name_key ('M. Porter Jr.' ->
+    'm porter' matches 'michael porter'); a full name: its exact name_key. An alias counts the
+    same way when its player is on one of the two teams now (player_aliases rules: collision
+    names and roster names ignored). Exactly one player -> resolve_player's ok shape plus
+    "game_opponent" (the other team, 'City Nickname'); several -> ambiguous; none -> not_found;
+    no header, or not two roster teams -> no_game_header.
+    """
+    import player_aliases
+    import rosters
+    teams = game_roster_teams(conn, game_teams)
+    if not teams:
+        return {"status": "no_game_header"}
+    first, *rest = rosters.name_key(name).split() or [""]
+
+    def fits(key: str) -> bool:
+        k = key.split()
+        if len(first) == 1:
+            return len(k) >= 2 and k[0].startswith(first) and k[1:] == rest
+        return k == [first, *rest]
+
+    by_name = {t["team_name"]: t for t in teams}
+    hits = {}                      # (name_key, team nickname) -> ok result
+    for r in conn.execute("SELECT player_name, name_key, team_abbrev, team_city, team_name FROM rosters "
+                          "WHERE team_name IN (?, ?)", tuple(by_name)):
+        if fits(r[1]):
+            hits[(r[1], r[4])] = {"status": "ok", "player_name": r[0], "team_abbrev": r[2],
+                                  "team_name": f"{r[3]} {r[4]}"}
+    try:
+        aliases = conn.execute("SELECT DISTINCT alias_key, person_id FROM player_aliases").fetchall()
+    except sqlite3.OperationalError:
+        aliases = []
+    for key, pid in aliases:
+        if not fits(key) or player_aliases._collides(conn, key) or player_aliases._is_roster_name(conn, key):
+            continue
+        for team in sorted(player_aliases.current_teams(conn, pid) & set(by_name)):
+            shown = player_aliases._display(conn, pid, team)
+            hits.setdefault((rosters.name_key(shown["player_name"]), team),
+                            {"status": "ok", **shown, "person_id": int(pid), "via": "alias"})
+    if len(hits) != 1:
+        return {"status": "ambiguous" if hits else "not_found"}
+    (_, team), who = next(iter(hits.items()))
+    other = next(t for t in teams if t["team_name"] != team)
+    return {**who, "game_opponent": f"{other['team_city']} {other['team_name']}"}
 
 
 def historical_range(conn, person_id: int | None, stat: str) -> dict | None:
@@ -923,7 +1201,14 @@ def confirmation_rows(rows: list[dict], context_fn=None, record: bool = True) ->
                             "flags": [], "alerts": list(r.get("alerts") or [UNREADABLE]),
                             "logged_line": None, "person_id": None})
                 continue
-            who = resolve_player(conn, r["player_name"], r["team"])
+            phone = "game_teams" in r
+            who = (resolve_on_game(conn, r["player_name"], r["game_teams"]) if phone
+                   else resolve_player(conn, r["player_name"], r["team"]))
+            ctx = (context_fn(who["player_name"]) or {}) if who["status"] == "ok" else {}
+            if phone and who["status"] == "ok" and ctx.get("next_opponent_full") != who["game_opponent"]:
+                # the header's game is not his next scheduled one (e.g. another day's screenshot)
+                who = {"status": "game_mismatch", "next": ctx.get("next_opponent_full"),
+                       "date": ctx.get("next_game_date")}
             row = {**r, "resolved_player": who.get("player_name", ""), "match": who["status"],
                    "opponent_team": "", "is_home": False, "is_back_to_back": False,
                    "game_date": None, "range": None, "flags": [], "alerts": list(r.get("alerts") or []),
@@ -931,7 +1216,6 @@ def confirmation_rows(rows: list[dict], context_fn=None, record: bool = True) ->
             if r["stat"] is None:
                 row["flags"].append(f"stat '{r['stat_text']}' is not one of {', '.join(SUPPORTED_STATS)}")
             if who["status"] == "ok":
-                ctx = context_fn(who["player_name"]) or {}
                 row.update(opponent_team=ctx.get("next_opponent_full") or "",
                            is_home=bool(ctx.get("is_home")), is_back_to_back=bool(ctx.get("is_back_to_back")),
                            game_date=ctx.get("next_game_date"))
@@ -952,7 +1236,14 @@ def confirmation_rows(rows: list[dict], context_fn=None, record: bool = True) ->
             else:
                 why = {"ambiguous": "several roster players match",
                        "team_mismatch": f"the card's team {r['team']} is not his roster team "
-                                        f"({', '.join(who.get('roster_teams', []))})"}
+                                        f"({', '.join(who.get('roster_teams', []))})",
+                       "no_game_header": "the game header's two teams couldn't be read",
+                       "game_mismatch": f"the screenshot's game ({' vs '.join(r.get('game_teams') or [])}) is not "
+                                        f"his next scheduled game ({who.get('next') or 'none found'}"
+                                        f"{', ' + who['date'] if who.get('date') else ''}): likely a screenshot "
+                                        f"from another game day"}
+                if phone and who["status"] == "not_found":
+                    why["not_found"] = f"no roster match on {' or '.join(r['game_teams'])}"
                 row["alerts"].append("player not resolved: " + why.get(who["status"], "no exact roster match"))
             out.append(row)
         if record and out:

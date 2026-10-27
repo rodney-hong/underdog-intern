@@ -39,6 +39,8 @@ const UNRESOLVED_NOTES = {
   ambiguous: 'Several players match: pick the right one from the search',
   team_mismatch: 'Not on the card’s team: pick from the search',
   unreadable: 'Couldn’t read this card: search the player and enter the line',
+  no_game_header: 'Couldn’t read the game’s two teams: pick from the search',
+  game_mismatch: 'Not his next scheduled game (another day’s screenshot?): pick from the search',
 }
 export function unresolvedNote(r) {
   if (r.matched) return null

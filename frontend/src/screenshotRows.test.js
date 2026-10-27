@@ -67,6 +67,10 @@ test('an unresolved row says what it needs until a player is picked', () => {
   assert.equal(opponentPlaceholder(r), 'Opponent: pick the player first')
   assert.equal(unresolvedNote(toEditable({ ...unresolved, match: 'ambiguous' }, 0)),
                'Several players match: pick the right one from the search')
+  assert.equal(unresolvedNote(toEditable({ ...unresolved, match: 'no_game_header' }, 0)),
+               'Couldn’t read the game’s two teams: pick from the search')
+  assert.equal(unresolvedNote(toEditable({ ...unresolved, match: 'game_mismatch' }, 0)),
+               'Not his next scheduled game (another day’s screenshot?): pick from the search')
   const picked = selectPlayer(r, 'Giannis Antetokounmpo', { person_id: 203507 }, null)
   assert.equal(unresolvedNote(picked), null)
   assert.equal(opponentPlaceholder(picked), 'Choose the opponent')

@@ -144,3 +144,95 @@ def render_underdog(cards=VARIANT_CARDS, cols: int = 2, crop_top: int = 0) -> by
     buf = io.BytesIO()
     img.save(buf, format="PNG")
     return buf.getvalue()
+
+
+# Underdog's iPhone game page (Players tab), 1185 x 2576 like an iPhone screenshot, laid out in
+# units of 1/721 of the width (where it was measured). Every tile / row carries two marker
+# squares of its own colours, one by the name and one by the line, so a stubbed reader can
+# tell exactly which item a crop holds and whether the name and line are both in it.
+PHONE_W, PHONE_H = 1185, 2576
+PHONE_PAGE, PHONE_PILL, PHONE_PILL_ON = (1, 7, 14), (28, 30, 38), (230, 230, 235)
+PHONE_HEADER_MARK = (255, 128, 0)
+PHONE_TABS = ["Popular", "Points", "Rebounds", "Assists", "3-Pointers"]
+PHONE_CONTENT_TOP = 521        # units: the sticky header ends here; items scroll under it
+ROW_PITCH, ROW_H, TILE_PITCH, TILE_H = 107.5, 86, 465, 446
+
+PHONE_ROWS = [{"player_name": "J. Tatum", "line": 24.5}, {"player_name": "M. Porter Jr.", "line": 19.5},
+              {"player_name": "P. George", "line": 19.5}, {"player_name": "D. White", "line": 14.5}]
+PHONE_TILES = [{"player_name": "M. PORTER JR.", "stat": "Points", "line": 19.5},
+               {"player_name": "P. GEORGE", "stat": "Rebounds", "line": 3.5},
+               {"player_name": "J. TATUM", "stat": "Points", "line": 24.5},
+               {"player_name": "P. GEORGE", "stat": "Points", "line": 19.5}]
+
+
+def name_mark(i: int) -> tuple:
+    return (250, 40 + 8 * i, 200)
+
+
+def line_mark(i: int) -> tuple:
+    return (200, 40 + 8 * i, 250)
+
+
+def render_phone(layout: str = "list", items=None, tab: str = "Points", first_y: float = 595,
+                 header: bool = True, tabs_y: float = 430, height: int = PHONE_H) -> bytes:
+    """layout 'list' (a stat tab: rows with two line buttons) or 'tiles' (Popular). first_y:
+    units from the top to the first item's top (above PHONE_CONTENT_TOP it is cut by the
+    sticky header); height: px, a smaller one cuts the last items at the bottom. header=False
+    leaves the team header blank; tabs_y moves the tab pills (and the content below them)."""
+    items = items if items is not None else (PHONE_ROWS if layout == "list" else PHONE_TILES)
+    u = PHONE_W / 721
+    shift = tabs_y - 430
+    img = Image.new("RGB", (PHONE_W, height), PHONE_PAGE)
+    d = ImageDraw.Draw(img)
+    big, mid, small = _font(int(30 * u)), _font(int(22 * u)), _font(int(17 * u))
+
+    def box(x0, y0, x1, y1):
+        return [int(x0 * u), int(y0 * u), int(x1 * u), int(y1 * u)]
+
+    for i, c in enumerate(items):
+        if layout == "list":
+            y = first_y + shift + i * ROW_PITCH
+            d.ellipse(box(28, y + 6, 100, y + 78), fill=(60, 140, 70))
+            d.text((int(115 * u), int((y + 14) * u)), c["player_name"], font=mid, fill=(245, 245, 245))
+            d.text((int(115 * u), int((y + 46) * u)), "20.0 avg", font=small, fill=(170, 170, 180))
+            d.rectangle(box(300, y + 18, 318, y + 36), fill=name_mark(i))
+            for j, arrow in enumerate(("^", "v")):
+                x = 368 + j * 169
+                d.rounded_rectangle(box(x, y, x + 155, y + ROW_H), radius=int(14 * u), fill=PHONE_PILL)
+                d.text((int((x + 40) * u), int((y + 12) * u)), f"{arrow} {c['line']:g}", font=mid, fill=(245, 245, 245))
+                d.text((int((x + 50) * u), int((y + 48) * u)), "1.62x", font=small, fill=(200, 200, 205))
+            d.rectangle(box(378, y + 14, 394, y + 30), fill=line_mark(i))
+        else:
+            x, y = 28 + (i % 2) * 340, first_y + shift + (i // 2) * TILE_PITCH
+            d.rounded_rectangle(box(x, y, x + 320, y + TILE_H), radius=int(24 * u), fill=(12, 16, 22))
+            d.rectangle(box(x, y + 20, x + 320, y + 0.465 * TILE_H), fill=(20, 160, 70))
+            d.rounded_rectangle(box(x, y, x + 320, y + 40), radius=int(24 * u), fill=(20, 160, 70))
+            d.text((int((x + 60) * u), int((y + 0.04 * TILE_H) * u)), c["player_name"], font=big, fill=(255, 255, 255))
+            d.rectangle(box(x + 280, y + 0.05 * TILE_H, x + 298, y + 0.09 * TILE_H), fill=name_mark(i))
+            d.text((int((x + 120) * u), int((y + 0.56 * TILE_H) * u)), f"{c['line']:g}", font=big, fill=(255, 255, 255))
+            d.text((int((x + 110) * u), int((y + 0.67 * TILE_H) * u)), c["stat"], font=small, fill=(200, 200, 205))
+            d.rectangle(box(x + 230, y + 0.58 * TILE_H, x + 248, y + 0.62 * TILE_H), fill=line_mark(i))
+            for j, side in enumerate(("Higher", "Lower")):
+                bx = x + 22 + j * 144
+                d.rounded_rectangle(box(bx, y + 0.79 * TILE_H, bx + 130, y + 0.95 * TILE_H), radius=int(12 * u),
+                                    fill=(30, 34, 42))
+                d.text((int((bx + 30) * u), int((y + 0.81 * TILE_H) * u)), side, font=small, fill=(245, 245, 245))
+    # the sticky header over whatever scrolled under it
+    d.rectangle(box(0, 0, 721, PHONE_CONTENT_TOP + shift), fill=PHONE_PAGE)
+    d.rounded_rectangle(box(185, 22, 530, 92), radius=int(35 * u), fill=(0, 0, 0))
+    if header:
+        d.text((int(46 * u), int(240 * u)), "BKN", font=big, fill=(160, 160, 165))
+        d.text((int(595 * u), int(240 * u)), "BOS", font=big, fill=(40, 170, 80))
+        d.text((int(315 * u), int(245 * u)), "6:30pm", font=mid, fill=(245, 245, 245))
+        d.rectangle(box(350, 290, 370, 310), fill=PHONE_HEADER_MARK)
+        d.text((int(185 * u), int(350 * u)), "Game     Players     Entries", font=mid, fill=(200, 200, 205))
+    x = 28
+    for label, wd in zip(PHONE_TABS, (167, 116, 157, 125, 125)):
+        d.rounded_rectangle(box(x, tabs_y, x + wd, tabs_y + 66), radius=int(33 * u),
+                            fill=PHONE_PILL_ON if label == tab else PHONE_PILL)
+        d.text((int((x + 20) * u), int((tabs_y + 18) * u)), label, font=mid,
+               fill=(10, 10, 10) if label == tab else (220, 220, 225))
+        x += wd + 14
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
