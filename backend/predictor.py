@@ -11,6 +11,7 @@ Assists, 3PM.
 
 import os
 import sqlite3
+import threading
 from datetime import datetime
 
 import joblib
@@ -65,36 +66,47 @@ _WNBA_MODELS_LOADED = False
 
 
 
+# Models load once per process and are reused by every request; the lock stops concurrent
+# first requests (/slip, /predict, paper logging) from each loading their own copy.
+_LOAD_LOCK = threading.Lock()
+
+
 def _load_models() -> dict:
     global _MODELS, _MODELS_LOADED
     if _MODELS_LOADED:
         return _MODELS
-    for stat_type in _ML_STAT_TYPES:
-        mp = os.path.join(_MODEL_DIR, f"model_{stat_type}.pkl")
-        if os.path.exists(mp):
-            _MODELS[stat_type] = joblib.load(mp)
-    if _MODELS:
-        print(f"[predictor] Loaded per-stat models: {sorted(_MODELS)}")
-    else:
-        print("[predictor] No per-stat models found — using heuristic scorer.")
-    _MODELS_LOADED = True
-    return _MODELS
+    with _LOAD_LOCK:
+        if _MODELS_LOADED:
+            return _MODELS
+        for stat_type in _ML_STAT_TYPES:
+            mp = os.path.join(_MODEL_DIR, f"model_{stat_type}.pkl")
+            if os.path.exists(mp):
+                _MODELS[stat_type] = joblib.load(mp)
+        if _MODELS:
+            print(f"[predictor] Loaded per-stat models: {sorted(_MODELS)}")
+        else:
+            print("[predictor] No per-stat models found — using heuristic scorer.")
+        _MODELS_LOADED = True
+        return _MODELS
 
 
 def _load_wnba_models() -> dict:
     global _WNBA_MODELS, _WNBA_MODELS_LOADED
     if _WNBA_MODELS_LOADED:
         return _WNBA_MODELS
-    for stat_type in _WNBA_ML_STAT_TYPES:
-        mp = os.path.join(_MODEL_DIR, f"model_wnba_{stat_type}.pkl")
-        if os.path.exists(mp):
-            _WNBA_MODELS[stat_type] = joblib.load(mp)
-    if _WNBA_MODELS:
-        print(f"[predictor] Loaded WNBA models: {sorted(_WNBA_MODELS)}")
-    else:
-        print("[predictor] No WNBA models found — using heuristic scorer for WNBA.")
-    _WNBA_MODELS_LOADED = True
-    return _WNBA_MODELS
+    with _LOAD_LOCK:
+        if _WNBA_MODELS_LOADED:
+            return _WNBA_MODELS
+        for stat_type in _WNBA_ML_STAT_TYPES:
+            mp = os.path.join(_MODEL_DIR, f"model_wnba_{stat_type}.pkl")
+            if os.path.exists(mp):
+                _WNBA_MODELS[stat_type] = joblib.load(mp)
+        if _WNBA_MODELS:
+            print(f"[predictor] Loaded WNBA models: {sorted(_WNBA_MODELS)}")
+        else:
+            print("[predictor] No WNBA models found — using heuristic scorer for WNBA.")
+        _WNBA_MODELS_LOADED = True
+        return _WNBA_MODELS
 
 
 # ---------------------------------------------------------------------------

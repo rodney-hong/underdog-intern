@@ -9,6 +9,7 @@ import datetime as dt
 import os
 import sys
 import threading
+import time
 
 # Never let a print crash startup: when output is redirected (service, log file) Windows
 # falls back to cp1252, and a character like "→" in an ETL message raised
@@ -566,12 +567,38 @@ def update_prediction_result(pred_id: int, req: ActualResultRequest):
     return dict(row)
 
 
+# /slip on the 2 vCPU / 2 GB server: one slip at a time, built on one worker, and none while
+# a pre-tip pull is waiting or running (collection comes first). A refused request returns at
+# once; nothing queues.
+_SLIP_LOCK = threading.Lock()
+_SECONDARY_LOCK = threading.Lock()   # the background secondary-stat logging, one run at a time
+SLIP_BUSY_DETAIL = "A slip is already being built; wait for it to finish and try again."
+SLIP_PRETIP_DETAIL = "A pre-tip pull is in progress; try again in a few minutes."
+
+
 @app.get("/slip")
 def build_slip(size: int = Query(default=2, ge=1, le=5)):
     """
-    Build a suggested parlay slip from tonight's games.
-    Runs predictions for every player in the OddsAPI lines cache in parallel,
-    applies diversity rules, and returns up to 3 picks with combined confidence.
+    Build a suggested parlay slip from tonight's games: 503 while a pre-tip pull is waiting
+    or running, 429 while another slip is being built, else the slip from _build_slip.
+    """
+    if line_logger._running_pretips:
+        raise HTTPException(status_code=503, detail=SLIP_PRETIP_DETAIL, headers={"Retry-After": "300"})
+    if not _SLIP_LOCK.acquire(blocking=False):
+        raise HTTPException(status_code=429, detail=SLIP_BUSY_DETAIL, headers={"Retry-After": "30"})
+    try:
+        result, lines = _build_slip(size)
+    finally:
+        _SLIP_LOCK.release()
+    if lines:
+        _start_secondary_logging(lines)
+    return result
+
+
+def _build_slip(size: int) -> tuple[dict, dict]:
+    """
+    (slip, lines): predictions for every player in today's lines, one player after another,
+    diversity rules applied, up to `size` picks with combined confidence.
     """
     SLIP_STATS = ["Points", "Rebounds", "Assists", "3PM"]
     STAT_TO_MARKET = {
@@ -584,7 +611,7 @@ def build_slip(size: int = Query(default=2, ge=1, le=5)):
 
     lines = data_fetcher.get_todays_lines()
     if not lines:
-        return {"picks": [], "parlay_confidence": 0.0}
+        return {"picks": [], "parlay_confidence": 0.0}, lines
 
     def _predict_player(player_name: str) -> list[dict]:
         player_data = lines.get(player_name, {})
@@ -633,13 +660,11 @@ def build_slip(size: int = Query(default=2, ge=1, le=5)):
         return results
 
     all_candidates: list[dict] = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as ex:
-        futures = {ex.submit(_predict_player, name): name for name in lines}
-        for fut in concurrent.futures.as_completed(futures):
-            try:
-                all_candidates.extend(fut.result())
-            except Exception:
-                pass
+    for name in lines:
+        try:
+            all_candidates.extend(_predict_player(name))
+        except Exception:
+            pass
 
     all_candidates.sort(key=lambda x: x["confidence"], reverse=True)
 
@@ -682,7 +707,12 @@ def build_slip(size: int = Query(default=2, ge=1, le=5)):
     for pick in picks:
         parlay_confidence *= pick["confidence"]
     parlay_confidence = round(parlay_confidence, 4) if picks else 0.0
+    return {"picks": picks, "parlay_confidence": parlay_confidence}, lines
 
+
+def _start_secondary_logging(lines: dict) -> None:
+    """Log predictions for the secondary stats in today's lines on a background thread; skipped
+    while an earlier run is still going, and paused while a pre-tip pull waits or runs."""
     _SECONDARY_STAT_TO_MARKET = {
         "Steals":             "player_steals",
         "Blocks":             "player_blocks",
@@ -697,6 +727,8 @@ def build_slip(size: int = Query(default=2, ge=1, le=5)):
     def _log_secondary_stats() -> None:
         count = 0
         for player_name, player_data in lines.items():
+            while line_logger._running_pretips:
+                time.sleep(5)
             ctx = data_fetcher.get_player_context(player_name)
             if ctx is None or not ctx.get("next_opponent_full"):
                 continue
@@ -734,9 +766,16 @@ def build_slip(size: int = Query(default=2, ge=1, le=5)):
                     pass
         print(f"[background] logged {count} secondary stat predictions")
 
-    threading.Thread(target=_log_secondary_stats, daemon=True).start()
+    def _run() -> None:
+        try:
+            _log_secondary_stats()
+        finally:
+            _SECONDARY_LOCK.release()
 
-    return {"picks": picks, "parlay_confidence": parlay_confidence}
+    if not _SECONDARY_LOCK.acquire(blocking=False):
+        print("[background] secondary stat logging still running; not started again")
+        return
+    threading.Thread(target=_run, daemon=True).start()
 
 
 @app.get("/lines/{player_name}/{stat_type}")

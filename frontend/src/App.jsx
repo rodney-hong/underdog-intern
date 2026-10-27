@@ -307,6 +307,14 @@ function ResultCard({ result, player, stat, league }) {
 function SlipCard({ slip, onClear }) {
   if (!slip) return null
 
+  if (slip.busy) {
+    return (
+      <p className="animate-fade-in mt-4 text-sm" role="status" style={{ color: 'var(--text-muted)' }}>
+        {slip.busy}
+      </p>
+    )
+  }
+
   if (slip.picks.length === 0) {
     return (
       <p className="animate-fade-in mt-4 text-sm" style={{ color: 'var(--text-muted)' }}>
@@ -526,6 +534,12 @@ export default function App() {
     setSlipResult(null)
     try {
       const res = await apiFetch(`/slip?size=${slipSize}`)
+      if (res.status === 429 || res.status === 503) {
+        // busy: another slip is being built, or a pre-tip pull is running
+        const body = await res.json().catch(() => ({}))
+        setSlipResult({ picks: [], parlay_confidence: 0.0, busy: body.detail || 'The server is busy; try again in a few minutes.' })
+        return
+      }
       if (!res.ok) throw new Error('slip fetch failed')
       setSlipResult(await res.json())
     } catch {

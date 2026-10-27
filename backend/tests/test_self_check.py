@@ -107,6 +107,9 @@ def test_self_check_job_is_in_the_prod_scheduler(tmp_path, monkeypatch):
     monkeypatch.setattr(line_logger, "ODDS_API_KEY", "")
     monkeypatch.setattr(line_logger, "fetch_events", lambda phase=None: fired.append(phase) or (None, None))
     monkeypatch.setattr(line_logger, "schedule_todays_pretips", lambda scheduler=None: fired.append("sched") or 0)
+    # after 10:00 ET the open pull is queued to run now; it can reach the executor before
+    # remove_all_jobs below and then run after teardown, against the real DB_PATH
+    monkeypatch.setattr(line_logger, "run_open_pull", lambda phase="open", scheduler=None: fired.append(phase) or 0)
     sched = line_logger.start_scheduler()
     try:
         ids = {j.id for j in sched.get_jobs()}
