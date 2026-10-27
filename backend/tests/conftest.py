@@ -3,10 +3,12 @@ Test-wide settings, applied before any test module imports main:
   - SPORTSBETTR_MODE=dev and WNBA_ENABLED=0, whatever backend/.env says (load_dotenv never
     overrides a variable that is already set);
   - "testserver" (Starlette's TestClient host) added to ALLOWED_HOSTS;
+  - no network for the whole process (see _no_network below);
   - every TestClient request is signed in (the auth dependency is overridden), except in
     tests marked `real_auth`, which exercise the login itself (tests/test_auth.py).
 """
 import os
+import socket
 import sys
 
 import pytest
@@ -23,35 +25,83 @@ def pytest_configure(config):
     config.addinivalue_line("markers", "real_auth: run with the real login check (no signed-in override)")
     config.addinivalue_line("markers", "live_db_readonly: may open the real predictions.db, read-only "
                                        "(file:...?mode=ro) connections only")
+    config.addinivalue_line("markers", "slip_parity: slow /slip before/after check on a copy of predictions.db; "
+                                       "skipped unless RUN_SLIP_PARITY=1")
+    config.addinivalue_line("markers", "live_network: may connect out, and only when RUN_LIVE_EXTRACTOR=1")
+
+
+def pytest_collection_modifyitems(config, items):
+    if os.getenv("RUN_SLIP_PARITY") == "1":
+        return
+    skip = pytest.mark.skip(reason="set RUN_SLIP_PARITY=1 to run the slow /slip parity check (~6 min)")
+    for item in items:
+        if item.get_closest_marker("slip_parity"):
+            item.add_marker(skip)
 
 
 _LOOPBACK = {"127.0.0.1", "::1", "localhost"}
 
+# No test reaches OddsAPI, Kaggle, ESPN, NBA, Ollama Cloud or Gemini. The block is installed
+# here, at import, for the whole pytest process and every thread in it: a background thread that
+# outlives its test (a scheduler job, a daemon thread) is blocked too, between tests and after the
+# last one. Every attempt is recorded; the test it happens in fails even when the code under test
+# caught the OSError, and an attempt outside any test fails the session. A call from a thread
+# leaked by an earlier test is blamed on whichever test is running when it happens.
+# Only a test marked live_network, with RUN_LIVE_EXTRACTOR=1, may connect out.
+_REAL_CONNECT, _REAL_CONNECT_EX, _REAL_GAI = socket.socket.connect, socket.socket.connect_ex, socket.getaddrinfo
+_net = {"test": None, "allow": False, "hits": []}      # hits: (test nodeid or None, target)
+
+
+def _blocked(target) -> bool:
+    if _net["allow"]:
+        return False
+    _net["hits"].append((_net["test"], str(target)))
+    return True
+
+
+def _remote(address) -> bool:
+    return isinstance(address, tuple) and address[0] not in _LOOPBACK
+
+
+def _connect(self, address, *a, **k):
+    if _remote(address) and _blocked(address):
+        raise OSError(f"network blocked in tests: {address}")
+    return _REAL_CONNECT(self, address, *a, **k)
+
+
+def _connect_ex(self, address, *a, **k):
+    if _remote(address) and _blocked(address):
+        raise OSError(f"network blocked in tests: {address}")
+    return _REAL_CONNECT_EX(self, address, *a, **k)
+
+
+def _getaddrinfo(host, *a, **k):
+    if host is not None and host not in _LOOPBACK and _blocked(host):
+        raise OSError(f"DNS blocked in tests: {host}")
+    return _REAL_GAI(host, *a, **k)
+
+
+socket.socket.connect, socket.socket.connect_ex, socket.getaddrinfo = _connect, _connect_ex, _getaddrinfo
+
 
 @pytest.fixture(autouse=True)
-def _no_network(monkeypatch):
-    """No test reaches OddsAPI, Kaggle, ESPN, NBA, Ollama Cloud or Gemini: any connection or DNS
-    lookup that is not loopback raises. (RUN_LIVE_EXTRACTOR=1 lifts it for that opt-in test.)"""
-    if os.getenv("RUN_LIVE_EXTRACTOR") == "1":
-        yield
-        return
-    import socket
-    real_connect, real_gai = socket.socket.connect, socket.getaddrinfo
-
-    def connect(self, address, *a, **k):
-        host = address[0] if isinstance(address, tuple) else address
-        if isinstance(address, tuple) and host not in _LOOPBACK:
-            raise OSError(f"network blocked in tests: {address}")
-        return real_connect(self, address, *a, **k)
-
-    def getaddrinfo(host, *a, **k):
-        if host not in _LOOPBACK and host is not None:
-            raise OSError(f"DNS blocked in tests: {host}")
-        return real_gai(host, *a, **k)
-
-    monkeypatch.setattr(socket.socket, "connect", connect)
-    monkeypatch.setattr(socket, "getaddrinfo", getaddrinfo)
+def _no_network(request):
+    _net["test"] = request.node.nodeid
+    _net["allow"] = (request.node.get_closest_marker("live_network") is not None
+                     and os.getenv("RUN_LIVE_EXTRACTOR") == "1")
+    start = len(_net["hits"])
     yield
+    _net["allow"], _net["test"] = False, None
+    mine = _net["hits"][start:]
+    if mine:
+        pytest.fail(f"made {len(mine)} blocked network call(s): {sorted({t for _, t in mine})}")
+
+
+def pytest_sessionfinish(session, exitstatus):
+    stray = [t for test, t in _net["hits"] if test is None]
+    if stray:
+        print(f"\nnetwork calls outside any test (a leaked background thread?): {sorted(set(stray))}")
+        session.exitstatus = 1
 
 
 _BACKEND = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

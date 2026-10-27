@@ -381,6 +381,7 @@ def test_extract_needs_the_login(db):
 
 # --- optional: the real extractor on the synthetic image ------------------------------------
 
+@pytest.mark.live_network
 @pytest.mark.skipif(os.getenv("RUN_LIVE_EXTRACTOR") != "1", reason="set RUN_LIVE_EXTRACTOR=1 to call the real extractor")
 @pytest.mark.parametrize("image, cards", [(ss.render, ss.CARDS), (ss.render_grid, ss.GRID_CARDS)],
                          ids=["list", "grid"])
