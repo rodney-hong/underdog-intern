@@ -560,8 +560,8 @@ def start_scheduler():
     if os.getenv("NEWS_INGEST_ENABLED", "1") != "1":
         print("[news] disabled via NEWS_INGEST_ENABLED")
         return None
-    from apscheduler.schedulers.background import BackgroundScheduler
-    sched = BackgroundScheduler(timezone=EASTERN)
+    from sched_tz import EasternCron, new_scheduler
+    sched = new_scheduler()   # UTC; the report cron keeps its ET minutes (see sched_tz.py: DST)
     now = dt.datetime.now(EASTERN)
     sched.add_job(poll_espn_job, "interval", minutes=POLL_MINUTES, id="news_espn",
                   next_run_time=now, coalesce=True, max_instances=1,
@@ -569,7 +569,7 @@ def start_scheduler():
     # Catch-up runs once at startup; the regular report job starts at its next cron
     # minute so the two never overlap on the same slots.
     sched.add_job(catch_up_nba_reports_job, id="news_nba_catchup", next_run_time=now)
-    sched.add_job(poll_nba_report_job, "cron", minute=NBA_REPORT_CRON_MINUTES, id="news_nba_report",
+    sched.add_job(poll_nba_report_job, EasternCron(minute=NBA_REPORT_CRON_MINUTES), id="news_nba_report",
                   coalesce=True, max_instances=1, misfire_grace_time=15 * 60)
     sched.start()
     _scheduler = sched

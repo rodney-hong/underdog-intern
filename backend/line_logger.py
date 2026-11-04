@@ -1501,8 +1501,8 @@ def _schedule_kaggle_retry(scheduler, backup_path: str, baseline: int | None, da
     """
     if scheduler is None:
         return "no scheduler, no retry"
-    run_at = _clear_of_pulls(scheduler, run_at or dt.datetime.now(EASTERN)
-                             + dt.timedelta(minutes=KAGGLE_RETRY_MINUTES))
+    run_at = _clear_of_pulls(scheduler, run_at or (dt.datetime.now(dt.timezone.utc)   # real minutes across DST
+                             + dt.timedelta(minutes=KAGGLE_RETRY_MINUTES)).astimezone(EASTERN))
     scheduler.add_job(
         run_kaggle_version_retry, "date", run_date=run_at,
         kwargs={"scheduler": scheduler, "backup_path": backup_path, "baseline": baseline,
@@ -1615,13 +1615,13 @@ def start_scheduler():
         print("[line_logger] disabled via LINE_LOGGER_ENABLED")
         return None
 
-    from apscheduler.schedulers.background import BackgroundScheduler
+    from sched_tz import EasternCron, new_scheduler
 
-    sched = BackgroundScheduler(timezone=EASTERN)
+    sched = new_scheduler()   # UTC; cron jobs keep their ET times (see sched_tz.py: DST)
     # Pre-tip pulls are always scheduled by a free daily events call, independent of
     # the open pull (which also schedules them, under the same job ids).
     sched.add_job(
-        schedule_todays_pretips, "cron", hour=SCHEDULE_HOUR_ET, minute=0,
+        schedule_todays_pretips, EasternCron(hour=SCHEDULE_HOUR_ET, minute=0),
         kwargs={"scheduler": sched},
         id="line_pretip_scheduler", replace_existing=True, misfire_grace_time=3 * 3600,
         coalesce=True,
@@ -1632,7 +1632,7 @@ def start_scheduler():
                   id="line_pretip_scheduler_catchup", replace_existing=True)
     if OPEN_PULL_ENABLED:
         sched.add_job(
-            run_open_pull, "cron", hour=OPEN_PULL_HOUR_ET, minute=0,
+            run_open_pull, EasternCron(hour=OPEN_PULL_HOUR_ET, minute=0),
             kwargs={"phase": "open", "scheduler": sched},
             id="line_open_pull", replace_existing=True,
             misfire_grace_time=OPEN_CATCHUP_HOURS * 3600, coalesce=True,
@@ -1646,7 +1646,7 @@ def start_scheduler():
     # 12 h grace: a machine asleep at 07:00 still runs it on waking. Startup runs its
     # own sync as soon as startup completes (main.py -> start_sync_in_background).
     sched.add_job(
-        run_morning_maintenance, "cron", hour=MAINTENANCE_HOUR_ET, minute=0,
+        run_morning_maintenance, EasternCron(hour=MAINTENANCE_HOUR_ET, minute=0),
         kwargs={"scheduler": sched},
         id="morning_maintenance", replace_existing=True, misfire_grace_time=12 * 3600,
         coalesce=True, max_instances=1,
@@ -1657,8 +1657,8 @@ def start_scheduler():
     # Nightly off-server backup (offsite_backup.py) when the bucket is configured.
     import offsite_backup
     if offsite_backup.configured():
-        sched.add_job(offsite_backup.run_nightly, "cron", hour=offsite_backup.BACKUP_HOUR_ET,
-                      minute=offsite_backup.BACKUP_MINUTE_ET, id="offsite_backup", replace_existing=True,
+        sched.add_job(offsite_backup.run_nightly, EasternCron(hour=offsite_backup.BACKUP_HOUR_ET,
+                      minute=offsite_backup.BACKUP_MINUTE_ET), id="offsite_backup", replace_existing=True,
                       misfire_grace_time=3 * 3600, coalesce=True, max_instances=1)
     else:
         print("!" * 78)
