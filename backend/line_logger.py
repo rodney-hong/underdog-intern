@@ -260,7 +260,8 @@ def record_call(resp: httpx.Response, *, endpoint: str, phase: str,
     """
     Log one completed OddsAPI call to odds_pull_log. Used by this module and by
     data_fetcher's slip path so the monthly cap sees every credit spent.
-    expected_cost is charged only when the response carries no usable cost headers.
+    expected_cost is charged only when a 200 response carries no usable cost headers; a
+    failed call without them (e.g. a gateway 502) was not billed and is logged as 0.
     Returns (credits_used, x-requests-remaining after).
     """
     remaining_after = _int_header(resp, "x-requests-remaining")
@@ -269,6 +270,8 @@ def record_call(resp: httpx.Response, *, endpoint: str, phase: str,
         credits = last
     elif remaining_before is not None and remaining_after is not None:
         credits = remaining_before - remaining_after
+    elif resp.status_code != 200:
+        credits = 0
     else:
         credits = 0 if endpoint == "events" else expected_cost  # don't undercount odds calls
     _log_pull(endpoint=endpoint, game_id=game_id, game_date=game_date, pull_phase=phase,

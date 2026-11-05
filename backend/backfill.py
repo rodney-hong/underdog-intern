@@ -394,6 +394,8 @@ class Run:
             credits = last
         elif self.remaining is not None and remaining_after is not None:
             credits = self.remaining - remaining_after
+        elif resp.status_code != 200:
+            credits = 0                               # failed, no cost headers: not billed
         else:
             credits = cost_if_unknown                 # never undercount
         if remaining_after is not None:
