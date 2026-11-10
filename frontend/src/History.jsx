@@ -4,8 +4,12 @@ import { duplicateCount, historySummary } from './historyStats'
 import ConfirmDialog from './components/ConfirmDialog'
 import { apiFetch } from './api'
 import { formatCentral, formatGameDate } from './format'
-import { useIsPhone } from './useMediaQuery'
+import { useIsPhone, useMediaQuery } from './useMediaQuery'
 import { sideColor } from './sides'
+import { AskPanel, useAsk } from './Ask'
+
+// The Ask panel sits beside the table from this width; below it, it opens as a bottom sheet.
+const ASK_SIDE_QUERY = '(min-width: 1280px)'
 
 const PAGE_SIZES = [10, 25, 50]
 
@@ -249,6 +253,15 @@ const icon = (d) => (
 const PENCIL = icon(<path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L8 18l-4 1 1-4z" />)
 const CHECK = icon(<path d="M5 12.5l4.5 4.5L19 7.5" />)
 const CROSS = icon(<path d="M6 6l12 12M18 6L6 18" />)
+const EXPLAIN = icon(<><path d="M4 5h16v11H9l-5 4z" /><path d="M10 9.2a2 2 0 1 1 2.6 1.9c-.4.2-.6.5-.6.9" /><path d="M12 13.6v.1" /></>)
+
+// Asks the Ask panel to explain this exact pick (by its prediction id).
+function ExplainButton({ onClick, large = false }) {
+  return (
+    <button onClick={onClick} className={`icon-btn ${large ? 'tap' : 'w-7 h-7'} flex items-center justify-center`}
+            title="Explain this pick" aria-label="Explain this pick">{EXPLAIN}</button>
+  )
+}
 
 // Set the actual result by hand: the pencil opens OVER / UNDER with confirm and cancel.
 function ResultEditor({ isEditing, editValue, onEdit, onEditChange, onEditConfirm, onEditCancel, large = false }) {
@@ -270,7 +283,7 @@ function ResultEditor({ isEditing, editValue, onEdit, onEditChange, onEditConfir
   )
 }
 
-function PredictionRow({ prediction: p, editor, model }) {
+function PredictionRow({ prediction: p, editor, model, onExplain }) {
   const v = rowView(p)
   return (
     <tr style={{ opacity: p.is_current === 0 ? 0.45 : 1 }}>
@@ -287,13 +300,18 @@ function PredictionRow({ prediction: p, editor, model }) {
       <td className="px-2 py-2.5 truncate text-right num">{(p.confidence * 100).toFixed(1)}%</td>
       <td className="px-2 py-2.5 truncate">{v.actualDisplay}</td>
       <td className="px-2 py-2.5">{v.resultTag}</td>
-      <td className="px-1 py-1"><ResultEditor {...editor} /></td>
+      <td className="px-1 py-1">
+        <div className="flex items-center gap-0.5">
+          <ExplainButton onClick={onExplain} />
+          <ResultEditor {...editor} />
+        </div>
+      </td>
     </tr>
   )
 }
 
 // Phones: one two-to-four-line row per prediction instead of an 11-column table row.
-function PredictionCard({ prediction: p, editor, model }) {
+function PredictionCard({ prediction: p, editor, model, onExplain }) {
   const v = rowView(p)
   return (
     <li className="py-3 space-y-1" style={{ opacity: p.is_current === 0 ? 0.45 : 1 }}>
@@ -315,7 +333,10 @@ function PredictionCard({ prediction: p, editor, model }) {
         <span className="text-xs num" style={{ color: 'var(--text-muted)' }}>
           Game {v.gameDateStr} · made {v.dateStr}
         </span>
-        <ResultEditor {...editor} large />
+        <div className="flex items-center gap-1">
+          <ExplainButton onClick={onExplain} large />
+          <ResultEditor {...editor} large />
+        </div>
       </div>
     </li>
   )
@@ -342,6 +363,10 @@ export default function History() {
   const [sortConfig, setSortConfig] = useState({ key: null, direction: 'asc' })
   const [confirmClean, setConfirmClean] = useState(null)    // rows the clean-up would remove, while asking
   const isPhone = useIsPhone()
+  const askSide = useMediaQuery(ASK_SIDE_QUERY) && !isPhone
+  const ask = useAsk()
+  const [askOpen, setAskOpen] = useState(false)
+  const explain = (p) => { setAskOpen(true); ask.explainPick(p) }
 
   const fetchHistory = useCallback(async () => {
     setLoading(true)
@@ -464,8 +489,9 @@ export default function History() {
   const replaced = summary.all - summary.current
 
   return (
-    <div className="history-fit w-full">
-      {/* Title row: the screen's name, what the figures leave out, the one clean-up action */}
+    <div className="history-layout w-full">
+    <div className="history-fit w-full min-w-0">
+      {/* Title row: the screen's name, what the figures leave out, the clean-up action, Ask */}
       <div className="flex flex-wrap items-start justify-between gap-x-6 gap-y-3 mb-6">
         <div className="min-w-0">
           <h1 className="text-2xl font-semibold tracking-tight">History</h1>
@@ -479,14 +505,23 @@ export default function History() {
             </p>
           )}
         </div>
-        <button
-          onClick={askCleanDuplicates}
-          disabled={cleaning || loading}
-          className="btn-danger-ghost tap shrink-0 px-3 py-1.5 text-sm"
-          title="Remove duplicates, keeping earliest per unique combo"
-        >
-          {cleaning ? 'Cleaning…' : 'Clean Duplicates'}
-        </button>
+        <div className="flex shrink-0 gap-2">
+          <button
+            onClick={() => setAskOpen((o) => !o)}
+            aria-expanded={askOpen}
+            className="btn-ghost tap px-3 py-1.5 text-sm font-medium"
+          >
+            Ask
+          </button>
+          <button
+            onClick={askCleanDuplicates}
+            disabled={cleaning || loading}
+            className="btn-danger-ghost tap px-3 py-1.5 text-sm"
+            title="Remove duplicates, keeping earliest per unique combo"
+          >
+            {cleaning ? 'Cleaning…' : 'Clean Duplicates'}
+          </button>
+        </div>
       </div>
 
       {/* Summary: one panel split by rules; accuracy leads */}
@@ -586,7 +621,8 @@ export default function History() {
             {isPhone ? (
               <ul className="px-4 phone-rows" aria-label="Predictions">
                 {paginated.map((p) => (
-                  <PredictionCard key={p.id} prediction={p} editor={editorFor(p)} model={TRACK_MODEL[modelFilter]} />
+                  <PredictionCard key={p.id} prediction={p} editor={editorFor(p)} model={TRACK_MODEL[modelFilter]}
+                                  onExplain={() => explain(p)} />
                 ))}
               </ul>
             ) : (
@@ -598,12 +634,12 @@ export default function History() {
                     <col style={{ width: '15%' }} />
                     <col style={{ width: '9%' }} />
                     <col style={{ width: '6%' }} />
-                    <col style={{ width: '15%' }} />
+                    <col style={{ width: '12%' }} />
                     <col style={{ width: '8%' }} />
                     <col style={{ width: '7%' }} />
                     <col style={{ width: '8%' }} />
                     <col style={{ width: '7%' }} />
-                    <col style={{ width: '5%' }} />
+                    <col style={{ width: '8%' }} />
                   </colgroup>
                   <thead>
                     <tr>
@@ -628,7 +664,7 @@ export default function History() {
                         )
                       })}
                       <th className="px-2 py-2.5 select-none">Result</th>
-                      <th className="px-2 py-2.5"><span className="sr-only">Edit</span></th>
+                      <th className="px-2 py-2.5"><span className="sr-only">Explain and edit</span></th>
                     </tr>
                   </thead>
                   <tbody>
@@ -638,6 +674,7 @@ export default function History() {
                         prediction={p}
                         editor={editorFor(p)}
                         model={TRACK_MODEL[modelFilter]}
+                        onExplain={() => explain(p)}
                       />
                     ))}
                   </tbody>
@@ -670,6 +707,8 @@ export default function History() {
           </>
         )}
       </section>
+    </div>
+    {askOpen && <AskPanel ask={ask} onClose={() => setAskOpen(false)} variant={askSide ? 'side' : 'sheet'} />}
     </div>
   )
 }

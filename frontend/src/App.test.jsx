@@ -53,6 +53,7 @@ it('shows the login page without a session, then the app; logout returns to it',
   fireEvent.change(pw, { target: { value: 'right one' } })
   fireEvent.click(screen.getByRole('button', { name: 'Log in' }))
   expect(await screen.findByRole('button', { name: 'History' })).toBeTruthy()
+  expect(screen.queryByRole('button', { name: 'Ask' })).toBeNull()   // Ask lives inside History, not the nav
   expect(screen.queryByLabelText('Password')).toBeNull()
 
   fireEvent.click(screen.getByRole('button', { name: 'Log out' }))

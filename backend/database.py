@@ -354,7 +354,7 @@ TRACK_RECORD_MODELS = {"challenger": ("challenger",), "frozen": ("frozen",),
 
 
 def player_track_record(player_name: str, stat_type: str = "Points", league: str = "NBA",
-                        before: str | None = None, model: str = "all") -> dict:
+                        before: str | None = None, model: str = "all", conn=None) -> dict:
     """
     The app's own record on this player and stat, over the rows History's stats cards count:
     current (not superseded), not limited-data, resolved (actual_result OVER/UNDER; DNP and
@@ -362,12 +362,14 @@ def player_track_record(player_name: str, stat_type: str = "Points", league: str
     or all = challenger + frozen). With `before`, only games dated before the reference
     prediction's ET date. A pick wins when predicted_outcome == actual_result. overall_rate
     uses the same filters for every player; adjusted_rate shrinks raw_rate toward it with
-    TRACK_RECORD_K. ValueError for an unknown model.
+    TRACK_RECORD_K. ValueError for an unknown model. `conn` (a Row-factory connection, e.g. the
+    assistant's read-only one) is used as given and left open.
     """
     if model not in TRACK_RECORD_MODELS:
         raise ValueError(f"model must be one of {sorted(TRACK_RECORD_MODELS)}")
     models = TRACK_RECORD_MODELS[model]
-    conn = get_connection()
+    own = conn is None
+    conn = get_connection() if own else conn
     try:
         cutoff = _track_record_cutoff(conn, before)
         sql = f"""
@@ -380,7 +382,8 @@ def player_track_record(player_name: str, stat_type: str = "Points", league: str
         """
         rows = conn.execute(sql, (stat_type, league, *models, cutoff, cutoff)).fetchall()
     finally:
-        conn.close()
+        if own:
+            conn.close()
 
     all_w = sum(r["predicted_outcome"] == r["actual_result"] for r in rows)
     all_n = len(rows)

@@ -22,7 +22,9 @@ for _stream in (sys.stdout, sys.stderr):
 from fastapi import Depends, FastAPI, File, HTTPException, Query, Request, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
-from pydantic import BaseModel, field_validator
+from typing import Literal
+
+from pydantic import BaseModel, Field, field_validator
 from starlette.concurrency import run_in_threadpool
 
 import auth
@@ -494,6 +496,36 @@ def get_player_track_record(
         raise HTTPException(status_code=404, detail=str(exc).strip("'"))
     except ValueError:
         raise HTTPException(status_code=422, detail="before must be a prediction id or an ISO timestamp")
+
+
+class AssistantMessage(BaseModel):
+    role: Literal["user", "assistant"]
+    content: str = Field(min_length=1, max_length=4000)
+
+
+class AssistantRequest(BaseModel):
+    messages: list[AssistantMessage] = Field(min_length=1, max_length=20)
+    prediction_id: int | None = Field(default=None, gt=0)     # History's Explain: that exact pick
+
+    @field_validator("messages")
+    @classmethod
+    def ends_with_user(cls, v):
+        if v[-1].role != "user":
+            raise ValueError("the last message must be the user's question")
+        return v
+
+
+@app.post("/assistant")
+def ask_assistant(req: AssistantRequest):
+    """
+    Read-only "Ask" assistant (assistant.py): the LLM phrases answers from whitelisted
+    read-only tools and never writes SQL. 503 when Ollama Cloud is unavailable.
+    """
+    import assistant
+    try:
+        return assistant.ask([m.model_dump() for m in req.messages], prediction_id=req.prediction_id)
+    except assistant.AssistantUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
 
 
 @app.get("/predictions/history")
