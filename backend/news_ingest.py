@@ -34,6 +34,7 @@ import json
 import hashlib
 import sqlite3
 import argparse
+import threading
 import datetime as dt
 from zoneinfo import ZoneInfo
 
@@ -530,15 +531,47 @@ def poll_espn_job() -> int:
     return _job(poll_espn)
 
 
+# The startup catch-up and the regular report poll never work on the same report slots at once
+# (the catch-up now starts once startup is complete and may retry, so it can meet a cron run).
+_REPORT_LOCK = threading.Lock()
+
+CATCHUP_RETRY_MINUTES = 5   # a locked catch-up runs again this much later ...
+CATCHUP_MAX_ATTEMPTS = 3    # ... at most this many attempts in all; ingested reports are skipped
+
+
 def poll_nba_report_job() -> int:
-    return _job(poll_nba_report)
+    with _REPORT_LOCK:
+        return _job(poll_nba_report)
 
 
-def catch_up_nba_reports_job() -> int:
-    """Startup: ingest official reports missed while the server was down (oldest first)."""
-    n = _job(lambda conn: poll_nba_report(conn, lookback_slots=NBA_REPORT_CATCHUP_HOURS * 4))
+def catch_up_nba_reports_job(attempt: int = 1) -> int:
+    """After startup: ingest official reports missed while the server was down (oldest first).
+    If the database is still locked by another writer (the startup sync's ETL, say) after the
+    connection's 30 s busy timeout, the job reschedules itself instead of being lost."""
+    try:
+        with _REPORT_LOCK:
+            n = _job(lambda conn: poll_nba_report(conn, lookback_slots=NBA_REPORT_CATCHUP_HOURS * 4))
+    except sqlite3.OperationalError as exc:
+        if "locked" not in str(exc) or attempt >= CATCHUP_MAX_ATTEMPTS or _scheduler is None:
+            raise
+        run_at = dt.datetime.now(EASTERN) + dt.timedelta(minutes=CATCHUP_RETRY_MINUTES)
+        _scheduler.add_job(catch_up_nba_reports_job, id="news_nba_catchup", next_run_time=run_at,
+                           kwargs={"attempt": attempt + 1}, replace_existing=True)
+        print(f"[news] official-report catch-up: database locked (attempt {attempt} of "
+              f"{CATCHUP_MAX_ATTEMPTS}); retrying at {run_at:%H:%M} ET")
+        return 0
     print(f"[news] official-report catch-up ({NBA_REPORT_CATCHUP_HOURS}h): {n} new items")
     return n
+
+
+def start_catch_up() -> bool:
+    """main._startup_complete (prod): run the report catch-up now, on the news scheduler, once
+    startup's own database work is done. False when the poller isn't running."""
+    if _scheduler is None:
+        return False
+    _scheduler.add_job(catch_up_nba_reports_job, id="news_nba_catchup",
+                       next_run_time=dt.datetime.now(EASTERN), replace_existing=True)
+    return True
 
 
 def poll_once() -> dict:
@@ -566,9 +599,9 @@ def start_scheduler():
     sched.add_job(poll_espn_job, "interval", minutes=POLL_MINUTES, id="news_espn",
                   next_run_time=now, coalesce=True, max_instances=1,
                   misfire_grace_time=POLL_MINUTES * 60)
-    # Catch-up runs once at startup; the regular report job starts at its next cron
-    # minute so the two never overlap on the same slots.
-    sched.add_job(catch_up_nba_reports_job, id="news_nba_catchup", next_run_time=now)
+    # The report catch-up is not added here: main._startup_complete calls start_catch_up(), so
+    # it never waits on a write transaction still held by startup (it used to fail ~36 s in
+    # with "database is locked"). The regular report job starts at its next cron minute.
     sched.add_job(poll_nba_report_job, EasternCron(minute=NBA_REPORT_CRON_MINUTES), id="news_nba_report",
                   coalesce=True, max_instances=1, misfire_grace_time=15 * 60)
     sched.start()

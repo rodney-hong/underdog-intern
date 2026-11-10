@@ -169,6 +169,9 @@ def test_prod_runs_the_collecting_steps(prod_steps, monkeypatch):
         assert s in steps
     assert "database.run_wnba_etl" not in steps and "ml_trainer.train_wnba_models" not in steps
     assert steps[-1] == "line_logger.start_sync_in_background"
+    # the official-report catch-up starts only once startup's own database work is done
+    assert steps.index("news_ingest.start_catch_up") > steps.index("database.init_db")
+    assert steps.index("news_ingest.start_catch_up") > steps.index("database.log_startup")
 
 
 def test_prod_with_wnba_on_loads_and_trains_a_missing_model(prod_steps, monkeypatch):

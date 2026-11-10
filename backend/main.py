@@ -187,6 +187,8 @@ def _startup_complete(challenger_ok: bool = True):
     background (line_logger.run_sync)."""
     _startup_step("database.log_startup", database.log_startup, mode=runmode.mode(),
                   wnba_enabled=runmode.wnba_enabled(), challenger_ok=challenger_ok)
+    # Official-report catch-up only now: during startup it waited on startup's write lock.
+    _startup_step("news_ingest.start_catch_up", news_ingest.start_catch_up)
     _startup_step("line_logger.start_sync_in_background", line_logger.start_sync_in_background)
     print("[startup] complete; data sync running in the background ([sync] lines)")
 
